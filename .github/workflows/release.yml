@@ -38,12 +38,12 @@ jobs:
         run: |
           pyinstaller --noconfirm --clean --noconsole --onefile --name "SubtitleVideoPro-Windows" --collect-all playwright main.py
 
-     # 1. 生成安全证明，并给这一步加上 id: attest 方便后续调用
+      # 1. 生成安全证明，并给这一步加上 id: attest 方便后续调用
       - name: Attest EXE (生成安全证明)
         id: attest  # 👑 关键：加一个 ID
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: 'dist/SubtitleVideoPro.exe'
+          subject-path: 'dist/SubtitleVideoPro-Windows.exe'  # 👉 修改点：加了 -Windows
 
       # 2. 👑 核心破解步：把隐藏的证明文件拷出来，变成肉眼可见的 .jsonl 文件
       - name: Export Provenance File (导出实体证明文件)
@@ -57,7 +57,7 @@ jobs:
         with:
           name: Windows-EXE
           path: |
-            dist/SubtitleVideoPro.exe
+            dist/SubtitleVideoPro-Windows.exe  # 👉 修改点：加了 -Windows
             dist/SubtitleVideoPro-provenance.jsonl
 
   # ==================== 工人 2：负责打包 macOS (生成 .dmg) ====================
@@ -102,15 +102,24 @@ jobs:
             "dist/SubtitleVideoPro.app"
 
       - name: Attest macOS DMG (生成安全证明)
+        id: attest_mac  # 加个 ID
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: 'dist/SubtitleVideoPro-macOS.dmg'
+
+      # 增加这一步把 Mac 的证明也导出来
+      - name: Export macOS Provenance File
+        shell: bash
+        run: |
+          cp "${{ steps.attest_mac.outputs.bundle-path }}" "dist/SubtitleVideoPro-macOS-provenance.jsonl"
 
       - name: Upload macOS Artifact
         uses: actions/upload-artifact@v4
         with:
           name: macOS-DMG
-          path: dist/SubtitleVideoPro-macOS.dmg
+          path: |
+            dist/SubtitleVideoPro-macOS.dmg
+            dist/SubtitleVideoPro-macOS-provenance.jsonl # 一起传上去
 
   # ==================== 发货中心：统一收集并创建 Release ====================
   release:
@@ -132,7 +141,8 @@ jobs:
           tag_name: ${{ github.event.inputs.version || github.ref_name }}
           name: Release ${{ github.event.inputs.version || github.ref_name }}
           files: |
-            artifacts/SubtitleVideoPro.exe
+            artifacts/SubtitleVideoPro-Windows.exe  # 👉 修改点：加了 -Windows
+            artifacts/SubtitleVideoPro-macOS.dmg    # 👉 修复点：顺便把 Mac 的安装包也加进发版列表
             artifacts/SubtitleVideoPro-provenance.jsonl  # 👑 把证明文件也发到 Release 页面
           generate_release_notes: true
           make_latest: true
