@@ -12,10 +12,9 @@ on:
         default: 'v1.0.0'
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-        
 
 jobs:
-  # ==================== 工人 1：负责打包 Windows (生成 .exe) ====================
+  # ==================== 工人 1：负责打包 Windows ====================
   build-windows:
     runs-on: windows-latest
     permissions:
@@ -37,38 +36,47 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller PyQt6 PyQt6-WebEngine requests playwright
 
-      # 👇 👑 核心修复：把当前代码文件夹加入杀软白名单，防止 exe 被偷偷删掉！
-      - name: Add Windows Defender Exclusion
+      # 👑 暴力破解：直接关闭云端 Windows 机器的自带杀毒软件！
+      - name: Disable Windows Defender
         shell: powershell
-        run: Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE
+        run: Set-MpPreference -DisableRealtimeMonitoring $true
 
-      - name: Package to EXE
+      # 打包 1：单文件版 (.exe)
+      - name: Package to Standalone EXE
         run: |
-          pyinstaller --noconfirm --clean --noconsole --onefile --name "SubtitleVideoPro-Windows" --icon "assets/icon.ico" --collect-all playwright main.py
-          
-      # 1. 生成安全证明，并给这一步加上 id: attest 方便后续调用
-      - name: Attest EXE (生成安全证明)
-        id: attest  # 👑 关键：加一个 ID
+          pyinstaller --noconfirm --clean --noconsole --onefile --name "Subtitled-video-Pro-Windows" --icon "assets/icon.ico" --collect-all playwright main.py
+
+      # 打包 2：绿色免安装版 (输出为文件夹，然后打成 .zip 包)
+      - name: Package to Green Portable ZIP
+        run: |
+          pyinstaller --noconfirm --clean --noconsole --onedir --name "Subtitled-video-Pro-Portable" --icon "assets/icon.ico" --collect-all playwright main.py
+          # 将文件夹压缩成 ZIP
+          Compress-Archive -Path "dist\Subtitled-video-Pro-Portable" -DestinationPath "dist\Subtitled-video-Pro-Windows-Portable.zip"
+
+      # 一次性给 .exe 和 .zip 都生成安全证明
+      - name: Attest Windows Assets
+        id: attest
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: 'dist/SubtitleVideoPro-Windows.exe'  # 👉 修改点：加了 -Windows
+          subject-path: |
+            dist/Subtitled-video-Pro-Windows.exe
+            dist/Subtitled-video-Pro-Windows-Portable.zip
 
-      # 2. 👑 核心破解步：把隐藏的证明文件拷出来，变成肉眼可见的 .jsonl 文件
-      - name: Export Provenance File (导出实体证明文件)
+      - name: Export Provenance File
         shell: bash
         run: |
-          cp "${{ steps.attest.outputs.bundle-path }}" "dist/SubtitleVideoPro-provenance.jsonl"
+          cp "${{ steps.attest.outputs.bundle-path }}" "dist/Subtitled-video-Pro-Win-provenance.jsonl"
 
-      # 3. 把 exe 和 证明文件 一起打包存入中转站
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Windows-EXE
+          name: Windows-Assets
           path: |
-            dist/SubtitleVideoPro-Windows.exe  # 👉 修改点：加了 -Windows
-            dist/SubtitleVideoPro-provenance.jsonl
+            dist/Subtitled-video-Pro-Windows.exe
+            dist/Subtitled-video-Pro-Windows-Portable.zip
+            dist/Subtitled-video-Pro-Win-provenance.jsonl
 
-  # ==================== 工人 2：负责打包 macOS (生成 .dmg) ====================
+  # ==================== 工人 2：负责打包 macOS ====================
   build-macos:
     runs-on: macos-latest
     permissions:
@@ -91,47 +99,44 @@ jobs:
           pip install pyinstaller PyQt6 PyQt6-WebEngine requests playwright
 
       - name: Package to Mac APP
-        # Mac 必须要加 --windowed 参数，这样才会生成漂亮的 .app 图形应用文件夹
         run: |
-          pyinstaller --noconfirm --clean --windowed --onefile --name "SubtitleVideoPro" --icon "assets/icon.icns" --collect-all playwright main.py
+          pyinstaller --noconfirm --clean --windowed --onefile --name "Subtitled-video-Pro" --icon "assets/icon.icns" --collect-all playwright main.py
           
       - name: Create DMG Installer
-        # 使用 create-dmg 工具，把 .app 封装成苹果用户最熟悉的 .dmg 安装包
         run: |
           brew install create-dmg
           create-dmg \
-            --volname "SubtitleVideoPro" \
+            --volname "Subtitled-video-Pro" \
             --window-pos 200 120 \
             --window-size 600 400 \
             --icon-size 100 \
-            --hide-extension "SubtitleVideoPro.app" \
+            --hide-extension "Subtitled-video-Pro.app" \
             --app-drop-link 425 120 \
-            "dist/SubtitleVideoPro-macOS.dmg" \
-            "dist/SubtitleVideoPro.app"
+            "dist/Subtitled-video-Pro-macOS.dmg" \
+            "dist/Subtitled-video-Pro.app"
 
-      - name: Attest macOS DMG (生成安全证明)
-        id: attest_mac  # 加个 ID
+      - name: Attest macOS DMG
+        id: attest_mac
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: 'dist/SubtitleVideoPro-macOS.dmg'
+          subject-path: 'dist/Subtitled-video-Pro-macOS.dmg'
 
-      # 增加这一步把 Mac 的证明也导出来
       - name: Export macOS Provenance File
         shell: bash
         run: |
-          cp "${{ steps.attest_mac.outputs.bundle-path }}" "dist/SubtitleVideoPro-macOS-provenance.jsonl"
+          cp "${{ steps.attest_mac.outputs.bundle-path }}" "dist/Subtitled-video-Pro-macOS-provenance.jsonl"
 
       - name: Upload macOS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: macOS-DMG
+          name: macOS-Assets
           path: |
-            dist/SubtitleVideoPro-macOS.dmg
-            dist/SubtitleVideoPro-macOS-provenance.jsonl # 一起传上去
+            dist/Subtitled-video-Pro-macOS.dmg
+            dist/Subtitled-video-Pro-macOS-provenance.jsonl
 
   # ==================== 发货中心：统一收集并创建 Release ====================
   release:
-    needs: [build-windows, build-macos] # 👑 关键：告诉发货中心，必须等这两个工人都干完活！
+    needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -141,16 +146,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          merge-multiple: true # 👑 把 Windows 和 Mac 的产物合并到同一个文件夹里
+          merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.version || github.ref_name }}
           name: Release ${{ github.event.inputs.version || github.ref_name }}
-          files: |
-            artifacts/SubtitleVideoPro-Windows.exe  # 👉 修改点：加了 -Windows
-            artifacts/SubtitleVideoPro-macOS.dmg    # 👉 修复点：顺便把 Mac 的安装包也加进发版列表
-            artifacts/SubtitleVideoPro-provenance.jsonl  # 👑 把证明文件也发到 Release 页面
+          # 👑 终极发货命令：中转站里有啥，全给我发上去！
+          files: artifacts/**/*
           generate_release_notes: true
           make_latest: true
