@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'v1.0.0'
+        description: 'v1.0.6'
         required: true
         default: 'v1.0.0'
 
@@ -33,6 +33,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller PyQt6 PyQt6-WebEngine requests playwright
+
+      # 👇 👑 核心修复：把当前代码文件夹加入杀软白名单，防止 exe 被偷偷删掉！
+      - name: Add Windows Defender Exclusion
+        shell: powershell
+        run: Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE
 
       - name: Package to EXE
         run: |
