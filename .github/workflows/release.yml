@@ -38,16 +38,27 @@ jobs:
         run: |
           pyinstaller --noconfirm --clean --noconsole --onefile --name "SubtitleVideoPro-Windows" --collect-all playwright main.py
 
-      - name: Attest Windows EXE (生成安全证明)
+     # 1. 生成安全证明，并给这一步加上 id: attest 方便后续调用
+      - name: Attest EXE (生成安全证明)
+        id: attest  # 👑 关键：加一个 ID
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: 'dist/SubtitleVideoPro-Windows.exe'
+          subject-path: 'dist/SubtitleVideoPro.exe'
 
-      - name: Upload Windows Artifact
+      # 2. 👑 核心破解步：把隐藏的证明文件拷出来，变成肉眼可见的 .jsonl 文件
+      - name: Export Provenance File (导出实体证明文件)
+        shell: bash
+        run: |
+          cp "${{ steps.attest.outputs.bundle-path }}" "dist/SubtitleVideoPro-provenance.jsonl"
+
+      # 3. 把 exe 和 证明文件 一起打包存入中转站
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Windows-EXE
-          path: dist/SubtitleVideoPro-Windows.exe
+          path: |
+            dist/SubtitleVideoPro.exe
+            dist/SubtitleVideoPro-provenance.jsonl
 
   # ==================== 工人 2：负责打包 macOS (生成 .dmg) ====================
   build-macos:
@@ -120,9 +131,8 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.version || github.ref_name }}
           name: Release ${{ github.event.inputs.version || github.ref_name }}
-          # 👑 同时把 .exe 和 .dmg 挂到展柜上
           files: |
-            artifacts/SubtitleVideoPro-Windows.exe
-            artifacts/SubtitleVideoPro-macOS.dmg
+            artifacts/SubtitleVideoPro.exe
+            artifacts/SubtitleVideoPro-provenance.jsonl  # 👑 把证明文件也发到 Release 页面
           generate_release_notes: true
           make_latest: true
