@@ -36,8 +36,8 @@ jobs:
 
       - name: Package to EXE
         run: |
-          pyinstaller --noconfirm --clean --noconsole --onefile --name "SubtitleVideoPro-Windows" --collect-all playwright main.py
-
+          pyinstaller --noconfirm --clean --noconsole --onefile --name "SubtitleVideoPro-Windows" --icon "assets/icon.ico" --collect-all playwright main.py
+          
       # 1. 生成安全证明，并给这一步加上 id: attest 方便后续调用
       - name: Attest EXE (生成安全证明)
         id: attest  # 👑 关键：加一个 ID
@@ -85,8 +85,8 @@ jobs:
       - name: Package to Mac APP
         # Mac 必须要加 --windowed 参数，这样才会生成漂亮的 .app 图形应用文件夹
         run: |
-          pyinstaller --noconfirm --clean --windowed --onefile --name "SubtitleVideoPro" --collect-all playwright main.py
-
+          pyinstaller --noconfirm --clean --windowed --onefile --name "SubtitleVideoPro" --icon "assets/icon.icns" --collect-all playwright main.py
+          
       - name: Create DMG Installer
         # 使用 create-dmg 工具，把 .app 封装成苹果用户最熟悉的 .dmg 安装包
         run: |
