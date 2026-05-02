@@ -3,13 +3,7 @@ name: Build and Release (Windows + macOS)
 on:
   push:
     tags:
-      - 'v*' # 打标签时自动触发
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'v1.0.6'
-        required: true
-        default: 'v1.0.0'
+      - 'v*'
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -151,8 +145,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.version || github.ref_name }}
-          name: Release ${{ github.event.inputs.version || github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
           # 👑 终极发货命令：中转站里有啥，全给我发上去！
           files: artifacts/**/*
           generate_release_notes: true
