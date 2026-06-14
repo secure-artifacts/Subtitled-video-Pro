@@ -30,9 +30,9 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(chromium_flags)
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QStackedWidget, QToolButton,
-    QMenu, QCheckBox, QLabel, QMessageBox, QTextEdit, QLineEdit, QAbstractSpinBox
+    QMenu, QCheckBox, QLabel, QMessageBox, QTextEdit, QLineEdit, QAbstractSpinBox, QStyle
 )
-from PyQt6.QtCore import Qt, QSettings
+from PyQt6.QtCore import Qt, QSettings, QSize
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 
 from core import auto_sync_cloud_data
@@ -49,6 +49,8 @@ from room_settings import SettingsView
 class SubtitledvideoPro(QMainWindow):
     def __init__(self, project_data):
         super().__init__()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
+        self._chrome_drag_pos = None
         self.setWindowTitle("Subtitle Video Pro - 工程房间版")
         self.fit_initial_window_to_screen()
         self.setStyleSheet("background-color: #11111b; color: #cdd6f4;")
@@ -95,6 +97,10 @@ class SubtitledvideoPro(QMainWindow):
 
     def create_topbar(self):
         self.topbar = QWidget()
+        self.topbar.mousePressEvent = self._chrome_mouse_press
+        self.topbar.mouseMoveEvent = self._chrome_mouse_move
+        self.topbar.mouseReleaseEvent = self._chrome_mouse_release
+        self.topbar.mouseDoubleClickEvent = self._chrome_mouse_double_click
         self.topbar.setStyleSheet("""
             QWidget { background-color: #181825; border-bottom: 1px solid #313244; }
             QToolButton, QPushButton {
@@ -111,6 +117,10 @@ class SubtitledvideoPro(QMainWindow):
         layout = QHBoxLayout(self.topbar)
         layout.setContentsMargins(8, 4, 10, 4)
         layout.setSpacing(4)
+
+        self.chrome_title = QLabel("Subtitle Composer")
+        self.chrome_title.setStyleSheet("color: #cdd6f4; font-weight: 900; padding: 0 10px 0 4px; border: none;")
+        layout.addWidget(self.chrome_title)
 
         self.btn_toggle_nav = QToolButton()
         self.btn_toggle_nav.setText("☰")
@@ -147,6 +157,24 @@ class SubtitledvideoPro(QMainWindow):
         self.auto_save_checkbox.stateChanged.connect(self.set_auto_save_enabled)
         layout.addWidget(self.auto_save_checkbox)
 
+        self.btn_window_min = QToolButton()
+        self.btn_window_min.setText("─")
+        self.btn_window_min.setToolTip("最小化")
+        self.btn_window_min.clicked.connect(self.showMinimized)
+        layout.addWidget(self.btn_window_min)
+
+        self.btn_window_max = QToolButton()
+        self.btn_window_max.setText("□")
+        self.btn_window_max.setToolTip("最大化/还原")
+        self.btn_window_max.clicked.connect(self.toggle_max_restore)
+        layout.addWidget(self.btn_window_max)
+
+        self.btn_window_close = QToolButton()
+        self.btn_window_close.setText("×")
+        self.btn_window_close.setToolTip("关闭")
+        self.btn_window_close.clicked.connect(self.close)
+        layout.addWidget(self.btn_window_close)
+
         self.main_layout.addWidget(self.topbar)
         self.update_history_buttons()
 
@@ -156,6 +184,27 @@ class SubtitledvideoPro(QMainWindow):
         btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         btn.setMenu(menu)
         return btn
+
+    def _chrome_mouse_press(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._chrome_drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def _chrome_mouse_move(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton and self._chrome_drag_pos is not None:
+            if self.isMaximized():
+                self.showNormal()
+            self.move(event.globalPosition().toPoint() - self._chrome_drag_pos)
+            event.accept()
+
+    def _chrome_mouse_release(self, event):
+        self._chrome_drag_pos = None
+        event.accept()
+
+    def _chrome_mouse_double_click(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.toggle_max_restore()
+            event.accept()
 
     def _action(self, text, callback, shortcut=None, checkable=False, checked=False):
         action = QAction(text, self)
@@ -272,20 +321,20 @@ class SubtitledvideoPro(QMainWindow):
         self.nav_widget = QWidget()
         self.nav_widget.setStyleSheet("background-color: #181825; border-top: 1px solid #313244;")
         nav_layout = QHBoxLayout(self.nav_widget)
-        nav_layout.setContentsMargins(10, 10, 10, 10)
-        nav_layout.setSpacing(10)
+        nav_layout.setContentsMargins(10, 4, 10, 4)
+        nav_layout.setSpacing(8)
 
         nav_btn_style = """
-            QPushButton { background-color: transparent; color: #a6adc8; font-size: 14px; font-weight: bold; border: none; padding: 10px 14px; border-radius: 8px; }
-            QPushButton:hover { background-color: #313244; color: #cdd6f4; }
-            QPushButton:checked { background-color: #313244; color: #a6e3a1; }
+            QToolButton { background-color: transparent; color: #a6adc8; border: none; padding: 5px 10px; border-radius: 4px; min-width: 46px; max-width: 60px; }
+            QToolButton:hover { background-color: #313244; color: #cdd6f4; }
+            QToolButton:checked { background-color: #11111b; color: #a6e3a1; border-bottom: 2px solid #a6e3a1; }
         """
 
-        self.btn_project = QPushButton("📁 工程")
-        self.btn_edit = QPushButton("🎬 精修")
-        self.btn_batch = QPushButton("📦 批量")
-        self.btn_deliver = QPushButton("🚀 导出")
-        self.btn_settings = QPushButton("⚙️ 设置")
+        self.btn_project = QToolButton()
+        self.btn_edit = QToolButton()
+        self.btn_batch = QToolButton()
+        self.btn_deliver = QToolButton()
+        self.btn_settings = QToolButton()
 
         self.nav_buttons = [
             self.btn_project,
@@ -305,6 +354,21 @@ class SubtitledvideoPro(QMainWindow):
         for btn in self.nav_buttons:
             btn.setStyleSheet(nav_btn_style)
             btn.setCheckable(True)
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            btn.setIconSize(QSize(18, 18))
+            btn.setFixedSize(54, 34)
+            btn.setAutoRaise(True)
+
+        self.btn_project.setToolTip("工程大厅")
+        self.btn_edit.setToolTip("精修时间线")
+        self.btn_batch.setToolTip("批量创建")
+        self.btn_deliver.setToolTip("导出中心")
+        self.btn_settings.setToolTip("设置")
+        self.btn_project.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirHomeIcon))
+        self.btn_edit.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        self.btn_batch.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogListView))
+        self.btn_deliver.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.btn_settings.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView))
 
         nav_layout.addStretch()
         for btn in self.nav_buttons:
@@ -319,15 +383,15 @@ class SubtitledvideoPro(QMainWindow):
         self.btn_settings.clicked.connect(lambda: self.switch_room(4))
 
     def apply_chrome_theme(self, theme_key):
-        colors = PROJECT_HALL_THEMES.get(theme_key, PROJECT_HALL_THEMES["dark_star"])
-        self.current_theme_key = theme_key if theme_key in PROJECT_HALL_THEMES else "dark_star"
+        colors = PROJECT_HALL_THEMES.get(theme_key, PROJECT_HALL_THEMES["graphite_cut"])
+        self.current_theme_key = theme_key if theme_key in PROJECT_HALL_THEMES else "graphite_cut"
         self.setStyleSheet(f"background-color: {colors['bg']}; color: {colors['text']};")
         if hasattr(self, "topbar"):
             self.topbar.setStyleSheet(f"""
                 QWidget {{ background-color: {colors['panel']}; border-bottom: 1px solid {colors['border']}; }}
                 QToolButton, QPushButton {{
                     background-color: transparent; color: {colors['muted']}; border: none;
-                    padding: 7px 9px; border-radius: 6px; font-weight: bold;
+                    padding: 6px 9px; border-radius: 4px; font-weight: bold;
                 }}
                 QToolButton:hover, QPushButton:hover {{ background-color: {colors['panel_2']}; color: {colors['text']}; }}
                 QToolButton:disabled {{ color: {colors['border']}; }}
@@ -336,23 +400,30 @@ class SubtitledvideoPro(QMainWindow):
                 QMenu::item:selected {{ background-color: {colors['selected']}; color: {colors['selected_text']}; }}
                 QCheckBox {{ color: {colors['accent_2']}; font-weight: bold; padding: 4px 8px; }}
             """)
+        if hasattr(self, "chrome_title"):
+            self.chrome_title.setStyleSheet(f"color: {colors['text']}; font-weight: 900; padding: 0 10px 0 4px; border: none;")
+        if hasattr(self, "btn_window_close"):
+            self.btn_window_close.setStyleSheet(
+                f"QToolButton {{ background-color: transparent; color: {colors['muted']}; border: none; padding: 6px 10px; border-radius: 4px; font-weight: 900; }}"
+                f"QToolButton:hover {{ background-color: {colors['danger']}; color: {colors['selected_text']}; }}"
+            )
         if hasattr(self, "project_label"):
             self.project_label.setStyleSheet(f"color: {colors['muted']}; border: none; padding-left: 6px;")
         if hasattr(self, "nav_widget"):
             self.nav_widget.setVisible(True)
             self.nav_widget.setStyleSheet(f"background-color: {colors['panel']}; border-top: 1px solid {colors['border']};")
             nav_btn_style = f"""
-                QPushButton {{
+                QToolButton {{
                     background-color: transparent;
                     color: {colors['muted']};
-                    font-size: 14px;
-                    font-weight: bold;
                     border: none;
-                    padding: 10px 14px;
-                    border-radius: 8px;
+                    padding: 5px 10px;
+                    border-radius: 4px;
+                    min-width: 46px;
+                    max-width: 60px;
                 }}
-                QPushButton:hover {{ background-color: {colors['panel_2']}; color: {colors['text']}; }}
-                QPushButton:checked {{ background-color: {colors['selected']}; color: {colors['selected_text']}; }}
+                QToolButton:hover {{ background-color: {colors['panel_2']}; color: {colors['text']}; }}
+                QToolButton:checked {{ background-color: {colors['hint']}; color: {colors['accent_2']}; border-bottom: 2px solid {colors['accent_2']}; }}
             """
             for btn in getattr(self, "nav_buttons", []):
                 btn.setStyleSheet(nav_btn_style)
@@ -479,6 +550,15 @@ class SubtitledvideoPro(QMainWindow):
             self.showNormal()
         else:
             self.showMaximized()
+        self._update_window_control_state()
+
+    def _update_window_control_state(self):
+        if hasattr(self, "btn_window_max"):
+            self.btn_window_max.setText("❐" if self.isMaximized() else "□")
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        self._update_window_control_state()
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
@@ -520,7 +600,7 @@ class SubtitledvideoPro(QMainWindow):
         ]
         for room in self.rooms:
             self.stack.addWidget(room)
-        self.apply_chrome_theme(getattr(self.room_project, "project_theme", "dark_star"))
+        self.apply_chrome_theme(getattr(self.room_project, "project_theme", "graphite_cut"))
         self.create_global_shortcuts()
 
     def open_default_room(self):

@@ -12,40 +12,60 @@ import shutil
 import csv
 import io
 import copy
+import random
 from datetime import datetime
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QFrame, QProgressBar, QTextEdit, QFileDialog, 
-                             QMessageBox, QComboBox, QTabWidget, QScrollArea, QLineEdit, QDialog, QDoubleSpinBox, QTabBar, QInputDialog)
+                             QMessageBox, QComboBox, QTabWidget, QScrollArea, QLineEdit, QDialog, QDoubleSpinBox, QTabBar, QInputDialog,
+                             QSizePolicy)
 from PyQt6.QtWidgets import QSlider, QSpinBox, QCheckBox
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QTimer, QMetaObject, Q_ARG
 from PyQt6.QtGui import QPixmap
 from playwright.sync_api import sync_playwright
 
-from core import get_ffmpeg_cmd, get_ffprobe_cmd
+from core import get_ffmpeg_cmd
+import media_probe
 from app_theme import apply_tinted_styles
-from app_config import get_output_resolution, resolution_to_size
+from room_theme_bridge import apply_room_theme_bridge
+from app_config import get_output_resolution, load_app_config, resolution_to_size
+from app_storage import read_json_file, resolve_user_file, write_json_file
 from render_config import build_video_encoder_args, get_render_profile
-from render_timing import build_subtitle_frame_schedule, render_tail_padding_seconds, subtitle_supersample
+from render_pipeline_model import ffconcat_file_entry, ffconcat_inout_entry, ffmpeg_canvas_source, ffmpeg_layer_overlay_xy, ffmpeg_layer_scale_filter
+from render_timing import active_subtitles_for_frame, build_subtitle_frame_schedule, render_tail_padding_seconds, subtitle_supersample
 # 确保导入了 get_exact_duration
 from ui_components import (
     get_exact_duration, get_video_dimensions, render_signature_html, render_subtitle_html,
     get_video_stream_duration,
     rebalance_subtitle_layout, tokenize_display_text,
     normalize_word_timestamps, align_reference_text_to_timestamps,
+    format_subtitle_text_spacing,
     default_signature_config, normalize_signature_config,
+    should_defer_subtitle_break_for_readability,
+    merge_single_word_subtitle_segments,
     FAITH_WORDS
 )
 from project_io import create_reel, sync_project_assets_to_project_dir, update_room_state, save_project
 from workspace_config import WORKSPACE_MODE_CLOUD, get_active_workspace, get_workspace_config
+from job_control import CooperativeJobControl
+from caption_presets import (
+    REFERENCE_NARRATIVE_CHUNK_MODE,
+    is_reference_narrative_chunk_mode,
+    merge_built_in_style_presets,
+)
 
-PRESETS_FILE = os.path.join(os.getcwd(), "style_presets.json") 
-SIGNATURE_PRESETS_FILE = os.path.join(os.getcwd(), "signature_presets.json")
-BATCH_QUEUE_BACKUPS_FILE = os.path.join(os.getcwd(), "batch_queue_backups.json")
+PRESETS_FILE = resolve_user_file("style_presets.json", legacy_root=os.getcwd(), kind="config")
+SIGNATURE_PRESETS_FILE = resolve_user_file("signature_presets.json", legacy_root=os.getcwd(), kind="config")
+BATCH_QUEUE_BACKUPS_FILE = resolve_user_file("batch_queue_backups.json", legacy_root=os.getcwd(), kind="state")
 STYLE_PRESET_POSITION_KEY = "__position__"
 SUBTITLE_SUPERSAMPLE = subtitle_supersample()
 MEDIA_EXTS = (".mp4", ".mov", ".webm", ".jpg", ".jpeg", ".png")
 AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
 TEXT_EXTS = (".txt", ".md", ".srt", ".vtt", ".ass", ".lrc")
+BATCH_MUSIC_MODES = (
+    ("顺序循环", "cycle"),
+    ("随机分配", "random"),
+    ("固定第一首", "first"),
+)
 
 
 def split_style_preset(raw):
@@ -107,14 +127,9 @@ def built_in_signature_presets():
 
 def load_signature_presets_file():
     presets = built_in_signature_presets()
-    if os.path.exists(SIGNATURE_PRESETS_FILE):
-        try:
-            with open(SIGNATURE_PRESETS_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            if isinstance(saved, dict):
-                presets.update(saved)
-        except Exception:
-            pass
+    saved = read_json_file(SIGNATURE_PRESETS_FILE, default={})
+    if isinstance(saved, dict):
+        presets.update(saved)
     return presets
 
 
@@ -269,13 +284,7 @@ def match_audio_for_media(video_name, audio_lookup):
 
 
 def local_get_cf_accounts():
-    config_path = os.path.join(os.getcwd(), "settings.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                return json.load(f).get("cf_accounts", [])
-        except: pass
-    return []
+    return load_app_config().get("cf_accounts", [])
 
 def get_browser_path():
     if os.name == 'nt': 
@@ -304,27 +313,7 @@ def launch_render_browser(playwright):
 
 
 def has_audio_stream(path):
-    if not path or not os.path.exists(path):
-        return False
-    try:
-        proc = subprocess.run(
-            [
-                get_ffprobe_cmd(),
-                "-v", "error",
-                "-select_streams", "a:0",
-                "-show_entries", "stream=index",
-                "-of", "csv=p=0",
-                path,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=8,
-            creationflags=0x08000000 if os.name == 'nt' else 0,
-        )
-        return bool(proc.stdout.strip())
-    except Exception:
-        return False
+    return media_probe.has_audio_stream(path)
 
 class BatchTaskRow(QFrame):
     def __init__(self, parent_view=None, parent=None):
@@ -336,18 +325,18 @@ class BatchTaskRow(QFrame):
 
     def init_ui(self):
         self.setStyleSheet("QFrame { background-color: #1e1e2e; border: 1px solid #313244; border-radius: 6px; }")
-        self.setFixedHeight(112)
+        self.setFixedHeight(96)
         row_layout = QHBoxLayout(self)
-        row_layout.setContentsMargins(10, 8, 10, 8)
-        row_layout.setSpacing(10)
+        row_layout.setContentsMargins(9, 6, 9, 6)
+        row_layout.setSpacing(8)
 
         self.btn_vid = QPushButton("➕ 选画面")
-        self.btn_vid.setFixedSize(88, 30)
+        self.btn_vid.setFixedSize(88, 28)
         self.btn_vid.setStyleSheet("background-color: #89b4fa; color: #11111b; font-weight: bold; border-radius: 4px; border: none;")
         self.btn_vid.clicked.connect(self.select_video)
 
         self.btn_aud = QPushButton("🎵 选配音")
-        self.btn_aud.setFixedSize(88, 30)
+        self.btn_aud.setFixedSize(88, 28)
         self.btn_aud.setStyleSheet("background-color: #cba6f7; color: #11111b; font-weight: bold; border-radius: 4px; border: none;")
         self.btn_aud.clicked.connect(self.select_audio)
 
@@ -388,17 +377,18 @@ class BatchTaskRow(QFrame):
         self.txt_title = QLineEdit()
         self.txt_title.setPlaceholderText("大标题 (可选)")
         self.txt_title.setStyleSheet("background-color: #11111b; color: #cdd6f4; border: 1px solid #313244; padding: 5px;")
-        self.txt_title.setFixedWidth(120)
+        self.txt_title.setFixedWidth(112)
         row_layout.addWidget(self.txt_title)
 
         self.txt_content = QTextEdit()
         self.txt_content.setPlaceholderText("详细正文文案 (支持多行/不填则盲听)")
         self.txt_content.setStyleSheet("background-color: #11111b; color: #a6adc8; border: 1px solid #313244; padding: 5px;")
+        self.txt_content.setFixedHeight(64)
         row_layout.addWidget(self.txt_content, stretch=1)
         
         # 👑 新增：预览按钮
         self.btn_preview = QPushButton("👁️ 预览")
-        self.btn_preview.setFixedSize(70, 40)
+        self.btn_preview.setFixedSize(68, 36)
         self.btn_preview.setStyleSheet("background-color: #f9e2af; color: #11111b; font-weight: bold; border-radius: 4px; border: none;")
         self.btn_preview.clicked.connect(self.preview_frame)
         row_layout.addWidget(self.btn_preview)
@@ -409,11 +399,18 @@ class BatchTaskRow(QFrame):
         self.lbl_status.setStyleSheet("color: #a6adc8; border: none;")
         row_layout.addWidget(self.lbl_status)
 
-        self.btn_del = QPushButton("❌")
-        self.btn_del.setFixedSize(40, 40)
-        self.btn_del.setStyleSheet("background-color: #f38ba8; color: #11111b; font-weight: bold; border-radius: 4px; border: none;")
+        self.btn_del = QPushButton("X")
+        self.btn_del.setToolTip("删除这一行")
+        self.btn_del.setFixedSize(36, 36)
+        self.btn_del.setStyleSheet("background-color: #f36f8e; color: #2b0b12; font-size: 15px; font-weight: 900; border-radius: 6px; border: none;")
         self.btn_del.clicked.connect(self.deleteLater)
         row_layout.addWidget(self.btn_del)
+        self.apply_compact_theme()
+
+    def apply_compact_theme(self):
+        self.btn_del.setText("X")
+        self.btn_del.setStyleSheet("background-color: #f36f8e; color: #2b0b12; font-size: 15px; font-weight: 900; border-radius: 6px; border: none;")
+        self.btn_preview.setStyleSheet("background-color: #f9d17a; color: #111315; font-weight: 900; border-radius: 6px; border: none;")
 
     def select_video(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择画面", "", media_file_filter())
@@ -521,7 +518,7 @@ class BatchTaskRow(QFrame):
                 
                 px = sub_data.get("pos_x", 0.0); py = sub_data.get("pos_y", 25.0)
                 base_css = f"position: absolute; left: calc(50% + {px}%); top: calc(50% + {py}%); transform: translate(-50%, -50%); z-index: 10; width: max-content; max-width: 92%;"
-                sub_html = render_subtitle_html(sub_data, 0.5, proj_w)
+                sub_html = render_subtitle_html(sub_data, 0.5, proj_w, proj_h)
                 html_content = f"<!DOCTYPE html><html><head><style>html, body {{ margin: 0; padding: 0; width: 100vw; height: 100vh; overflow: hidden; background: transparent; display: flex; justify-content: center; align-items: center; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }} #scale-wrapper {{ width: 100vw; height: 100vh; position: absolute; left: 0; top: 0; filter: drop-shadow(0px 0px 0px transparent); }}</style></head><body><div id='scale-wrapper'><div style='{base_css}'>{sub_html}</div></div></body></html>"
                 
                 page.set_content(html_content)
@@ -577,12 +574,15 @@ class BatchView(QWidget):
         self.output_dir = ""
         self.project_output_dir = ""
         self.batch_music_path = ""
+        self.batch_music_paths = []
         self.task_queue = []
         self.batch_queues = []
         self.current_queue_index = 0
         self._switching_queue = False
         self.current_idx = 0
         self.is_running = False
+        self.batch_job_control = CooperativeJobControl()
+        self.batch_run_kind = ""
         
         self.sig_log.connect(self._append_log)
         self.sig_progress.connect(self._update_progress)
@@ -595,8 +595,8 @@ class BatchView(QWidget):
 
     def init_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(15)
+        main_layout.setContentsMargins(14, 10, 14, 10)
+        main_layout.setSpacing(8)
 
         queue_shell = QFrame()
         queue_shell.setStyleSheet("QFrame { background-color: #181825; border: 1px solid #313244; border-radius: 8px; }")
@@ -634,8 +634,8 @@ class BatchView(QWidget):
         self.global_queue_panel = QFrame()
         self.global_queue_panel.setStyleSheet("QFrame { background-color: #1e1e2e; border: 1px solid #a6e3a1; border-radius: 8px; }")
         global_layout = QHBoxLayout(self.global_queue_panel)
-        global_layout.setContentsMargins(12, 8, 12, 8)
-        global_layout.setSpacing(10)
+        global_layout.setContentsMargins(12, 6, 12, 6)
+        global_layout.setSpacing(8)
         global_layout.addWidget(QLabel("总开关", styleSheet="color: #a6e3a1; font-size: 16px; font-weight: 900; border: none;"))
         self.lbl_global_queue_stats = QLabel("")
         self.lbl_global_queue_stats.setStyleSheet("color: #cdd6f4; border: none;")
@@ -651,7 +651,7 @@ class BatchView(QWidget):
         main_layout.addWidget(self.global_queue_panel)
 
         top_header = QHBoxLayout()
-        top_header.addWidget(QLabel("📦 工业级批量生成引擎 (Matrix Pipeline)", styleSheet="font-size: 22px; font-weight: bold; color: #cdd6f4;"))
+        top_header.addWidget(QLabel("📦 工业级批量生成引擎", styleSheet="font-size: 19px; font-weight: 900; color: #cdd6f4;"))
         top_header.addStretch()
         
         # 👑 音频静音控制区
@@ -723,7 +723,7 @@ class BatchView(QWidget):
         
         top_header.addWidget(QLabel("✂️ AI断句:", styleSheet="color: #89b4fa; font-weight: bold; margin-left: 15px;"))
         self.chunk_mode = QComboBox()
-        self.chunk_mode.addItems(["单字轰炸 (1字/句)", "智能重点短句 (3-4词为主)", "自然短句 (1-4词)", "双词节奏 (2词/句)", "三词短句 (3词/句)", "四词短句 (4词/句)", "短句快闪 (3-5字)", "长句大段 (约10字)"])
+        self.chunk_mode.addItems(["单字轰炸 (1字/句)", "智能重点短句 (3-4词为主)", "智能听译 (4-7词，适配双行按词)", REFERENCE_NARRATIVE_CHUNK_MODE, "自然短句 (1-4词)", "双词节奏 (2词/句)", "三词短句 (3词/句)", "四词短句 (4词/句)", "短句快闪 (3-5字)", "长句大段 (约10字)"])
         self.chunk_mode.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 10px; font-weight: bold; border-radius: 5px;")
         top_header.addWidget(self.chunk_mode)
 
@@ -744,11 +744,11 @@ class BatchView(QWidget):
         music_row.setSpacing(8)
         music_row.addWidget(QLabel("🎼 批量配乐:", styleSheet="color: #f9e2af; font-weight: bold;"))
         self.chk_batch_music = QCheckBox("启用")
-        self.chk_batch_music.setToolTip("启用后，配乐会自动循环/裁切到每条视频的最终时长。")
+        self.chk_batch_music.setToolTip("启用后，配乐池会按分配方式写入每条视频，并自动循环/裁切到最终时长。")
         self.chk_batch_music.setStyleSheet("QCheckBox { color: #cdd6f4; font-weight: bold; }")
         self.chk_batch_music.stateChanged.connect(self._on_batch_music_enabled_changed)
         music_row.addWidget(self.chk_batch_music)
-        self.btn_select_batch_music = QPushButton("选择配乐")
+        self.btn_select_batch_music = QPushButton("选择配乐池")
         self.btn_select_batch_music.setStyleSheet("background-color: #313244; color: #cdd6f4; font-weight: bold; padding: 5px 12px; border-radius: 5px;")
         self.btn_select_batch_music.clicked.connect(self.select_batch_music)
         music_row.addWidget(self.btn_select_batch_music)
@@ -756,6 +756,14 @@ class BatchView(QWidget):
         self.btn_clear_batch_music.setStyleSheet("background-color: #45475a; color: #cdd6f4; font-weight: bold; padding: 5px 10px; border-radius: 5px;")
         self.btn_clear_batch_music.clicked.connect(self.clear_batch_music)
         music_row.addWidget(self.btn_clear_batch_music)
+        self.batch_music_mode_combo = QComboBox()
+        for label, mode in BATCH_MUSIC_MODES:
+            self.batch_music_mode_combo.addItem(label, userData=mode)
+        self.batch_music_mode_combo.setFixedWidth(104)
+        self.batch_music_mode_combo.setToolTip("多首配乐的分配方式。顺序循环适合批量稳定生产，随机分配适合做变化。")
+        self.batch_music_mode_combo.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 8px; font-weight: bold; border-radius: 5px;")
+        self.batch_music_mode_combo.currentIndexChanged.connect(lambda *_: (self._set_batch_music_controls_enabled(), self._capture_current_queue_state()))
+        music_row.addWidget(self.batch_music_mode_combo)
         self.lbl_batch_music = QLabel("未选择；启用后默认匹配每条视频时长")
         self.lbl_batch_music.setStyleSheet("color: #a6adc8; font-size: 12px;")
         music_row.addWidget(self.lbl_batch_music, stretch=1)
@@ -816,10 +824,11 @@ class BatchView(QWidget):
         signature_row.addWidget(QLabel("精修页保存的署名模板会出现在这里，批量建工程时自动写入。", styleSheet="color: #a6adc8; font-size: 12px;"), stretch=1)
         main_layout.addLayout(signature_row)
         self.tabs = QTabWidget()
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         self.tabs.setStyleSheet("""
-            QTabBar::tab { background: #181825; color: #a6adc8; padding: 10px 20px; font-size: 15px; font-weight: bold; border-top-left-radius: 8px; border-top-right-radius: 8px; }
+            QTabBar::tab { background: #181825; color: #a6adc8; padding: 7px 14px; font-size: 13px; font-weight: bold; border-top-left-radius: 7px; border-top-right-radius: 7px; }
             QTabBar::tab:selected { background: #313244; color: #a6e3a1; }
-            QTabWidget::pane { border: 2px solid #313244; border-radius: 8px; background: #181825; }
+            QTabWidget::pane { border: 1px solid #313244; border-radius: 8px; background: #181825; }
         """)
         
         self.tab_table = QWidget()
@@ -830,19 +839,38 @@ class BatchView(QWidget):
         self.init_folder_tab()
         self.tabs.addTab(self.tab_folder, "📁 文件夹全自动匹配")
 
-        main_layout.addWidget(self.tabs, stretch=1)
+        main_layout.addWidget(self.tabs)
 
         bottom_layout = QHBoxLayout()
         self.log_console = QTextEdit()
         self.log_console.setReadOnly(True)
-        self.log_console.setFixedHeight(120)
-        self.log_console.setStyleSheet("background-color: #11111b; color: #a6adc8; font-family: Consolas; font-size: 13px; border: 1px solid #313244; border-radius: 5px; padding: 10px;")
+        self.log_console.setFixedHeight(72)
+        self.log_console.setStyleSheet("background-color: #11111b; color: #a6adc8; font-family: Consolas; font-size: 12px; border: 1px solid #313244; border-radius: 5px; padding: 6px;")
         bottom_layout.addWidget(self.log_console, stretch=1)
         main_layout.addLayout(bottom_layout)
 
+        run_control_row = QHBoxLayout()
+        run_control_row.setSpacing(8)
+        self.lbl_batch_run_state = QLabel("批量状态：空闲")
+        self.lbl_batch_run_state.setStyleSheet("color: #a6adc8; font-weight: bold;")
+        self.btn_batch_pause = QPushButton("暂停")
+        self.btn_batch_pause.setToolTip("当前任务完成后暂停，不会强行打断正在处理的素材。")
+        self.btn_batch_cancel = QPushButton("取消")
+        self.btn_batch_cancel.setToolTip("当前任务完成后停止后续队列。")
+        self.btn_batch_pause.setEnabled(False)
+        self.btn_batch_cancel.setEnabled(False)
+        self.btn_batch_pause.setStyleSheet("background-color: #f9e2af; color: #11111b; font-weight: bold; padding: 6px 14px; border-radius: 5px;")
+        self.btn_batch_cancel.setStyleSheet("background-color: #f38ba8; color: #11111b; font-weight: bold; padding: 6px 14px; border-radius: 5px;")
+        self.btn_batch_pause.clicked.connect(self.toggle_batch_pause)
+        self.btn_batch_cancel.clicked.connect(self.request_batch_cancel)
+        run_control_row.addWidget(self.lbl_batch_run_state, stretch=1)
+        run_control_row.addWidget(self.btn_batch_pause)
+        run_control_row.addWidget(self.btn_batch_cancel)
+        main_layout.addLayout(run_control_row)
+
         self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedHeight(25)
-        self.progress_bar.setStyleSheet("QProgressBar { border: 2px solid #313244; border-radius: 5px; text-align: center; color: white; font-weight: bold; } QProgressBar::chunk { background-color: #a6e3a1; }")
+        self.progress_bar.setFixedHeight(20)
+        self.progress_bar.setStyleSheet("QProgressBar { border: 1px solid #313244; border-radius: 5px; text-align: center; color: white; font-weight: bold; } QProgressBar::chunk { background-color: #a6e3a1; }")
         self.progress_bar.setValue(0)
         main_layout.addWidget(self.progress_bar)
 
@@ -854,6 +882,9 @@ class BatchView(QWidget):
         self._theme_colors = colors
         self._theme_key = theme_key or ""
         apply_tinted_styles(self, colors)
+        apply_room_theme_bridge(self, colors)
+        for row in self._table_rows():
+            row.apply_compact_theme()
 
     def _new_queue_state(self, name=None):
         idx = len(self.batch_queues) + 1
@@ -867,6 +898,8 @@ class BatchView(QWidget):
             "video_volume": self.video_volume_percent() if hasattr(self, "video_volume_spin") else 20,
             "music_enabled": bool(getattr(self, "chk_batch_music", None) and self.chk_batch_music.isChecked()),
             "music_path": getattr(self, "batch_music_path", ""),
+            "music_paths": self._current_batch_music_paths() if hasattr(self, "batch_music_paths") else [],
+            "music_mode": self._batch_music_mode() if hasattr(self, "batch_music_mode_combo") else "cycle",
             "music_volume": self.music_volume_percent() if hasattr(self, "batch_music_volume_spin") else 35,
             "performance_mode": self.performance_mode.currentText() if hasattr(self, "performance_mode") else "",
             "preset_name": self.preset_combo.currentText() if hasattr(self, "preset_combo") else "",
@@ -913,6 +946,8 @@ class BatchView(QWidget):
             "video_volume": self.video_volume_percent(),
             "music_enabled": bool(self.chk_batch_music.isChecked()) if hasattr(self, "chk_batch_music") else False,
             "music_path": self.batch_music_path,
+            "music_paths": self._current_batch_music_paths(),
+            "music_mode": self._batch_music_mode(),
             "music_volume": self.music_volume_percent(),
             "performance_mode": self.performance_mode.currentText(),
             "preset_name": self.preset_combo.currentText(),
@@ -947,6 +982,7 @@ class BatchView(QWidget):
             self.table_layout.addWidget(row)
             if hasattr(self, "_theme_colors"):
                 apply_tinted_styles(row, self._theme_colors)
+                row.apply_compact_theme()
 
     def _apply_queue_state(self, state):
         self._switching_queue = True
@@ -966,7 +1002,8 @@ class BatchView(QWidget):
                 sig_idx = self.signature_preset_combo.findData(sig_name, Qt.ItemDataRole.UserRole)
                 self.signature_preset_combo.setCurrentIndex(sig_idx if sig_idx >= 0 else 0)
             self._set_video_volume(int(state.get("video_volume", 20)), enabled=True)
-            self.batch_music_path = state.get("music_path", "")
+            self._set_batch_music_paths(state.get("music_paths") or state.get("music_path", ""))
+            self._set_batch_music_mode(state.get("music_mode", "cycle"))
             if hasattr(self, "chk_batch_music"):
                 self.chk_batch_music.blockSignals(True)
                 self.chk_batch_music.setChecked(bool(state.get("music_enabled", False)))
@@ -1032,18 +1069,11 @@ class BatchView(QWidget):
             self.lbl_global_queue_stats.setText(f"{len(self.batch_queues)} 个队列 / 共 {total} 个候选任务")
 
     def _load_queue_backups(self):
-        if not os.path.exists(BATCH_QUEUE_BACKUPS_FILE):
-            return []
-        try:
-            with open(BATCH_QUEUE_BACKUPS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
+        data = read_json_file(BATCH_QUEUE_BACKUPS_FILE, default=[])
+        return data if isinstance(data, list) else []
 
     def _write_queue_backups(self, backups):
-        with open(BATCH_QUEUE_BACKUPS_FILE, "w", encoding="utf-8") as f:
-            json.dump(backups, f, indent=2, ensure_ascii=False)
+        write_json_file(BATCH_QUEUE_BACKUPS_FILE, backups, indent=2)
 
     def save_current_queue_backup(self):
         self._capture_current_queue_state()
@@ -1114,12 +1144,78 @@ class BatchView(QWidget):
     def music_volume_percent(self):
         return int(self.batch_music_volume_spin.value()) if hasattr(self, "batch_music_volume_spin") else 35
 
+    def _valid_batch_music_mode(self, mode):
+        valid = {value for _, value in BATCH_MUSIC_MODES}
+        return mode if mode in valid else "cycle"
+
+    def _batch_music_mode(self, state=None):
+        if isinstance(state, dict):
+            return self._valid_batch_music_mode(state.get("music_mode", "cycle"))
+        combo = getattr(self, "batch_music_mode_combo", None)
+        if combo is None:
+            return "cycle"
+        return self._valid_batch_music_mode(combo.currentData(Qt.ItemDataRole.UserRole) or "cycle")
+
+    def _set_batch_music_mode(self, mode):
+        combo = getattr(self, "batch_music_mode_combo", None)
+        if combo is None:
+            return
+        mode = self._valid_batch_music_mode(mode)
+        idx = combo.findData(mode, Qt.ItemDataRole.UserRole)
+        combo.blockSignals(True)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _music_mode_label(self, mode):
+        mode = self._valid_batch_music_mode(mode)
+        return next((label for label, value in BATCH_MUSIC_MODES if value == mode), "顺序循环")
+
+    def _normalize_batch_music_paths(self, paths):
+        if isinstance(paths, str):
+            paths = [paths]
+        clean = []
+        for path in paths or []:
+            p = str(path or "").strip()
+            if p and looks_audio_path(p) and p not in clean:
+                clean.append(p)
+        return clean
+
+    def _set_batch_music_paths(self, paths):
+        self.batch_music_paths = self._normalize_batch_music_paths(paths)
+        self.batch_music_path = self.batch_music_paths[0] if self.batch_music_paths else ""
+
+    def _current_batch_music_paths(self):
+        paths = self._normalize_batch_music_paths(getattr(self, "batch_music_paths", []))
+        fallback = getattr(self, "batch_music_path", "")
+        if fallback and fallback not in paths:
+            paths.insert(0, fallback)
+        self.batch_music_paths = paths
+        self.batch_music_path = paths[0] if paths else ""
+        return paths
+
+    def _batch_music_summary(self, paths, mode):
+        names = [os.path.basename(path) for path in paths]
+        if not names:
+            return ""
+        if len(names) == 1:
+            return f"1 首 · {names[0]}"
+        preview = "、".join(names[:3])
+        if len(names) > 3:
+            preview += f" 等 {len(names)} 首"
+        return f"{len(names)} 首 · {self._music_mode_label(mode)} · {preview}"
+
     def batch_music_enabled(self):
-        return bool(getattr(self, "chk_batch_music", None) and self.chk_batch_music.isChecked() and self.batch_music_path)
+        payload = self._batch_music_payload()
+        return bool(payload.get("enabled"))
 
     def _set_batch_music_controls_enabled(self, enabled=None):
         checked = bool(getattr(self, "chk_batch_music", None) and self.chk_batch_music.isChecked()) if enabled is None else bool(enabled)
-        has_path = bool(getattr(self, "batch_music_path", ""))
+        paths = self._current_batch_music_paths()
+        has_path = bool(paths)
+        mode = self._batch_music_mode()
+        mode_combo = getattr(self, "batch_music_mode_combo", None)
+        if mode_combo is not None:
+            mode_combo.setEnabled(has_path)
         for widget in (getattr(self, "batch_music_volume_slider", None), getattr(self, "batch_music_volume_spin", None)):
             if widget is not None:
                 widget.setEnabled(checked and has_path)
@@ -1130,63 +1226,83 @@ class BatchView(QWidget):
         if getattr(self, "lbl_batch_music", None) is not None:
             if has_path:
                 prefix = "已启用" if checked else "已选择未启用"
-                self.lbl_batch_music.setText(f"{prefix}: {os.path.basename(self.batch_music_path)}")
+                self.lbl_batch_music.setText(f"{prefix}: {self._batch_music_summary(paths, mode)}")
             elif checked:
-                self.lbl_batch_music.setText("已启用，但还没有选择配乐")
+                self.lbl_batch_music.setText("已启用，但还没有选择配乐池")
             else:
-                self.lbl_batch_music.setText("未选择；启用后默认匹配每条视频时长")
+                self.lbl_batch_music.setText("未选择；可一次选择多首配乐并批量分配")
 
     def _on_batch_music_enabled_changed(self, *_):
         self._set_batch_music_controls_enabled()
         self._capture_current_queue_state()
 
     def select_batch_music(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择批量配乐", "", audio_file_filter())
-        if not path:
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择批量配乐（可多选）", "", audio_file_filter())
+        if not paths:
             return
-        self.batch_music_path = path
+        self._set_batch_music_paths(paths)
         if hasattr(self, "chk_batch_music"):
             self.chk_batch_music.setChecked(True)
         self._set_batch_music_controls_enabled(True)
         self._capture_current_queue_state()
 
     def clear_batch_music(self):
-        self.batch_music_path = ""
+        self._set_batch_music_paths([])
         if hasattr(self, "chk_batch_music"):
             self.chk_batch_music.setChecked(False)
         self._set_batch_music_controls_enabled(False)
         self._capture_current_queue_state()
 
     def apply_batch_music_to_all_queues(self):
-        path = getattr(self, "batch_music_path", "").strip()
-        if not path or not os.path.exists(path):
-            return QMessageBox.warning(self, "提示", "请先选择一个有效的批量配乐。")
+        paths = [path for path in self._current_batch_music_paths() if os.path.exists(path)]
+        if not paths:
+            return QMessageBox.warning(self, "提示", "请先选择一个或多个有效的批量配乐。")
         if hasattr(self, "chk_batch_music") and not self.chk_batch_music.isChecked():
             self.chk_batch_music.setChecked(True)
         self._capture_current_queue_state()
         volume = self.music_volume_percent()
+        mode = self._batch_music_mode()
         for state in self.batch_queues:
             state["music_enabled"] = True
-            state["music_path"] = path
+            state["music_path"] = paths[0]
+            state["music_paths"] = list(paths)
+            state["music_mode"] = mode
             state["music_volume"] = volume
         self._update_queue_stats()
-        self.sig_log.emit(f"批量配乐已同步到全部队列：{os.path.basename(path)} @ {volume}%", "#a6e3a1")
+        self.sig_log.emit(f"配乐池已同步到全部队列：{len(paths)} 首 · {self._music_mode_label(mode)} @ {volume}%", "#a6e3a1")
 
     def _batch_music_payload(self, state=None):
         if isinstance(state, dict):
-            path = state.get("music_path", "")
+            raw_paths = state.get("music_paths") or state.get("music_path", "")
             enabled = bool(state.get("music_enabled", False))
+            mode = self._batch_music_mode(state)
             try:
                 volume = int(state.get("music_volume", self.music_volume_percent()))
             except Exception:
                 volume = self.music_volume_percent()
         else:
-            path = getattr(self, "batch_music_path", "")
+            raw_paths = self._current_batch_music_paths()
             enabled = bool(getattr(self, "chk_batch_music", None) and self.chk_batch_music.isChecked())
+            mode = self._batch_music_mode()
             volume = self.music_volume_percent()
-        if not enabled or not path or not os.path.exists(path):
-            return "", max(0, min(100, volume))
-        return path, max(0, min(100, volume))
+        paths = [path for path in self._normalize_batch_music_paths(raw_paths) if os.path.exists(path)]
+        volume = max(0, min(100, volume))
+        if not enabled or not paths:
+            return {"enabled": False, "paths": [], "path": "", "mode": mode, "volume": volume}
+        return {"enabled": True, "paths": paths, "path": paths[0], "mode": mode, "volume": volume}
+
+    def _music_path_for_task(self, payload, task_index):
+        if not isinstance(payload, dict) or not payload.get("enabled"):
+            return ""
+        paths = payload.get("paths") or []
+        if not paths:
+            return ""
+        mode = self._valid_batch_music_mode(payload.get("mode", "cycle"))
+        if mode == "first":
+            return paths[0]
+        if mode == "random":
+            return random.choice(paths)
+        return paths[int(task_index or 0) % len(paths)]
 
     def batch_subtitle_y(self):
         return float(self.global_subtitle_y_spin.value()) if hasattr(self, "global_subtitle_y_spin") else 25.0
@@ -1308,22 +1424,25 @@ class BatchView(QWidget):
 
     def init_table_tab(self):
         layout = QVBoxLayout(self.tab_table)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
         
         toolbar = QHBoxLayout()
-        btn_batch_vid = QPushButton("🎞️ 1. 批量选视频"); btn_batch_vid.setStyleSheet("background-color: #89b4fa; color: #11111b; font-weight: bold; padding: 8px; border-radius: 4px;")
-        btn_batch_aud = QPushButton("🎵 2. 批量选音频"); btn_batch_aud.setStyleSheet("background-color: #cba6f7; color: #11111b; font-weight: bold; padding: 8px; border-radius: 4px;")
-        btn_paste = QPushButton("📋 3. 从表格/Excel一键粘贴"); btn_paste.setStyleSheet("background-color: #b4befe; color: #11111b; font-weight: bold; padding: 8px; border-radius: 4px;")
+        toolbar.setSpacing(8)
+        btn_batch_vid = QPushButton("🎞️ 1. 批量选视频"); btn_batch_vid.setStyleSheet("background-color: #89b4fa; color: #11111b; font-weight: bold; padding: 6px 10px; border-radius: 4px;")
+        btn_batch_aud = QPushButton("🎵 2. 批量选音频"); btn_batch_aud.setStyleSheet("background-color: #cba6f7; color: #11111b; font-weight: bold; padding: 6px 10px; border-radius: 4px;")
+        btn_paste = QPushButton("📋 3. 从表格/Excel一键粘贴"); btn_paste.setStyleSheet("background-color: #b4befe; color: #11111b; font-weight: bold; padding: 6px 10px; border-radius: 4px;")
         
         btn_batch_vid.clicked.connect(self.batch_select_videos)
         btn_batch_aud.clicked.connect(self.batch_select_audios)
         btn_paste.clicked.connect(lambda: self.open_paste_dialog(auto_add=True))
         
         btn_start_table = QPushButton("🚀 建工程并导出")
-        btn_start_table.setStyleSheet("background-color: #a6e3a1; color: #11111b; font-size: 16px; font-weight: bold; padding: 8px 20px; border-radius: 4px;")
+        btn_start_table.setStyleSheet("background-color: #a6e3a1; color: #11111b; font-size: 15px; font-weight: bold; padding: 7px 18px; border-radius: 4px;")
         btn_start_table.clicked.connect(self.start_table_batch)
 
         btn_build_projects = QPushButton("开始创建工程")
-        btn_build_projects.setStyleSheet("background-color: #f9e2af; color: #11111b; font-size: 16px; font-weight: bold; padding: 8px 20px; border-radius: 4px;")
+        btn_build_projects.setStyleSheet("background-color: #f9e2af; color: #11111b; font-size: 15px; font-weight: bold; padding: 7px 18px; border-radius: 4px;")
         btn_build_projects.clicked.connect(self.start_table_project_build)
 
         toolbar.addWidget(btn_batch_vid); toolbar.addWidget(btn_batch_aud); toolbar.addWidget(btn_paste)
@@ -1332,16 +1451,20 @@ class BatchView(QWidget):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setMaximumHeight(230)
         scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        self.table_scroll = scroll
         self.table_content = QWidget()
         self.table_layout = QVBoxLayout(self.table_content)
         self.table_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.table_layout.setSpacing(5)
+        self.table_layout.setContentsMargins(0, 0, 0, 0)
+        self.table_layout.setSpacing(6)
         scroll.setWidget(self.table_content)
-        layout.addWidget(scroll, stretch=1)
+        layout.addWidget(scroll)
 
         btn_add_row = QPushButton("➕ 新增空行")
-        btn_add_row.setStyleSheet("background-color: #313244; color: #cdd6f4; font-weight: bold; padding: 10px; border-radius: 5px;")
+        btn_add_row.setFixedHeight(32)
+        btn_add_row.setStyleSheet("background-color: #313244; color: #cdd6f4; font-weight: bold; padding: 6px; border-radius: 5px;")
         btn_add_row.clicked.connect(self.add_table_row)
         layout.addWidget(btn_add_row)
         
@@ -1354,6 +1477,7 @@ class BatchView(QWidget):
         self.table_layout.addWidget(row)
         if hasattr(self, "_theme_colors"):
             apply_tinted_styles(row, self._theme_colors)
+            row.apply_compact_theme()
 
     def _table_rows(self):
         rows = []
@@ -1475,12 +1599,12 @@ class BatchView(QWidget):
         target = prefer_name or current
         self.preset_combo.blockSignals(True)
         self.preset_combo.clear()
-        if os.path.exists(PRESETS_FILE):
-            try:
-                with open(PRESETS_FILE, 'r', encoding='utf-8') as f:
-                    presets = json.load(f)
-                    if presets: self.preset_combo.addItems(list(presets.keys()))
-            except: pass
+        presets = read_json_file(PRESETS_FILE, default={})
+        if not isinstance(presets, dict):
+            presets = {}
+        presets = merge_built_in_style_presets(presets)
+        if presets:
+            self.preset_combo.addItems(list(presets.keys()))
         if self.preset_combo.count() == 0: self.preset_combo.addItem("未找到预设，请先在 Edit 房间保存")
         elif target:
             idx = self.preset_combo.findText(target)
@@ -1521,11 +1645,13 @@ class BatchView(QWidget):
 
     def _load_selected_preset_raw(self):
         preset_name = self.preset_combo.currentText() if hasattr(self, "preset_combo") else ""
-        if not preset_name or not os.path.exists(PRESETS_FILE):
+        if not preset_name:
             return {}
         try:
-            with open(PRESETS_FILE, 'r', encoding='utf-8') as f:
-                presets = json.load(f)
+            presets = read_json_file(PRESETS_FILE, default={})
+            if not isinstance(presets, dict):
+                presets = {}
+            presets = merge_built_in_style_presets(presets)
             return presets.get(preset_name, {}) if isinstance(presets, dict) else {}
         except Exception:
             return {}
@@ -1607,6 +1733,81 @@ class BatchView(QWidget):
     @pyqtSlot(int)
     def _update_progress(self, val):
         self.progress_bar.setValue(val)
+
+    @property
+    def batch_pause_requested(self):
+        return self.batch_job_control.pause_requested
+
+    @batch_pause_requested.setter
+    def batch_pause_requested(self, value):
+        self.batch_job_control.pause_requested = bool(value)
+
+    @property
+    def batch_cancel_requested(self):
+        return self.batch_job_control.cancel_requested
+
+    @batch_cancel_requested.setter
+    def batch_cancel_requested(self, value):
+        self.batch_job_control.cancel_requested = bool(value)
+
+    @property
+    def batch_finish_reason(self):
+        return self.batch_job_control.finish_reason
+
+    @batch_finish_reason.setter
+    def batch_finish_reason(self, value):
+        self.batch_job_control.finish_reason = str(value or "completed")
+
+    def _set_batch_run_controls(self, running=None, state_text=None):
+        active = self.is_running if running is None else bool(running)
+        if hasattr(self, "btn_batch_pause"):
+            self.btn_batch_pause.setEnabled(active and not self.batch_cancel_requested)
+            self.btn_batch_pause.setText("继续" if self.batch_pause_requested else "暂停")
+        if hasattr(self, "btn_batch_cancel"):
+            self.btn_batch_cancel.setEnabled(active and not self.batch_cancel_requested)
+        if hasattr(self, "lbl_batch_run_state"):
+            if state_text is None:
+                if self.batch_cancel_requested:
+                    state_text = "批量状态：取消请求已收到，当前任务完成后停止"
+                elif self.batch_pause_requested:
+                    state_text = "批量状态：暂停请求已收到，当前任务完成后停在下一条前"
+                elif active:
+                    state_text = "批量状态：运行中"
+                else:
+                    state_text = "批量状态：空闲"
+            self.lbl_batch_run_state.setText(state_text)
+
+    def _reset_batch_control_flags(self, run_kind):
+        self.batch_job_control.reset(run_kind)
+        self.batch_run_kind = run_kind
+        self._set_batch_run_controls(True)
+
+    def toggle_batch_pause(self):
+        if not self.is_running:
+            return
+        paused = self.batch_job_control.toggle_pause()
+        if paused:
+            self.sig_log.emit("已请求暂停：当前任务完成后停在下一条前。", "#f9e2af")
+        else:
+            self.sig_log.emit("已继续批量任务。", "#a6e3a1")
+            if self.batch_run_kind == "pipeline":
+                QTimer.singleShot(0, self.process_next)
+        self._set_batch_run_controls(True)
+
+    def request_batch_cancel(self):
+        if not self.is_running or self.batch_cancel_requested:
+            return
+        was_paused = self.batch_pause_requested
+        self.batch_job_control.request_cancel()
+        self.sig_log.emit("已请求取消：当前任务完成后停止后续队列。", "#f38ba8")
+        self._set_batch_run_controls(True)
+        if self.batch_run_kind == "pipeline" and was_paused:
+            QTimer.singleShot(0, self.process_next)
+
+    def _wait_while_batch_paused(self):
+        return self.batch_job_control.wait_if_paused(
+            on_pause_once=lambda: self.sig_log.emit("批量已暂停，点击“继续”后从下一条任务恢复。", "#f9e2af")
+        )
         
     @pyqtSlot(int, str, str)
     def _update_table_row_status(self, idx, text, color):
@@ -1622,9 +1823,10 @@ class BatchView(QWidget):
         preset_pos_x, _ = self._load_preset_position_by_name(state.get("preset_name", ""), default_y=float(state.get("subtitle_y", 25.0) or 25.0))
         preset_style = self._load_preset_style_by_name(state.get("preset_name", ""))
         signature = self._load_signature_preset_by_name(state.get("signature_preset_name", ""))
-        music_path, music_volume = self._batch_music_payload(state)
+        music_payload = self._batch_music_payload(state)
         for i, row in enumerate(state.get("table_rows", [])):
             if row.get("video"):
+                task_order = len(tasks)
                 tasks.append({
                     "type": "table",
                     "idx": i,
@@ -1634,8 +1836,9 @@ class BatchView(QWidget):
                     "text": row.get("text", ""),
                     "a_mode": state.get("audio_mode", self.audio_mode.currentText()),
                     "video_volume": int(state.get("video_volume", self.video_volume_percent())),
-                    "music_path": music_path,
-                    "music_volume": music_volume,
+                    "music_path": self._music_path_for_task(music_payload, task_order),
+                    "music_volume": music_payload.get("volume", self.music_volume_percent()),
+                    "music_mode": music_payload.get("mode", "cycle"),
                     "performance_mode": state.get("performance_mode", self.performance_mode.currentText()),
                     "pos_x": preset_pos_x,
                     "pos_y": float(row.get("pos_y", state.get("subtitle_y", 25.0)) or 25.0),
@@ -1658,9 +1861,10 @@ class BatchView(QWidget):
         preset_pos_x, preset_pos_y = self._load_preset_position_by_name(state.get("preset_name", ""), default_y=float(state.get("subtitle_y", 25.0) or 25.0))
         preset_style = self._load_preset_style_by_name(state.get("preset_name", ""))
         signature = self._load_signature_preset_by_name(state.get("signature_preset_name", ""))
-        music_path, music_volume = self._batch_music_payload(state)
+        music_payload = self._batch_music_payload(state)
         tasks = []
         for item in folder_items:
+            task_order = len(tasks)
             tasks.append({
                 "type": "folder",
                 "idx": item["idx"],
@@ -1670,8 +1874,9 @@ class BatchView(QWidget):
                 "text": item.get("text", ""),
                 "a_mode": state.get("audio_mode", self.audio_mode.currentText()),
                 "video_volume": int(state.get("video_volume", self.video_volume_percent())),
-                "music_path": music_path,
-                "music_volume": music_volume,
+                "music_path": self._music_path_for_task(music_payload, task_order),
+                "music_volume": music_payload.get("volume", self.music_volume_percent()),
+                "music_mode": music_payload.get("mode", "cycle"),
                 "performance_mode": state.get("performance_mode", self.performance_mode.currentText()),
                 "pos_x": preset_pos_x,
                 "pos_y": preset_pos_y,
@@ -1722,30 +1927,11 @@ class BatchView(QWidget):
     def start_table_project_build(self):
         if self.is_running: return
         self._capture_current_queue_state()
-        tasks = []
-        preset_pos_x, _ = self.selected_preset_position()
-        music_path, music_volume = self._batch_music_payload()
-        for i in range(self.table_layout.count()):
-            row_widget = self.table_layout.itemAt(i).widget()
-            if isinstance(row_widget, BatchTaskRow):
-                row_widget.sync_paths_from_fields()
-                if row_widget.video_path:
-                    tasks.append({
-                        "idx": i,
-                        "video": row_widget.video_path,
-                        "audio": row_widget.audio_path,
-                        "a_mode": self.audio_mode.currentText(),
-                        "video_volume": self.video_volume_percent(),
-                        "music_path": music_path,
-                        "music_volume": music_volume,
-                        "performance_mode": self.performance_mode.currentText(),
-                        "title": row_widget.txt_title.text().strip(),
-                        "text": row_widget.txt_content.toPlainText().strip(),
-                        "pos_x": preset_pos_x,
-                        "pos_y": row_widget.spin_y.value()
-                    })
-                else:
-                    row_widget.lbl_status.setText("略过:无画面")
+        tasks = self._tasks_from_queue_state(self.batch_queues[self.current_queue_index])
+        for row_widget in self._table_rows():
+            row_widget.sync_paths_from_fields()
+            if not row_widget.video_path:
+                row_widget.lbl_status.setText("略过:无画面")
         if not tasks:
             return QMessageBox.warning(self, "提示", "表格中没有任何有效画面，无法建立工程。")
         self._start_project_build(tasks, "表格批量建工程")
@@ -1763,7 +1949,7 @@ class BatchView(QWidget):
         audio_lookup = build_audio_lookup(self.input_dir)
         a_mode = self.audio_mode.currentText()
         video_volume = self.video_volume_percent()
-        music_path, music_volume = self._batch_music_payload()
+        music_payload = self._batch_music_payload()
         performance_mode = self.performance_mode.currentText()
         preset_pos_x, preset_pos_y = self.selected_preset_position()
         
@@ -1771,6 +1957,7 @@ class BatchView(QWidget):
             v_path = os.path.join(self.input_dir, vf)
             a_path = match_audio_for_media(vf, audio_lookup)
                 
+            task_order = len(self.task_queue)
             self.task_queue.append({
                 "type": "folder",
                 "idx": i,
@@ -1779,8 +1966,9 @@ class BatchView(QWidget):
                 "text": "",
                 "a_mode": a_mode,
                 "video_volume": video_volume,
-                "music_path": music_path,
-                "music_volume": music_volume,
+                "music_path": self._music_path_for_task(music_payload, task_order),
+                "music_volume": music_payload.get("volume", self.music_volume_percent()),
+                "music_mode": music_payload.get("mode", "cycle"),
                 "performance_mode": performance_mode,
                 "pos_x": preset_pos_x,
                 "pos_y": preset_pos_y # 文件夹模式默认高度
@@ -1801,7 +1989,7 @@ class BatchView(QWidget):
         )
         audio_lookup = build_audio_lookup(self.input_dir)
         preset_pos_x, preset_pos_y = self.selected_preset_position()
-        music_path, music_volume = self._batch_music_payload()
+        music_payload = self._batch_music_payload()
         for i, vf in enumerate(v_files):
             v_path = os.path.join(self.input_dir, vf)
             base_name = os.path.splitext(vf)[0]
@@ -1815,14 +2003,16 @@ class BatchView(QWidget):
             custom_text = ""
             if text_path:
                 custom_text = read_text_source(text_path)
+            task_order = len(tasks)
             tasks.append({
                 "idx": i,
                 "video": v_path,
                 "audio": a_path,
                 "a_mode": self.audio_mode.currentText(),
                 "video_volume": self.video_volume_percent(),
-                "music_path": music_path,
-                "music_volume": music_volume,
+                "music_path": self._music_path_for_task(music_payload, task_order),
+                "music_volume": music_payload.get("volume", self.music_volume_percent()),
+                "music_mode": music_payload.get("mode", "cycle"),
                 "performance_mode": self.performance_mode.currentText(),
                 "title": base_name,
                 "text": custom_text,
@@ -1898,10 +2088,11 @@ class BatchView(QWidget):
         self.task_queue.clear()
         a_mode = self.audio_mode.currentText()
         video_volume = self.video_volume_percent()
-        music_path, music_volume = self._batch_music_payload()
+        music_payload = self._batch_music_payload()
         performance_mode = self.performance_mode.currentText()
         preset_pos_x, preset_pos_y = self.selected_preset_position()
         for item in folder_items:
+            task_order = len(self.task_queue)
             self.task_queue.append({
                 "type": "folder",
                 "idx": item["idx"],
@@ -1911,8 +2102,9 @@ class BatchView(QWidget):
                 "text": item.get("text", ""),
                 "a_mode": a_mode,
                 "video_volume": video_volume,
-                "music_path": music_path,
-                "music_volume": music_volume,
+                "music_path": self._music_path_for_task(music_payload, task_order),
+                "music_volume": music_payload.get("volume", self.music_volume_percent()),
+                "music_mode": music_payload.get("mode", "cycle"),
                 "performance_mode": performance_mode,
                 "pos_x": preset_pos_x,
                 "pos_y": preset_pos_y,
@@ -1935,17 +2127,19 @@ class BatchView(QWidget):
             return QMessageBox.warning(self, "提示", "文件夹中没有找到视频/图片。")
 
         preset_pos_x, preset_pos_y = self.selected_preset_position()
-        music_path, music_volume = self._batch_music_payload()
+        music_payload = self._batch_music_payload()
         tasks = []
         for item in folder_items:
+            task_order = len(tasks)
             tasks.append({
                 "idx": item["idx"],
                 "video": item["video"],
                 "audio": item["audio"],
                 "a_mode": self.audio_mode.currentText(),
                 "video_volume": self.video_volume_percent(),
-                "music_path": music_path,
-                "music_volume": music_volume,
+                "music_path": self._music_path_for_task(music_payload, task_order),
+                "music_volume": music_payload.get("volume", self.music_volume_percent()),
+                "music_mode": music_payload.get("mode", "cycle"),
                 "performance_mode": self.performance_mode.currentText(),
                 "title": item["title"],
                 "text": item.get("text", ""),
@@ -1967,6 +2161,7 @@ class BatchView(QWidget):
         batch_record = self._init_project_record(tasks, project_dir, mode_name, c_mode, timing_mode)
         self.auto_render_after_project_build = bool(auto_render)
         self.is_running = True
+        self._reset_batch_control_flags("project_build")
         self.log_console.clear()
         self.progress_bar.setValue(0)
         self.sig_log.emit(f"{mode_name}启动，共 {len(tasks)} 个工程。", "#a6e3a1")
@@ -1990,18 +2185,20 @@ class BatchView(QWidget):
         return project_dir
 
     def _load_selected_preset_style(self):
-        base_style = {"layout_mode": "standard", "box_layout": "fixed", "box_width": 74.0, "box_height": 0.0, "max_lines": 2}
+        base_style = {"layout_mode": "standard", "box_layout": "fixed", "box_width": 74.0, "box_height": 0.0, "max_lines": 2, "hl_style": "text"}
         preset_style, _ = split_style_preset(self._load_selected_preset_raw())
         base_style.update(preset_style)
         return base_style
 
     def _load_preset_style_by_name(self, preset_name):
-        base_style = {"layout_mode": "standard", "box_layout": "fixed", "box_width": 74.0, "box_height": 0.0, "max_lines": 2}
-        if not preset_name or not os.path.exists(PRESETS_FILE):
+        base_style = {"layout_mode": "standard", "box_layout": "fixed", "box_width": 74.0, "box_height": 0.0, "max_lines": 2, "hl_style": "text"}
+        if not preset_name:
             return base_style
         try:
-            with open(PRESETS_FILE, "r", encoding="utf-8") as f:
-                presets = json.load(f)
+            presets = read_json_file(PRESETS_FILE, default={})
+            if not isinstance(presets, dict):
+                presets = {}
+            presets = merge_built_in_style_presets(presets)
             preset_style, _ = split_style_preset(presets.get(preset_name, {}) if isinstance(presets, dict) else {})
             base_style.update(preset_style)
         except Exception:
@@ -2009,11 +2206,13 @@ class BatchView(QWidget):
         return base_style
 
     def _load_preset_position_by_name(self, preset_name, default_x=0.0, default_y=25.0):
-        if not preset_name or not os.path.exists(PRESETS_FILE):
+        if not preset_name:
             return float(default_x), float(default_y)
         try:
-            with open(PRESETS_FILE, "r", encoding="utf-8") as f:
-                presets = json.load(f)
+            presets = read_json_file(PRESETS_FILE, default={})
+            if not isinstance(presets, dict):
+                presets = {}
+            presets = merge_built_in_style_presets(presets)
             _, position = split_style_preset(presets.get(preset_name, {}) if isinstance(presets, dict) else {})
             if position:
                 return position["pos_x"], position["pos_y"]
@@ -2033,6 +2232,11 @@ class BatchView(QWidget):
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         json_path = os.path.join(project_dir, f"批量工程记录_{run_id}.json")
         csv_path = os.path.join(project_dir, f"批量工程记录_{run_id}.csv")
+        task_music_paths = []
+        for task in tasks:
+            music_path = task.get("music_path", "")
+            if music_path and music_path not in task_music_paths:
+                task_music_paths.append(music_path)
         record = {
             "record_type": "subtitle_composer_batch_project_build",
             "version": 1,
@@ -2048,7 +2252,9 @@ class BatchView(QWidget):
                 "timing_mode": timing_mode,
                 "audio_mode": self.audio_mode.currentText(),
                 "video_volume": self.video_volume_percent(),
-                "music_path": self.batch_music_path if self.batch_music_enabled() else "",
+                "music_path": task_music_paths[0] if task_music_paths else "",
+                "music_paths": task_music_paths,
+                "music_mode": self._batch_music_mode(),
                 "music_volume": self.music_volume_percent(),
                 "performance_mode": self.performance_mode.currentText(),
                 "output_dir": self.output_dir,
@@ -2077,6 +2283,7 @@ class BatchView(QWidget):
                 "video_volume": int(task.get("video_volume", self.video_volume_percent())),
                 "music": task.get("music_path", ""),
                 "music_volume": int(task.get("music_volume", self.music_volume_percent())),
+                "music_mode": task.get("music_mode", ""),
                 "subtitle_x": task.get("pos_x", 0.0),
                 "subtitle_y": task.get("pos_y", 25.0),
                 "text": text,
@@ -2097,7 +2304,7 @@ class BatchView(QWidget):
                 json.dump(record, f, indent=2, ensure_ascii=False)
             fields = [
                 "row", "ui_row", "status", "project_name", "project_rel_path",
-                "video", "audio", "video_volume", "music", "music_volume", "title", "subtitle_x", "subtitle_y", "text_chars", "error",
+                "video", "audio", "video_volume", "music", "music_volume", "music_mode", "title", "subtitle_x", "subtitle_y", "text_chars", "error",
             ]
             with open(record["files"]["csv"], "w", encoding="utf-8-sig", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fields)
@@ -2115,6 +2322,20 @@ class BatchView(QWidget):
         queue_group_index = {}
         total = max(1, len(tasks))
         for i, task in enumerate(tasks):
+            if self.batch_cancel_requested:
+                failed += len(tasks) - i
+                for row_record in batch_record.get("rows", [])[i:]:
+                    row_record["status"] = "cancelled"
+                    row_record["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.sig_log.emit("批量建工程已取消，剩余任务已跳过。", "#f38ba8")
+                break
+            if not self._wait_while_batch_paused():
+                failed += len(tasks) - i
+                for row_record in batch_record.get("rows", [])[i:]:
+                    row_record["status"] = "cancelled"
+                    row_record["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.sig_log.emit("批量建工程已取消，剩余任务已跳过。", "#f38ba8")
+                break
             idx = task.get("idx", i)
             row_record = batch_record["rows"][i] if i < len(batch_record.get("rows", [])) else None
             try:
@@ -2386,7 +2607,11 @@ class BatchView(QWidget):
             pass
 
     def _on_projects_done(self, success, failed, project_dir, built_paths):
+        was_cancelled = self.batch_finish_reason == "cancelled" or self.batch_cancel_requested
         self.is_running = False
+        self.batch_pause_requested = False
+        self.batch_cancel_requested = False
+        self._set_batch_run_controls(False, "批量状态：已取消" if was_cancelled else "批量状态：空闲")
         self.progress_bar.setValue(100)
         record_json = ""
         record_csv = ""
@@ -2410,6 +2635,8 @@ class BatchView(QWidget):
         handed_off = False
         auto_render = bool(getattr(self, "auto_render_after_project_build", False))
         self.auto_render_after_project_build = False
+        if was_cancelled:
+            auto_render = False
         if success and parent and hasattr(parent, "room_deliver"):
             output_dir = self.output_dir or os.path.join(project_dir, "批量成品")
             try:
@@ -2446,6 +2673,7 @@ class BatchView(QWidget):
         self.preset_style = self._load_selected_preset_style()
 
         self.is_running = True
+        self._reset_batch_control_flags("pipeline")
         self.current_idx = 0
         self.log_console.clear()
         self.sig_log.emit(f"🚀 {mode_name} 启动！共发现 {len(self.task_queue)} 个生产任务。", "#a6e3a1")
@@ -2469,6 +2697,14 @@ class BatchView(QWidget):
             n += 1
 
     def process_next(self):
+        if self.batch_cancel_requested:
+            self.batch_finish_reason = "cancelled"
+            self.sig_all_done.emit()
+            return
+        if self.batch_pause_requested:
+            self._set_batch_run_controls(True)
+            self.sig_log.emit("批量已暂停，点击“继续”后从下一条任务恢复。", "#f9e2af")
+            return
         if self.current_idx >= len(self.task_queue):
             self.sig_all_done.emit()
             return
@@ -2590,25 +2826,21 @@ class BatchView(QWidget):
                     def write_subtitle_frame(path, duration):
                         nonlocal last_concat_file
                         duration = max(0.001, float(duration or 0.0))
-                        f_concat.write(f"file '{path}'\n")
-                        f_concat.write(f"duration {duration:.3f}\n")
+                        f_concat.write(ffconcat_file_entry(path, duration))
                         last_concat_file = path
                     
                     for current_time, frame_duration in frame_schedule:
-                        active_subs = [
-                            s for s in subs_data
-                            if float(s.get('start', 0)) <= current_time < float(s.get('end', 1))
-                        ]
-                        signature_html = render_signature_html(signature, current_time, proj_w)
+                        active_subs = active_subtitles_for_frame(subs_data, current_time, frame_duration)
+                        signature_html = render_signature_html(signature, current_time, proj_w, proj_h)
                         if not active_subs and not signature_html:
                             write_subtitle_frame(blank_path, frame_duration)
                             continue
                         
                         html_subs = signature_html
-                        for s in active_subs:
+                        for s, sub_time in active_subs:
                             px = s.get("pos_x", 0.0); py = s.get("pos_y", 25.0)
                             base_css = f"position: absolute; left: calc(50% + {px}%); top: calc(50% + {py}%); transform: translate(-50%, -50%); z-index: 10; width: max-content; max-width: 92%;"
-                            sub_html = render_subtitle_html(s, current_time, proj_w)
+                            sub_html = render_subtitle_html(s, sub_time, proj_w, proj_h)
                             html_subs += f"<div style='{base_css}'>{sub_html}</div>\n"
                         
                         # 👑 全局抗锯齿平滑渲染参数
@@ -2619,7 +2851,7 @@ class BatchView(QWidget):
                         write_subtitle_frame(frame_path, frame_duration)
                         frame_idx += 1
 
-                    f_concat.write(f"file '{last_concat_file}'\n")
+                    f_concat.write(ffconcat_file_entry(last_concat_file))
                         
             self.sig_progress.emit(70)
 
@@ -2628,17 +2860,14 @@ class BatchView(QWidget):
             v_loop_path = os.path.join(temp_dir, "v_loop.txt").replace("\\", "/")
             with open(v_loop_path, 'w', encoding='utf-8') as f:
                 media_loop_dur = max(0.0, float(v_stream_dur or 0.0))
-                safe_v_path = v_path.replace("\\", "/")
                 if media_loop_dur > 0.1:
                     remaining = content_dur
                     while remaining > 0.001:
                         part_dur = min(remaining, media_loop_dur)
-                        f.write(f"file '{safe_v_path}'\n")
-                        f.write("inpoint 0\n")
-                        f.write(f"outpoint {part_dur:.3f}\n")
+                        f.write(ffconcat_inout_entry(v_path, 0, part_dur))
                         remaining -= part_dur
                 else:
-                    f.write(f"file '{safe_v_path}'\n")
+                    f.write(ffconcat_file_entry(v_path))
 
             has_audio_file = bool(a_path and os.path.exists(a_path))
             has_source_audio = has_audio_stream(v_path)
@@ -2668,7 +2897,14 @@ class BatchView(QWidget):
             
             video_guard = f"tpad=stop_mode=clone:stop_duration={total_dur:.3f},trim=duration={total_dur:.3f},setpts=PTS-STARTPTS"
             sub_guard = f"tpad=stop_mode=clone:stop_duration={total_dur:.3f},trim=duration={total_dur:.3f},setpts=PTS-STARTPTS"
-            vf = f"[0:v]scale={proj_w}:{proj_h}:force_original_aspect_ratio=increase,crop={proj_w}:{proj_h},format=rgba,{video_guard}[bg];[1:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos,{sub_guard}[sub];[bg][sub]overlay=0:0:eof_action=pass:format=auto,format=yuv420p[outv]"
+            layer_x, layer_y = ffmpeg_layer_overlay_xy()
+            vf = (
+                f"{ffmpeg_canvas_source(proj_w, proj_h, total_dur)};"
+                f"[0:v]{ffmpeg_layer_scale_filter(1.0, proj_w, proj_h, fit='cover')},format=rgba,{video_guard}[fg];"
+                f"[canvas][fg]overlay=x='{layer_x}':y='{layer_y}':eof_action=pass:format=auto[bg];"
+                f"[1:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos,{sub_guard}[sub];"
+                f"[bg][sub]overlay=0:0:eof_action=pass:format=auto,format=yuv420p[outv]"
+            )
             
             wants_mix = ("混合" in a_mode) or ("配音" in a_mode and "静音" not in a_mode and "替换" not in a_mode)
             wants_keep = "保留" in a_mode
@@ -2780,14 +3016,17 @@ class BatchView(QWidget):
             clean_w = re.sub(r'[^a-zA-Z0-9\']', '', w["word"]).lower()
             has_punct = any(w["word"].endswith(p) for p in puncts)
             is_last_word = (i == len(words) - 1)
+            next_word = words[i + 1]["word"] if i + 1 < len(words) else ""
             next_start = words[i + 1]["start"] if i + 1 < len(words) else 9999.0
             silence_gap = next_start - curr["end"]
             curr_dur = curr["end"] - curr["start"]
-            
+            narrative_block = is_reference_narrative_chunk_mode(mode)
+            tiktok_smart = "智能听译" in mode or "4-6" in mode or "4-7" in mode
+
             smart_short = "智能重点" in mode or "3-4词为主" in mode
             natural_short = "自然短句" in mode or "1-4" in mode
             fixed_count = 0
-            if not natural_short and not smart_short:
+            if not natural_short and not smart_short and not tiktok_smart and not narrative_block:
                 if "短句快速" in mode or "1-3" in mode:
                     fixed_count = 3
                 elif "双词" in mode or "2词" in mode:
@@ -2809,6 +3048,24 @@ class BatchView(QWidget):
 
             if "单字" in mode: is_break = True
             elif fixed_count: is_break = len(curr["words"]) >= fixed_count or silence_gap > 0.8
+            elif narrative_block:
+                is_break = (
+                    (silence_gap > 0.8 and len(curr["words"]) >= 6) or
+                    (has_punct and len(curr["words"]) >= 8) or
+                    (silence_gap > 0.42 and len(curr["words"]) >= 8) or
+                    (is_key_word and len(curr["words"]) >= 10 and (silence_gap > 0.16 or curr_dur > 2.6)) or
+                    len(curr["words"]) >= 12
+                )
+            elif tiktok_smart:
+                is_break = (
+                    silence_gap > 0.8 or
+                    (has_punct and len(curr["words"]) >= 4) or
+                    (silence_gap > 0.46 and len(curr["words"]) >= 3) or
+                    (silence_gap > 0.28 and len(curr["words"]) >= 4) or
+                    (is_key_word and len(curr["words"]) >= 5 and (silence_gap > 0.14 or curr_dur > 1.55)) or
+                    len(curr["words"]) >= 7 or
+                    (len(curr["words"]) >= 6 and curr_dur > 2.35)
+                )
             elif smart_short:
                 long_slot = (len(subs) + int(float(curr.get("start", 0.0)) * 10)) % 5 == 3
                 is_break = (
@@ -2847,12 +3104,22 @@ class BatchView(QWidget):
                     if clean_w in NON_END_WORDS and not is_last_word and len(curr["words"]) < 15: is_break = False
                     else: is_break = True
                 else: is_break = False
+
+            if is_break and should_defer_subtitle_break_for_readability(
+                w.get("word", ""),
+                next_word,
+                segment_word_count=len(curr["words"]),
+                silence_gap=silence_gap,
+                has_punct=has_punct,
+                is_last_word=is_last_word,
+            ):
+                is_break = False
                     
             if is_break: 
                 if sound_aligned and len(curr["words"]) >= 6:
                     mid = len(curr["words"]) // 2
                     curr["words"][mid]["text"] = "\n" + curr["words"][mid]["text"].lstrip()
-                curr["text"] = " ".join([x["text"] for x in curr["words"]])
+                curr["text"] = format_subtitle_text_spacing(" ".join([x["text"] for x in curr["words"]]))
                 curr["text"] = curr["text"].replace(" \n", "\n").replace("\n ", "\n")
                 curr["pos_x"] = 0.0; curr["pos_y"] = 25.0; curr["track"] = 1
                 subs.append(curr); curr = {"words": []}
@@ -2861,11 +3128,14 @@ class BatchView(QWidget):
             if sound_aligned and len(curr["words"]) >= 6:
                 mid = len(curr["words"]) // 2
                 curr["words"][mid]["text"] = "\n" + curr["words"][mid]["text"].lstrip()
-            curr["text"] = " ".join([x["text"] for x in curr["words"]])
+            curr["text"] = format_subtitle_text_spacing(" ".join([x["text"] for x in curr["words"]]))
             curr["text"] = curr["text"].replace(" \n", "\n").replace("\n ", "\n")
             curr["pos_x"] = 0.0; curr["pos_y"] = 25.0; curr["track"] = 1
             subs.append(curr)
-            
+
+        if narrative_block or "长句" in mode or "约10" in mode:
+            subs = merge_single_word_subtitle_segments(subs, max_merged_words=14)
+
         return self._apply_timing_mode(subs, timing_mode)
 
     def _apply_timing_mode(self, subs, timing_mode):
@@ -2896,12 +3166,22 @@ class BatchView(QWidget):
     @pyqtSlot()
     def _on_file_done(self):
         self.current_idx += 1
+        if self.batch_cancel_requested:
+            self.batch_finish_reason = "cancelled"
         self.process_next()
 
     @pyqtSlot()
     def _on_all_done(self):
+        was_cancelled = self.batch_finish_reason == "cancelled" or self.batch_cancel_requested
         self.is_running = False
+        self.batch_pause_requested = False
+        self.batch_cancel_requested = False
+        self._set_batch_run_controls(False, "批量状态：已取消" if was_cancelled else "批量状态：空闲")
         btn_start_table = self.findChild(QPushButton, "🚀 开始批量流水线")
         if btn_start_table: btn_start_table.setEnabled(True)
+        if was_cancelled:
+            self.log_console.append("<span style='color:#f38ba8'>批量任务已取消，后续任务没有继续启动。</span>")
+            QMessageBox.information(self, "批量已取消", "当前任务已收尾，后续批量任务已停止。")
+            return
         self.log_console.append("🎉 所有矩阵任务圆满完成！")
         QMessageBox.information(self, "批量完成", "恭喜，矩阵批量生成完毕！")

@@ -7,13 +7,15 @@ import threading
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel,
                              QTextEdit, QPushButton, QMessageBox, QFrame,
                              QHBoxLayout, QLineEdit, QScrollArea, QComboBox,
-                             QCheckBox, QFileDialog, QProgressDialog)
+                             QCheckBox, QFileDialog, QProgressDialog, QKeySequenceEdit,
+                             QTabWidget)
 from PyQt6.QtCore import Qt, QUrl, QTimer, pyqtSignal
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QDesktopServices, QKeySequence
 import requests
 
 from core import DEFAULT_SYNC_URL, CLOUD_SECRET
 from app_theme import apply_tinted_styles
+from room_theme_bridge import apply_room_theme_bridge
 from font_assets import ensure_fonts_dir, font_asset_summary, register_bundled_fonts
 from render_config import (
     cpu_safe_profile,
@@ -22,7 +24,17 @@ from render_config import (
     peek_render_profile,
 )
 from font_registry import FONT_REGISTRY_FILE, STATUS_NONCOMMERCIAL, load_font_registry, reset_to_open_font_policy, upsert_approved_fonts
-from app_config import OUTPUT_RESOLUTION_OPTIONS, get_output_resolution, set_output_resolution
+from app_config import (
+    CONFIG_FILE,
+    DEFAULT_SHORTCUTS,
+    OUTPUT_RESOLUTION_OPTIONS,
+    get_output_resolution,
+    get_preview_fullscreen_shortcut,
+    load_app_config,
+    save_app_config,
+    set_output_resolution,
+    set_preview_fullscreen_shortcut,
+)
 from app_update import (
     check_latest_release,
     download_asset,
@@ -33,18 +45,10 @@ from app_update import (
     save_update_config,
 )
 
-CONFIG_FILE = os.path.join(os.getcwd(), "settings.json")
-
-
 def load_cloud_secret():
     cloud_secret = CLOUD_SECRET
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                config = json.load(f)
-            cloud_secret = config.get("cloud_secret") or cloud_secret
-        except Exception:
-            pass
+    config = load_app_config()
+    cloud_secret = config.get("cloud_secret") or cloud_secret
     return (cloud_secret or "").strip()
 
 
@@ -120,27 +124,40 @@ class SettingsView(QWidget):
 
     def init_ui(self):
         root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(0)
-
-        self.settings_scroll = QScrollArea()
-        self.settings_scroll.setWidgetResizable(True)
-        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.settings_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-        self.settings_content = QWidget()
-        self.settings_scroll.setWidget(self.settings_content)
-        root_layout.addWidget(self.settings_scroll)
-
-        layout = QVBoxLayout(self.settings_content)
-        layout.setContentsMargins(30, 30, 30, 30)
-        layout.setSpacing(20)
+        root_layout.setContentsMargins(18, 14, 18, 14)
+        root_layout.setSpacing(10)
         self.setting_sections = []
+        self.settings_scrolls = []
+        self.settings_content = QWidget(self)
 
         # 👑 顶部标题
-        title = QLabel("⚙️ 全局设置与引擎管控 (Global Settings)")
-        title.setStyleSheet("font-size: 24px; font-weight: bold; color: #cdd6f4;")
-        layout.addWidget(title)
+        title = QLabel("⚙️ 全局设置")
+        title.setStyleSheet("font-size: 20px; font-weight: 900; color: #cdd6f4;")
+        root_layout.addWidget(title)
+
+        self.settings_tabs = QTabWidget()
+        self.settings_tabs.setDocumentMode(True)
+        root_layout.addWidget(self.settings_tabs, stretch=1)
+
+        def make_tab(name):
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(14, 14, 14, 14)
+            page_layout.setSpacing(12)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setWidget(page)
+            self.settings_scrolls.append(scroll)
+            self.settings_tabs.addTab(scroll, name)
+            return page_layout
+
+        render_tab_layout = make_tab("渲染与性能")
+        cloud_tab_layout = make_tab("云端与 AI")
+        workflow_tab_layout = make_tab("操作")
+        update_tab_layout = make_tab("更新")
+        font_tab_layout = make_tab("字体与合规")
 
         cloud_frame = QFrame()
         cloud_frame.setStyleSheet("background-color: #181825; border-radius: 10px; border: 1px solid #89b4fa;")
@@ -191,7 +208,7 @@ class SettingsView(QWidget):
         self.lbl_sync_status.setStyleSheet("color: #f9e2af; font-size: 12px; border: none;")
         cloud_layout.addWidget(self.lbl_sync_status)
 
-        self.cloud_section = self._add_section(layout, "云端同步链接", cloud_frame, "#89b4fa", expanded=True)
+        self.cloud_section = self._add_section(cloud_tab_layout, "云端同步链接", cloud_frame, "#89b4fa", expanded=True)
 
         hardware_frame = QFrame()
         hardware_frame.setStyleSheet("background-color: #181825; border-radius: 10px; border: 1px solid #a6e3a1;")
@@ -260,7 +277,7 @@ class SettingsView(QWidget):
         hardware_btn_row.addWidget(self.btn_cpu_safe)
         hardware_layout.addLayout(hardware_btn_row)
 
-        self.hardware_section = self._add_section(layout, "硬件扫描与渲染优化", hardware_frame, "#a6e3a1", expanded=True)
+        self.hardware_section = self._add_section(render_tab_layout, "硬件扫描与渲染优化", hardware_frame, "#a6e3a1", expanded=True)
 
         resolution_frame = QFrame()
         resolution_frame.setStyleSheet("background-color: #181825; border-radius: 10px; border: 1px solid #cba6f7;")
@@ -288,7 +305,46 @@ class SettingsView(QWidget):
         self.lbl_output_resolution.setStyleSheet("color: #a6e3a1; font-size: 12px; border: none;")
         resolution_layout.addWidget(self.lbl_output_resolution)
 
-        self.resolution_section = self._add_section(layout, "画面分辨率", resolution_frame, "#cba6f7", expanded=True)
+        self.resolution_section = self._add_section(render_tab_layout, "画面分辨率", resolution_frame, "#cba6f7", expanded=True)
+
+        shortcuts_frame = QFrame()
+        shortcuts_frame.setStyleSheet("background-color: #181825; border-radius: 10px; border: 1px solid #89b4fa;")
+        shortcuts_layout = QVBoxLayout(shortcuts_frame)
+        shortcuts_layout.setContentsMargins(25, 18, 25, 18)
+        shortcuts_layout.setSpacing(10)
+
+        lbl_shortcuts_title = QLabel("快捷键操作")
+        lbl_shortcuts_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #89b4fa; border: none;")
+        shortcuts_layout.addWidget(lbl_shortcuts_title)
+
+        lbl_shortcuts_desc = QLabel("设置软件内部快捷键。预览全屏默认 Ctrl+F，只在软件窗口内响应，不会注册为系统全局热键。")
+        lbl_shortcuts_desc.setWordWrap(True)
+        lbl_shortcuts_desc.setStyleSheet("color: #a6adc8; font-size: 13px; border: none;")
+        shortcuts_layout.addWidget(lbl_shortcuts_desc)
+
+        fullscreen_shortcut_row = QHBoxLayout()
+        fullscreen_shortcut_row.addWidget(QLabel("预览全屏:", styleSheet="color: #cdd6f4; border: none;"))
+        self.preview_fullscreen_shortcut_edit = QKeySequenceEdit()
+        self.preview_fullscreen_shortcut_edit.setKeySequence(QKeySequence(get_preview_fullscreen_shortcut()))
+        self.preview_fullscreen_shortcut_edit.setStyleSheet("background-color: #11111b; color: #cdd6f4; border: 1px solid #45475a; border-radius: 6px; padding: 8px;")
+        fullscreen_shortcut_row.addWidget(self.preview_fullscreen_shortcut_edit, stretch=1)
+        self.btn_save_shortcuts = QPushButton("保存")
+        self.btn_reset_shortcuts = QPushButton("恢复默认")
+        for btn in (self.btn_save_shortcuts, self.btn_reset_shortcuts):
+            btn.setStyleSheet("background-color: #313244; color: #89b4fa; font-weight: bold; border-radius: 6px; padding: 8px 12px;")
+        self.btn_save_shortcuts.clicked.connect(self.save_shortcuts_ui)
+        self.btn_reset_shortcuts.clicked.connect(self.reset_shortcuts_ui)
+        self.preview_fullscreen_shortcut_edit.editingFinished.connect(self.save_shortcuts_ui)
+        fullscreen_shortcut_row.addWidget(self.btn_save_shortcuts)
+        fullscreen_shortcut_row.addWidget(self.btn_reset_shortcuts)
+        shortcuts_layout.addLayout(fullscreen_shortcut_row)
+
+        self.lbl_shortcuts_status = QLabel("")
+        self.lbl_shortcuts_status.setWordWrap(True)
+        self.lbl_shortcuts_status.setStyleSheet("color: #a6e3a1; background-color: #11111b; border: 1px solid #313244; border-radius: 6px; padding: 8px; font-size: 12px;")
+        shortcuts_layout.addWidget(self.lbl_shortcuts_status)
+
+        self.shortcuts_section = self._add_section(workflow_tab_layout, "快捷键操作", shortcuts_frame, "#89b4fa", expanded=True)
 
         update_frame = QFrame()
         update_frame.setStyleSheet("background-color: #181825; border-radius: 10px; border: 1px solid #74c7ec;")
@@ -350,7 +406,7 @@ class SettingsView(QWidget):
         self.lbl_update_status.setWordWrap(True)
         self.lbl_update_status.setStyleSheet("color: #f9e2af; background-color: #11111b; border: 1px solid #313244; border-radius: 6px; padding: 8px; font-size: 12px;")
         update_layout.addWidget(self.lbl_update_status)
-        self.update_section = self._add_section(layout, "软件更新与下载", update_frame, "#74c7ec", expanded=False)
+        self.update_section = self._add_section(update_tab_layout, "软件更新与下载", update_frame, "#74c7ec", expanded=True)
 
         font_frame = QFrame()
         font_frame.setStyleSheet("background-color: #181825; border-radius: 10px; border: 1px solid #f9e2af;")
@@ -409,7 +465,7 @@ class SettingsView(QWidget):
         font_btn_row.addStretch()
         font_layout.addLayout(font_btn_row)
 
-        self.font_section = self._add_section(layout, "字体版权登记", font_frame, "#f9e2af", expanded=False)
+        self.font_section = self._add_section(font_tab_layout, "字体版权登记", font_frame, "#f9e2af", expanded=True)
 
         # 👑 账号池大框架
         pool_frame = QFrame()
@@ -464,8 +520,9 @@ class SettingsView(QWidget):
         btn_save.clicked.connect(self.save_config)
         pool_layout.addWidget(btn_save)
 
-        self.pool_section = self._add_section(layout, "Cloudflare Whisper AI 账号池", pool_frame, "#89b4fa", expanded=False)
-        layout.addStretch(1)
+        self.pool_section = self._add_section(cloud_tab_layout, "Cloudflare Whisper AI 账号池", pool_frame, "#89b4fa", expanded=True)
+        for tab_layout in (render_tab_layout, cloud_tab_layout, workflow_tab_layout, update_tab_layout, font_tab_layout):
+            tab_layout.addStretch(1)
 
     def _add_section(self, layout, title, frame, accent, expanded=True):
         section = SettingsSection(title, frame, accent=accent, expanded=expanded, parent=self.settings_content)
@@ -477,21 +534,54 @@ class SettingsView(QWidget):
         self._theme_colors = colors
         self._theme_key = theme_key or ""
         apply_tinted_styles(self, colors)
-        self.settings_scroll.setStyleSheet(f"""
+        apply_room_theme_bridge(self, colors)
+        if hasattr(self, "settings_tabs"):
+            self.settings_tabs.setStyleSheet(f"""
+                QTabWidget::pane {{
+                    background-color: {colors['panel']};
+                    border: 1px solid {colors['border']};
+                    border-radius: 8px;
+                    top: -1px;
+                }}
+                QTabBar::tab {{
+                    background-color: {colors['panel']};
+                    color: {colors['muted']};
+                    padding: 8px 16px;
+                    margin-right: 4px;
+                    border: 1px solid {colors['border']};
+                    border-bottom: none;
+                    border-top-left-radius: 7px;
+                    border-top-right-radius: 7px;
+                    font-weight: 800;
+                }}
+                QTabBar::tab:selected {{
+                    background-color: {colors['panel_2']};
+                    color: {colors['accent_2']};
+                    border-color: {colors['accent']};
+                }}
+                QTabBar::tab:hover {{
+                    background-color: {colors['card_hover']};
+                    color: {colors['text']};
+                }}
+            """)
+        scroll_style = f"""
             QScrollArea {{
                 background-color: {colors['bg']};
                 border: none;
             }}
             QScrollBar:vertical {{
                 background: {colors['panel']};
-                width: 12px;
-                margin: 4px 2px 4px 2px;
-                border-radius: 6px;
+                width: 10px;
+                margin: 2px;
+                border-radius: 5px;
             }}
             QScrollBar::handle:vertical {{
-                background: {colors['accent']};
+                background: {colors['border']};
                 border-radius: 5px;
-                min-height: 42px;
+                min-height: 38px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: {colors['accent']};
             }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
                 height: 0px;
@@ -499,7 +589,9 @@ class SettingsView(QWidget):
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
                 background: transparent;
             }}
-        """)
+        """
+        for scroll in getattr(self, "settings_scrolls", []):
+            scroll.setStyleSheet(scroll_style)
         for section in getattr(self, "setting_sections", []):
             section.apply_section_theme(colors)
 
@@ -515,6 +607,38 @@ class SettingsView(QWidget):
                 parent.room_edit.on_resolution_changed(saved)
             except Exception:
                 pass
+
+    def _main_window(self):
+        parent = self.parent()
+        while parent is not None and not hasattr(parent, "room_edit"):
+            parent = parent.parent()
+        return parent
+
+    def _shortcut_edit_text(self, sequence):
+        text = sequence.toString(QKeySequence.SequenceFormat.PortableText).strip()
+        return text or DEFAULT_SHORTCUTS["preview_fullscreen"]
+
+    def save_shortcuts_ui(self):
+        if not hasattr(self, "preview_fullscreen_shortcut_edit"):
+            return
+        value = self._shortcut_edit_text(self.preview_fullscreen_shortcut_edit.keySequence())
+        saved = set_preview_fullscreen_shortcut(value)
+        self.preview_fullscreen_shortcut_edit.blockSignals(True)
+        self.preview_fullscreen_shortcut_edit.setKeySequence(QKeySequence(saved))
+        self.preview_fullscreen_shortcut_edit.blockSignals(False)
+        main_window = self._main_window()
+        if main_window and hasattr(main_window, "room_edit"):
+            try:
+                saved = main_window.room_edit.apply_preview_fullscreen_shortcut(saved)
+            except Exception:
+                pass
+        if hasattr(self, "lbl_shortcuts_status"):
+            self.lbl_shortcuts_status.setText(f"预览全屏快捷键已保存：{saved}")
+
+    def reset_shortcuts_ui(self):
+        default = DEFAULT_SHORTCUTS["preview_fullscreen"]
+        self.preview_fullscreen_shortcut_edit.setKeySequence(QKeySequence(default))
+        self.save_shortcuts_ui()
 
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
@@ -539,6 +663,12 @@ class SettingsView(QWidget):
             self.output_resolution_combo.setCurrentText(current_resolution)
             self.output_resolution_combo.blockSignals(False)
             self.lbl_output_resolution.setText(f"当前固定画布：{current_resolution}")
+        if hasattr(self, "preview_fullscreen_shortcut_edit"):
+            shortcut = get_preview_fullscreen_shortcut()
+            self.preview_fullscreen_shortcut_edit.blockSignals(True)
+            self.preview_fullscreen_shortcut_edit.setKeySequence(QKeySequence(shortcut))
+            self.preview_fullscreen_shortcut_edit.blockSignals(False)
+            self.lbl_shortcuts_status.setText(f"当前预览全屏快捷键：{shortcut}")
         self.load_update_ui()
 
     def load_update_ui(self):

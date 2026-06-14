@@ -2,37 +2,8 @@
   "cf_accounts": [],
   "sync_url": "",
   "cloud_secret": "",
-  "elevenlabs_tool": {
-    "api_key": "",
-    "accounts": [],
-    "current_account_key": "",
-    "voice_id": "",
-    "model": "eleven_v3",
-    "format": "mp3_44100_128",
-    "output_dir": "",
-    "stability": 0.5,
-    "similarity": 0.75,
-    "style": 0.0,
-    "speaker_boost": true,
-    "clear_after": false,
-    "split_mode": 0,
-    "api_key_link": "https://elevenlabs.io/app/settings/api-keys",
-    "cards": []
-  },
-  "elevenlabs_assist_tool": {
-    "accounts": [],
-    "current_token": "",
-    "voice_id": "",
-    "model": "eleven_flash_v2_5",
-    "output_dir": "",
-    "sub_folder": "",
-    "stability": 0.5,
-    "similarity": 0.75,
-    "style": 0.0,
-    "speaker_boost": true,
-    "compat_mode": true,
-    "auto_delete": true,
-    "cards": []
+  "shortcuts": {
+    "preview_fullscreen": "Ctrl+F"
   },
   "workspace": {
     "mode": "local",

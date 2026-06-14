@@ -5,10 +5,8 @@ import platform
 import subprocess
 from datetime import datetime
 
+from app_config import CONFIG_FILE, load_app_config, save_app_config
 from core import get_ffmpeg_cmd
-
-
-CONFIG_FILE = os.path.join(os.getcwd(), "settings.json")
 
 
 def _creation_flags():
@@ -16,18 +14,11 @@ def _creation_flags():
 
 
 def _load_config():
-    if not os.path.exists(CONFIG_FILE):
-        return {}
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    return load_app_config()
 
 
 def _save_config(config):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=4, ensure_ascii=False)
+    save_app_config(config)
 
 
 def _run_text(cmd, timeout=8):

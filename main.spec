@@ -11,7 +11,6 @@ datas = [
     ("font_registry.json", "."),
     ("nlp_dictionary.txt", "."),
     ("fonts/open", "fonts/open"),
-    ("web_tools/dist", "web_tools/dist"),
 ]
 binaries = []
 hiddenimports = [

@@ -1,8 +1,11 @@
-import json
 import os
 
+from app_storage import read_json_file, resolve_user_file, write_json_file
 
-CONFIG_FILE = os.path.join(os.getcwd(), "settings.json")
+CONFIG_FILE = resolve_user_file("settings.json", legacy_root=os.getcwd(), kind="config")
+DEFAULT_SHORTCUTS = {
+    "preview_fullscreen": "Ctrl+F",
+}
 DEFAULT_OUTPUT_RESOLUTION = "竖屏 1080x1920"
 OUTPUT_RESOLUTION_OPTIONS = [
     "竖屏 1080x1920",
@@ -13,20 +16,13 @@ OUTPUT_RESOLUTION_OPTIONS = [
 
 
 def load_app_config():
-    if not os.path.exists(CONFIG_FILE):
-        return {}
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    data = read_json_file(CONFIG_FILE, default={})
+    return data if isinstance(data, dict) else {}
 
 
 def save_app_config(config):
     data = dict(config or {})
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+    write_json_file(CONFIG_FILE, data, indent=4)
 
 
 def get_output_resolution():
@@ -40,6 +36,45 @@ def set_output_resolution(value):
     config["output_resolution"] = value
     save_app_config(config)
     return value
+
+
+def _shortcut_text(value, default):
+    text = str(value or "").strip()
+    return text or default
+
+
+def get_shortcuts():
+    saved = load_app_config().get("shortcuts")
+    saved = saved if isinstance(saved, dict) else {}
+    shortcuts = dict(DEFAULT_SHORTCUTS)
+    for key, default in DEFAULT_SHORTCUTS.items():
+        shortcuts[key] = _shortcut_text(saved.get(key), default)
+    return shortcuts
+
+
+def get_shortcut(key):
+    return get_shortcuts().get(key, DEFAULT_SHORTCUTS.get(key, ""))
+
+
+def set_shortcut(key, sequence):
+    if key not in DEFAULT_SHORTCUTS:
+        return ""
+    config = load_app_config()
+    saved = config.get("shortcuts")
+    saved = saved if isinstance(saved, dict) else {}
+    value = _shortcut_text(sequence, DEFAULT_SHORTCUTS[key])
+    saved[key] = value
+    config["shortcuts"] = saved
+    save_app_config(config)
+    return value
+
+
+def get_preview_fullscreen_shortcut():
+    return get_shortcut("preview_fullscreen")
+
+
+def set_preview_fullscreen_shortcut(sequence):
+    return set_shortcut("preview_fullscreen", sequence)
 
 
 def resolution_to_size(resolution_text, media_path="", get_media_size=None):

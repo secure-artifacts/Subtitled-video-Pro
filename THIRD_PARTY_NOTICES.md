@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Generated: 2026-06-03
+Generated: 2026-06-04
 
 This file summarizes direct runtime dependencies and release-relevant
 components. See `LICENSE.LIST` for the direct dependency audit and
@@ -14,7 +14,6 @@ components. See `LICENSE.LIST` for the direct dependency audit and
 | PyQt6-WebEngine | 6.11.0 | GPL-3.0-only or Riverbank commercial license | https://pypi.org/project/PyQt6-WebEngine/ |
 | requests | 2.34.2 | Apache-2.0 | https://pypi.org/project/requests/ |
 | playwright | 1.59.0 | Apache-2.0 | https://pypi.org/project/playwright/ |
-| konva | 10.3.0 | MIT | https://www.npmjs.com/package/konva |
 
 ## Release-Relevant Components
 

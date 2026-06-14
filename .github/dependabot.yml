@@ -6,12 +6,6 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
 
-  - package-ecosystem: npm
-    directory: "/web_tools"
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

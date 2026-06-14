@@ -1,114 +1,116 @@
-# 依赖协议审计报告
+# Dependency License Audit Report
 
-## 项目信息
+## Project Information
 
-- 项目名称：Subtitle Composer / Subtitled Video Pro
-- 项目路径：`0516`
-- 项目类型：Python desktop app + Vite web tool panels + bundled open font assets
-- 审计时间：2026-06-03
-- 审计基准：公开 GitHub 开源分发
-- 审计范围：直接运行依赖；构建工具、外部可执行组件和字体资产单独列示
+- Project: Subtitle Composer / Subtitled Video Pro
+- Project type: Python desktop app with bundled open font assets
+- Audit date: 2026-06-04
+- Audit baseline: public GitHub open-source distribution
+- Scope: direct runtime dependencies; build tools, external executables, and
+  bundled font assets are tracked separately.
 
-## 版权协议合规结论
+## Compliance Conclusion
 
-最终判定：有条件合规，可开源分发。
+Final assessment: conditionally compliant for open-source distribution.
 
-条件是：项目必须按 `GPL-3.0-only` 分发，并随 release 提供完整对应源代码、许可证声明、第三方 notices、字体许可证文件和构件证明。
+Condition: distribute the project under `GPL-3.0-only`, include the complete
+corresponding source, preserve third-party notices, keep bundled font license
+files, and ship release provenance/checksum materials.
 
-原因：当前直接运行依赖中包含 `PyQt6` 与 `PyQt6-WebEngine`。两者在 PyPI 的开源分发路径为 `GPL-3.0-only`，另有 Riverbank 商业许可路径。如果没有商业 PyQt 授权，项目不应以 MIT、Apache-2.0 或闭源专有协议公开分发。
+Reason: the direct runtime dependencies include `PyQt6` and `PyQt6-WebEngine`.
+Their PyPI open-source distribution path is `GPL-3.0-only`, with a Riverbank
+commercial license available as an alternative. Without documented commercial
+PyQt/PyQt-WebEngine licensing, the project should not be publicly distributed
+under MIT, Apache-2.0, or proprietary-only terms.
 
-0516 新增的 `fonts/open` 字体包按发布资产审计：当前 manifest 记录 22 个字体文件，许可证为 `OFL-1.1` 或兼容开放字体许可证。字体资产与 GPL-3.0-only 项目分发兼容，但必须保留各字体目录内的 `OFL.txt`、`LICENSE.txt` 或 `LICENSE.md`。2026-06-03 新增 TikTok Sans v4.000，来源为 TikTok 官方 GitHub release / Google Fonts，许可证为 `OFL-1.1`。
+## Audit Summary
 
-0519 新增的 `web_tools` 设计房间依赖 `konva@10.3.0`，许可证为 `MIT`，用于 Canva 式页面/图层画布编辑。该依赖与 GPL-3.0-only 项目基准兼容，需在发布包中保留 MIT notices。
-
-## 审计结果摘要
-
-| 指标 | 数值 |
+| Metric | Value |
 | --- | ---: |
-| 直接运行依赖总数 | 5 |
-| 已确认协议 | 5 |
-| 未确认协议 | 0 |
-| 低风险 | 3 |
-| 需关注 | 2 |
-| 需手动确认 | 0 |
-| 发布相关字体文件 | 22 |
+| Direct runtime dependencies | 4 |
+| Confirmed licenses | 4 |
+| Unknown licenses | 0 |
+| Low risk | 2 |
+| Needs attention | 2 |
+| Manual confirmation required | 0 |
+| Publication-relevant bundled font files | 22 |
 
-## 协议分布
+## License Distribution
 
-| 协议 | 数量 | 占比 | 说明 |
-| --- | ---: | ---: | --- |
-| GPL-3.0-only | 2 | 40% | 强 copyleft；决定项目开源分发基准 |
-| Apache-2.0 | 2 | 40% | 与 GPL-3.0-only 兼容；需保留 notices |
-| MIT | 1 | 20% | 与 GPL-3.0-only 兼容；需保留 notices |
+| License | Count | Notes |
+| --- | ---: | --- |
+| GPL-3.0-only or commercial | 2 | Decides the public distribution baseline unless commercial PyQt licensing is documented |
+| Apache-2.0 | 2 | Compatible with GPL-3.0-only; preserve notices |
+| MIT | 0 | Removed with the obsolete Web tools |
 
-字体资产：22 个字体文件，按 `OFL-1.1` 或兼容开放字体许可证单独记录，不计入直接运行依赖总数。
+Bundled font assets: 22 files under `OFL-1.1` or compatible open font
+licenses, recorded in `fonts/open/open_fonts_manifest.json`.
 
-## 依赖明细
+## Direct Dependency Details
 
-| 依赖名称 | 版本 | 协议 | 来源 | 结论 |
+| Dependency | Version | License | Source | Conclusion |
 | --- | --- | --- | --- | --- |
-| PyQt6 | 6.11.0 | GPL-3.0-only 或商业许可 | https://pypi.org/project/PyQt6/ | 需按 GPL-3.0-only 分发，除非有商业授权 |
-| PyQt6-WebEngine | 6.11.0 | GPL-3.0-only 或商业许可 | https://pypi.org/project/PyQt6-WebEngine/ | 需按 GPL-3.0-only 分发，Riverbank 说明其不提供 LGPL 路径 |
-| requests | 2.34.2 | Apache-2.0 | https://pypi.org/project/requests/ | 与 GPL-3.0-only 兼容 |
-| playwright | 1.59.0 | Apache-2.0 | https://pypi.org/project/playwright/ | 与 GPL-3.0-only 兼容 |
-| konva | 10.3.0 | MIT | https://www.npmjs.com/package/konva | 与 GPL-3.0-only 兼容；用于设计房间 canvas 图层编辑 |
+| PyQt6 | 6.11.0 | GPL-3.0-only or Riverbank commercial license | https://pypi.org/project/PyQt6/ | Requires GPL-3.0-only distribution unless commercial licensing is documented |
+| PyQt6-WebEngine | 6.11.0 | GPL-3.0-only or Riverbank commercial license | https://pypi.org/project/PyQt6-WebEngine/ | Same PyQt commercial/GPL boundary; Riverbank states PyQt-WebEngine is not LGPL |
+| requests | 2.34.2 | Apache-2.0 | https://pypi.org/project/requests/ | Compatible with GPL-3.0-only |
+| playwright | 1.59.0 | Apache-2.0 | https://pypi.org/project/playwright/ | Compatible with GPL-3.0-only; track bundled browser notices if packaged |
 
-## 发布资产明细
+## Release-Relevant Assets
 
-| 资产 | 数量 | 协议 | 来源 | 结论 |
+| Asset | Quantity | License / Notice | Source | Conclusion |
 | --- | ---: | --- | --- | --- |
-| Open font pack | 22 个字体文件 | OFL-1.1 或兼容开放字体许可证 | `fonts/open/open_fonts_manifest.json` | 可随 GPL-3.0-only 项目发布；保留字体许可证文件 |
-| FFmpeg | Release workflow bundles FFmpeg/FFprobe under `vendor/<platform>/ffmpeg` | GPL/LGPL depends on build variant; Windows Gyan essentials builds are GPLv3 | https://www.gyan.dev/ffmpeg/builds/ and https://ffmpeg.org/legal.html | Preserve upstream notices and source-offer information with release materials |
-| PyInstaller | 构建工具 | GPL-2.0-or-later with bootloader exception | https://pyinstaller.org/en/stable/license.html | 可用于构建；保留 provenance |
-| Playwright browsers | release build 安装 Chromium | Chromium/browser 组件许可证 | https://playwright.dev/python/ | 若被打进产物，持续跟踪 notices |
+| Open font pack | 22 font files | OFL-1.1 or compatible open font licenses | `fonts/open/open_fonts_manifest.json` | May be redistributed with the GPL-3.0-only project; keep each font license file |
+| FFmpeg | Release workflow bundles FFmpeg/FFprobe under `vendor/<platform>/ffmpeg` | GPL/LGPL depending on build variant; Windows Gyan essentials builds are GPLv3 | https://www.gyan.dev/ffmpeg/builds/ and https://ffmpeg.org/legal.html | Preserve upstream notices and source/source-offer information |
+| PyInstaller | Build tool | GPL-2.0-or-later with bootloader exception | https://pyinstaller.org/en/stable/license.html | May be used for builds; preserve provenance |
+| Playwright browsers | Browser runtime installed during release build | Chromium/browser component licenses | https://playwright.dev/python/ | If bundled into artifacts, keep browser notices under review |
 
-## 风险发现
+## Risk Findings
 
-### 协议不兼容
+### License Compatibility
 
-未发现与 `GPL-3.0-only` 项目基准不兼容的直接运行依赖。
+No direct runtime dependency is incompatible with a `GPL-3.0-only` project
+baseline.
 
-如果项目改用 `MIT`、`Apache-2.0` 或闭源专有协议，则 `PyQt6` 和 `PyQt6-WebEngine` 会成为协议冲突项。修复路径为：
+If the project changes to MIT, Apache-2.0, or proprietary-only distribution,
+`PyQt6` and `PyQt6-WebEngine` become the key licensing blockers unless a valid
+Riverbank commercial license is documented.
 
-| 方案 | 说明 |
+| Option | Notes |
 | --- | --- |
-| 保持 GPL-3.0-only | 当前自动化审计推荐路径，适合公开 GitHub 开源分发 |
-| 购买并记录 Riverbank 商业授权 | 可另选项目协议；需在 release 合规材料中记录授权依据 |
-| 替换 GUI 框架 | 例如切换到 LGPL/宽松协议 GUI 方案，但需要较大改造 |
+| Keep GPL-3.0-only | Recommended for the current public release baseline |
+| Document Riverbank commercial licensing | Allows a different project license if the entitlement is valid and recorded |
+| Replace the GUI framework | Possible but requires significant engineering work |
 
-### 协议未知
+### Unknown Licenses
 
-所有直接运行依赖协议均已确认。字体资产目前均有 manifest 记录，但仍需在 release 包中保留实际许可证文件。
+All direct runtime dependency licenses are confirmed.
 
-### 外部组件风险
+### External Components
 
-| 组件 | 风险 | 建议 |
+| Component | Risk | Recommendation |
 | --- | --- | --- |
-| FFmpeg release runtime | Release workflow bundles Windows FFmpeg from Gyan essentials and macOS FFmpeg from the GitHub-hosted Homebrew environment | Preserve upstream notices and source-offer information; keep the project GPL-3.0-only baseline |
-| 字体包 | OFL 字体可以随软件发布，但修改字体后不得违规使用 Reserved Font Name | 保留每个字体目录内的许可证文件；修改字体时重命名并更新 manifest |
-| settings.json | 本地配置可能包含 token、API key、云同步地址和本地路径 | 不提交 `settings.json`；使用 `settings.example.json` 模板 |
+| FFmpeg release runtime | CI bundles platform FFmpeg/FFprobe binaries | Preserve upstream notices and source/source-offer information |
+| Open font pack | OFL fonts can be redistributed, but modified fonts must respect reserved font name rules | Keep each font directory's license file and update the manifest after font changes |
+| settings.json | Local config may contain API keys, cloud sync secrets, and local paths | Do not commit or package `settings.json`; use `settings.example.json` |
 
-## 生成文件
+## Generated Files
 
-| 文件 | 路径 | 说明 |
-| --- | --- | --- |
-| LICENSE.LIST | `LICENSE.LIST` | 直接依赖协议清单 |
-| LICENSE | `LICENSE` | 项目协议合规参考报告 |
-| COPYING | `COPYING` | 项目 GPL-3.0-only 短许可证声明 |
-| requirements.txt | `requirements.txt` | Python 运行依赖清单 |
-| requirements-build.txt | `requirements-build.txt` | Python 构建依赖清单 |
-| THIRD_PARTY_NOTICES.md | `THIRD_PARTY_NOTICES.md` | 第三方 notices 汇总 |
+| File | Purpose |
+| --- | --- |
+| `LICENSE.LIST` | Direct dependency license list |
+| `LICENSE` | Project license compliance summary |
+| `COPYING` | Short GPL-3.0-only project license notice |
+| `requirements.txt` | Python runtime dependencies |
+| `requirements-build.txt` | Python build dependencies |
+| `THIRD_PARTY_NOTICES.md` | Third-party notices summary |
 
-## 已安装 Skill
+## Follow-Up Recommendations
 
-| 编辑器 | Skill 路径 | 说明 |
-| --- | --- | --- |
-| Codex | `.codex/skills/license-audit/SKILL.md` | 依赖声明、字体 manifest 或 release 准备变更时重新检查协议合规性 |
-
-## 后续建议
-
-1. 推送 GitHub 前确认项目是否接受 `GPL-3.0-only` 开源分发。
-2. 如果计划闭源或使用 MIT/Apache-2.0，请先取得并记录 Riverbank PyQt/PyQt-WebEngine 商业授权。
-3. 发布二进制时随包附带 `LICENSE`、`COPYING`、`LICENSE.LIST`、`THIRD_PARTY_NOTICES.md`、本报告、字体许可证文件和 release checksum。
-4. FFmpeg release runtime files are bundled by CI; keep third-party notices and source/source-offer information in release materials.
-5. 每次依赖或字体资产变更后重新执行本审计。
+1. Confirm the project owner accepts `GPL-3.0-only` public distribution.
+2. If closed-source or permissive licensing is planned, first obtain and record
+   valid Riverbank commercial PyQt/PyQt-WebEngine licensing.
+3. Ship `LICENSE`, `COPYING`, `LICENSE.LIST`, `THIRD_PARTY_NOTICES.md`, this
+   report, bundled font license files, release checksums, and build provenance
+   with binary artifacts.
+4. Re-run this audit after dependency, bundled font, or FFmpeg distribution
+   changes.

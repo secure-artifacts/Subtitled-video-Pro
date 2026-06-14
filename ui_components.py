@@ -3,22 +3,80 @@
 # ==========================================
 import math
 import copy
-import subprocess
 import os
 import re
-import html
 from difflib import SequenceMatcher
+from pathlib import Path
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
 from PyQt6.QtCore import Qt, QObject, pyqtSlot
 
-from core import get_ffmpeg_cmd, get_ffprobe_cmd
+import media_probe
+from subtitle_render_utils import css_font_stack, html_attr, html_multiline_text, html_text
 
 FAITH_WORDS = {"god", "jesus", "amen", "lord", "christ", "holy", "bible"}
+READABILITY_SUBJECT_GLUE_WORDS = {"god", "jesus", "lord", "christ", "holy"}
+READABILITY_TRAILING_GLUE_WORDS = {
+    "i", "a", "an", "the", "to", "of", "in", "on", "at", "for", "with", "from",
+    "by", "about", "as", "into", "like", "through", "after", "over", "between",
+    "out", "against", "during", "without", "before", "under", "around", "among",
+    "and", "but", "or", "so", "because", "if", "when", "while", "that", "this",
+    "these", "those", "my", "your", "his", "her", "its", "our", "their", "is",
+    "am", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "shall", "should", "can", "could",
+    "may", "might", "must", "not",
+}
+
+def _readability_word_key(value):
+    return re.sub(r"[^a-zA-Z0-9']", "", str(value or "")).lower()
+
+def should_defer_subtitle_break_for_readability(
+    current_word,
+    next_word,
+    *,
+    segment_word_count=0,
+    silence_gap=0.0,
+    has_punct=False,
+    is_last_word=False,
+):
+    if is_last_word or not next_word:
+        return False
+    if has_punct:
+        return False
+    try:
+        silence_gap = float(silence_gap)
+    except Exception:
+        silence_gap = 0.0
+    if silence_gap > 1.15:
+        return False
+
+    current_key = _readability_word_key(current_word)
+    next_key = _readability_word_key(next_word)
+    if not current_key or not next_key:
+        return False
+    if current_key in READABILITY_SUBJECT_GLUE_WORDS:
+        return silence_gap < 0.95
+    if current_key in READABILITY_TRAILING_GLUE_WORDS:
+        return True
+    return int(segment_word_count or 0) <= 1 and silence_gap < 0.65
 APOSTROPHES = {"'", "’", "‘", "`"}
 ENGLISH_SUFFIX_TOKENS = {
     "'s", "'m", "'re", "'ve", "'ll", "'d", "'t",
     "n't", "n’t", "’s", "’m", "’re", "’ve", "’ll", "’d", "’t",
 }
+
+
+MIN_WORD_DURATION_SECONDS = 0.04
+MIN_SUBTITLE_DURATION_SECONDS = 0.18
+
+
+def _safe_float(value, default=0.0):
+    try:
+        value = float(value)
+        if math.isfinite(value):
+            return value
+    except Exception:
+        pass
+    return default
 
 
 def default_signature_style(base_style=None, scale_from_subtitle=True):
@@ -158,6 +216,14 @@ def normalize_design_room_state(state):
                 item["zIndex"] = j
             if item["type"] == "image":
                 item["src"] = str(item.get("src", "") or "")
+                item["path"] = str(item.get("path", "") or "")
+                item["source_path"] = str(item.get("source_path", "") or "")
+                item["original_path"] = str(item.get("original_path", "") or "")
+                item["proxy_path"] = str(item.get("proxy_path", "") or "")
+                try:
+                    item["proxy_max_side"] = int(float(item.get("proxy_max_side", 0) or 0))
+                except Exception:
+                    item["proxy_max_side"] = 0
                 item["fit"] = str(item.get("fit", "cover") or "cover")
             clean_page["layers"].append(item)
         clean_pages.append(clean_page)
@@ -165,6 +231,32 @@ def normalize_design_room_state(state):
         clean_pages = default_design_room_state()["pages"]
     data["pages"] = clean_pages
     return data
+
+
+def _file_path_to_url(path):
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    if text.startswith(("file://", "http://", "https://", "data:")):
+        return text
+    try:
+        return Path(text).resolve().as_uri()
+    except Exception:
+        return text
+
+
+def design_image_source(layer):
+    if not isinstance(layer, dict):
+        return ""
+    for key in ("proxy_path", "path"):
+        candidate = str(layer.get(key, "") or "").strip()
+        if candidate and os.path.exists(candidate):
+            return _file_path_to_url(candidate)
+    for key in ("source_path", "original_path"):
+        candidate = str(layer.get(key, "") or "").strip()
+        if candidate and os.path.exists(candidate):
+            return _file_path_to_url(candidate)
+    return str(layer.get("src", "") or "").strip()
 
 
 def design_frame_times(design_state):
@@ -191,6 +283,101 @@ def design_frame_times(design_state):
 def _normalize_apostrophes(text):
     return str(text or "").replace("’", "'").replace("‘", "'").replace("`", "'")
 
+SCRIPTURE_BOOK_WORDS = (
+    "Gen|Genesis|Exod|Exodus|Lev|Leviticus|Num|Numbers|Deut|Deuteronomy|"
+    "Josh|Joshua|Judg|Judges|Ruth|Sam|Samuel|Kings|Chron|Chronicles|Ezra|Neh|Nehemiah|"
+    "Esth|Esther|Job|Ps|Psalm|Psalms|Prov|Proverbs|Eccl|Ecclesiastes|Song|Isa|Isaiah|"
+    "Jer|Jeremiah|Lam|Lamentations|Ezek|Ezekiel|Dan|Daniel|Hos|Hosea|Joel|Amos|Obad|"
+    "Jonah|Mic|Micah|Nah|Nahum|Hab|Habakkuk|Zeph|Zephaniah|Hag|Haggai|Zech|Zechariah|"
+    "Mal|Malachi|Matt|Matthew|Mark|Luke|John|Jn|Jon|Acts|Rom|Romans|Cor|Corinthians|"
+    "Gal|Galatians|Eph|Ephesians|Phil|Philippians|Col|Colossians|Thess|Thessalonians|"
+    "Tim|Timothy|Titus|Philem|Philemon|Heb|Hebrews|James|Jas|Peter|Pet|Jude|Rev|Revelation"
+)
+SCRIPTURE_REF_RE = re.compile(
+    rf"(?<![A-Za-z0-9])"
+    rf"((?:(?:[1-3]\s*)?(?:{SCRIPTURE_BOOK_WORDS})\.?,?\s+)?)"
+    rf"(\d{{1,3}})\s*[,，]?\s*[:：]\s*[,，]?\s*(\d{{1,3}}(?:\s*[-–]\s*\d{{1,3}})?)"
+    rf"(?!\d)",
+    re.IGNORECASE,
+)
+
+def normalize_scripture_quote_text(raw_text):
+    text = str(raw_text or "")
+    if not text:
+        return ""
+    text = (
+        text.replace("“", '"')
+        .replace("”", '"')
+        .replace("„", '"')
+        .replace("‟", '"')
+        .replace("＂", '"')
+    )
+
+    def repl_ref(match):
+        book = re.sub(r"\s+", " ", match.group(1) or "").replace(",", "").strip()
+        chapter = match.group(2)
+        verse = re.sub(r"\s*[-–]\s*", "-", match.group(3))
+        prefix = f"{book} " if book else ""
+        return f"{prefix}{chapter}:{verse}"
+
+    text = SCRIPTURE_REF_RE.sub(repl_ref, text)
+    ref_core = r"(?:(?:(?:[1-3]\s*)?[A-Za-z]+\.?\s+)?\d{1,3}:\d{1,3}(?:-\d{1,3})?)"
+    text = re.sub(rf"\b({ref_core})\s*\"", r'\1"', text)
+    text = re.sub(rf"\b({ref_core}\")\s+", r"\1", text)
+    text = re.sub(r'\s+"', '"', text)
+
+    def wrap_line(match):
+        lead, ref, body = match.group(1), match.group(2), match.group(3).strip()
+        if not body or body.startswith('"'):
+            return match.group(0)
+        return f'{lead}{ref}"{body}"'
+
+    text = re.sub(
+        rf"(^|\n)\s*({ref_core})(?!\")\s+([^\"\n]+)",
+        wrap_line,
+        text,
+    )
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+def _merge_scripture_reference_tokens(tokens):
+    merged = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        bare = token.lstrip("\n")
+        newline = token[: len(token) - len(bare)]
+        if re.fullmatch(r"\d{1,3}:", bare) and i + 1 < len(tokens):
+            next_token = tokens[i + 1]
+            next_bare = next_token.lstrip("\n")
+            if re.fullmatch(r'\d{1,3}(?:-\d{1,3})?"?', next_bare):
+                combined = f"{newline}{bare}{next_bare}"
+                i += 2
+                if combined.endswith('"') and i < len(tokens):
+                    after = tokens[i]
+                    after_bare = after.lstrip("\n")
+                    if after_bare and not after.startswith("\n"):
+                        combined += after_bare
+                        i += 1
+                merged.append(combined)
+                continue
+        merged.append(token)
+        i += 1
+    return merged
+
+def format_subtitle_text_spacing(text):
+    clean = normalize_scripture_quote_text(text)
+
+    def repl_ref(match):
+        verse = re.sub(r"\s*[-–]\s*", "-", match.group(2))
+        return f"{match.group(1)}:{verse}"
+
+    clean = re.sub(r"(\d{1,3})\s*[,，]?\s*[:：]\s*[,，]?\s*(\d{1,3}(?:\s*[-–]\s*\d{1,3})?)", repl_ref, clean)
+    clean = re.sub(r'(\b\d{1,3}:\d{1,3}(?:-\d{1,3})?")\s+', r"\1", clean)
+    clean = re.sub(r"\s+([,.;:!?])", r"\1", clean)
+    clean = re.sub(r'\s+"', '"', clean)
+    clean = re.sub(r'"\s+([,.;:!?])', r'"\1', clean)
+    return clean.replace(" \n", "\n").replace("\n ", "\n").strip()
+
 def _visual_text_units(text):
     units = 0.0
     for ch in str(text or ""):
@@ -208,6 +395,7 @@ def tokenize_display_text(raw_text):
     tokens = []
     buf = ""
     pending_newline = False
+    raw_text = normalize_scripture_quote_text(raw_text)
 
     def flush_buf():
         nonlocal buf, pending_newline
@@ -246,7 +434,7 @@ def tokenize_display_text(raw_text):
                     pending_newline = False
                 tokens.append(token)
     flush_buf()
-    return [t for t in tokens if t.replace("\n", "").strip()]
+    return _merge_scripture_reference_tokens([t for t in tokens if t.replace("\n", "").strip()])
 
 
 def _token_match_key(token):
@@ -280,7 +468,10 @@ def _merge_english_suffix_tokens(words):
             else:
                 suffix_text = "'" + word
             fixed_prev["word"] = prev_word + suffix_text
-            fixed_prev["end"] = max(float(prev.get("end", 0.0)), float(item.get("end", prev.get("end", 0.0))))
+            fixed_prev["end"] = max(
+                _safe_float(prev.get("end", 0.0), 0.0),
+                _safe_float(item.get("end", prev.get("end", 0.0)), _safe_float(prev.get("end", 0.0), 0.0)),
+            )
             merged[-1] = fixed_prev
             continue
 
@@ -310,11 +501,91 @@ def _distribute_tokens_over_span(tokens, start_time, end_time):
     return aligned
 
 
+def _valid_fallback_bounds(fallback_start=None, fallback_end=None):
+    if fallback_end is None:
+        return None
+    start = 0.0 if fallback_start is None else max(0.0, _safe_float(fallback_start, 0.0))
+    end = _safe_float(fallback_end, 0.0)
+    if end > start + 0.05:
+        return start, end
+    return None
+
+
+def _repair_word_timeline(words, fallback_start=None, fallback_end=None):
+    if not words:
+        return []
+
+    fixed = []
+    overlap_count = 0
+    duplicate_start_count = 0
+    backwards_count = 0
+    zero_duration_count = 0
+    prev_start = None
+    prev_end = None
+
+    for item in words:
+        start = max(0.0, _safe_float(item.get("start"), prev_end if prev_end is not None else 0.0))
+        end = _safe_float(item.get("end"), start + MIN_WORD_DURATION_SECONDS)
+        if end <= start:
+            zero_duration_count += 1
+            end = start + MIN_WORD_DURATION_SECONDS
+        if prev_start is not None:
+            if start < prev_start - 0.01:
+                backwards_count += 1
+            if prev_end is not None and start < prev_end - 0.01:
+                overlap_count += 1
+            if abs(start - prev_start) < 0.01:
+                duplicate_start_count += 1
+        fixed_item = copy.deepcopy(item)
+        fixed_item["start"] = start
+        fixed_item["end"] = end
+        fixed.append(fixed_item)
+        prev_start = start
+        prev_end = end
+
+    observed_start = fixed[0]["start"]
+    observed_end = max(fixed[-1]["end"], max(item["end"] for item in fixed))
+    observed_span = max(0.0, observed_end - observed_start)
+    issue_count = overlap_count + duplicate_start_count + backwards_count
+    compressed = len(fixed) >= 6 and (
+        observed_span < len(fixed) * 0.055
+        or (zero_duration_count >= len(fixed) * 0.5 and observed_span < len(fixed) * 0.12)
+    )
+    crowded = len(fixed) >= 4 and issue_count >= max(2, int(len(fixed) * 0.25))
+    fallback_bounds = _valid_fallback_bounds(fallback_start, fallback_end)
+
+    if compressed or crowded:
+        span_start = observed_start
+        span_end = max(observed_end, observed_start + len(fixed) * 0.12)
+        if fallback_bounds:
+            fb_start, fb_end = fallback_bounds
+            fallback_span = fb_end - fb_start
+            if fallback_span > max(span_end - span_start, len(fixed) * 0.08):
+                span_start, span_end = fb_start, fb_end
+        return _normalize_aligned_word_times(
+            _distribute_tokens_over_span([item.get("word", "") for item in fixed], span_start, span_end),
+            span_start,
+            span_end,
+        )
+
+    repaired = []
+    cursor = fixed[0]["start"]
+    for item in fixed:
+        start = max(cursor, _safe_float(item.get("start"), cursor))
+        end = max(_safe_float(item.get("end"), start + MIN_WORD_DURATION_SECONDS), start + MIN_WORD_DURATION_SECONDS)
+        repaired_item = copy.deepcopy(item)
+        repaired_item["start"] = start
+        repaired_item["end"] = end
+        repaired.append(repaired_item)
+        cursor = end
+    return repaired
+
+
 def _normalize_aligned_word_times(aligned, total_start=None, total_end=None):
     if not aligned:
         return []
-    total_start = float(total_start if total_start is not None else aligned[0].get("start", 0.0))
-    total_end = float(total_end if total_end is not None else aligned[-1].get("end", total_start + 1.0))
+    total_start = _safe_float(total_start if total_start is not None else aligned[0].get("start", 0.0), 0.0)
+    total_end = _safe_float(total_end if total_end is not None else aligned[-1].get("end", total_start + 1.0), total_start + 1.0)
     span = max(0.01, total_end - total_start)
     min_dur = min(0.06, max(0.012, span / max(1, len(aligned)) * 0.22))
     cursor = total_start
@@ -322,8 +593,8 @@ def _normalize_aligned_word_times(aligned, total_start=None, total_end=None):
     for idx, item in enumerate(aligned):
         remaining = len(aligned) - idx - 1
         latest_start = max(total_start, total_end - max(0.0, remaining + 1) * min_dur)
-        raw_start = float(item.get("start", cursor))
-        raw_end = float(item.get("end", raw_start + min_dur))
+        raw_start = _safe_float(item.get("start", cursor), cursor)
+        raw_end = _safe_float(item.get("end", raw_start + min_dur), raw_start + min_dur)
         start = max(cursor, min(raw_start, latest_start))
         end = max(raw_end, start + min_dur)
         if remaining > 0:
@@ -335,7 +606,7 @@ def _normalize_aligned_word_times(aligned, total_start=None, total_end=None):
     return normalized
 
 
-def normalize_word_timestamps(words, text_key="word"):
+def normalize_word_timestamps(words, text_key="word", fallback_start=None, fallback_end=None):
     normalized = []
     for word in words or []:
         raw_text = _normalize_apostrophes(word.get(text_key) or word.get("word") or word.get("text") or "").strip()
@@ -344,10 +615,10 @@ def normalize_word_timestamps(words, text_key="word"):
         pieces = tokenize_display_text(raw_text)
         if not pieces:
             continue
-        start = float(word.get("start", 0.0))
-        end = float(word.get("end", start + 0.05))
+        start = max(0.0, _safe_float(word.get("start", 0.0), 0.0))
+        end = _safe_float(word.get("end", start + MIN_WORD_DURATION_SECONDS), start + MIN_WORD_DURATION_SECONDS)
         if end <= start:
-            end = start + 0.05
+            end = start + MIN_WORD_DURATION_SECONDS
         if len(pieces) == 1:
             normalized.append({"word": pieces[0], "start": start, "end": end})
             continue
@@ -360,11 +631,12 @@ def normalize_word_timestamps(words, text_key="word"):
             part_end = end if idx == len(pieces) - 1 else min(end, cursor + max(0.01, part_dur))
             normalized.append({"word": piece, "start": cursor, "end": max(cursor + 0.01, part_end)})
             cursor = part_end
-    return _merge_english_suffix_tokens(normalized)
+    return _repair_word_timeline(_merge_english_suffix_tokens(normalized), fallback_start, fallback_end)
 
-def align_reference_text_to_timestamps(ai_words, raw_text):
+def align_reference_text_to_timestamps(ai_words, raw_text, fallback_start=None, fallback_end=None):
+    raw_text = normalize_scripture_quote_text(raw_text)
     user_tokens = tokenize_display_text(raw_text)
-    ai_words = normalize_word_timestamps(ai_words or [])
+    ai_words = normalize_word_timestamps(ai_words or [], fallback_start=fallback_start, fallback_end=fallback_end)
     if not ai_words or not user_tokens:
         return ai_words
 
@@ -444,6 +716,58 @@ def _subtitle_plain_text(words):
             parts.append(raw)
     return " ".join(parts).replace(" \n", "\n").replace("\n ", "\n")
 
+def _subtitle_word_count(subtitle):
+    words = subtitle.get("words", []) if isinstance(subtitle, dict) else []
+    if words:
+        return len([w for w in words if _clean_word_text(w)])
+    return len(str(subtitle.get("text", "") if isinstance(subtitle, dict) else "").split())
+
+def _merge_subtitle_segments(left, right):
+    merged = copy.deepcopy(left)
+    left_words = [copy.deepcopy(w) for w in (left.get("words", []) or []) if _clean_word_text(w)]
+    right_words = [copy.deepcopy(w) for w in (right.get("words", []) or []) if _clean_word_text(w)]
+    if not left_words:
+        left_words = [{"text": left.get("text", ""), "start": left.get("start", 0.0), "end": left.get("end", 0.0)}]
+    if not right_words:
+        right_words = [{"text": right.get("text", ""), "start": right.get("start", left.get("end", 0.0)), "end": right.get("end", left.get("end", 0.0))}]
+    merged_words = left_words + right_words
+    merged["words"] = merged_words
+    merged["text"] = format_subtitle_text_spacing(_subtitle_plain_text(merged_words))
+    merged["start"] = min(_safe_float(left.get("start", 0.0), 0.0), _safe_float(right.get("start", 0.0), 0.0))
+    merged["end"] = max(_safe_float(left.get("end", merged["start"] + 0.05), merged["start"] + 0.05), _safe_float(right.get("end", merged["start"] + 0.05), merged["start"] + 0.05))
+    merged["track"] = left.get("track", right.get("track", 1))
+    return merged
+
+def merge_single_word_subtitle_segments(subtitles, *, max_merged_words=14):
+    items = [copy.deepcopy(s) for s in (subtitles or []) if isinstance(s, dict)]
+    if len(items) <= 1:
+        return items
+    result = []
+    idx = 0
+    while idx < len(items):
+        current = items[idx]
+        if _subtitle_word_count(current) > 1:
+            result.append(current)
+            idx += 1
+            continue
+
+        current_track = int(current.get("track", 1))
+        if result and int(result[-1].get("track", 1)) == current_track and _subtitle_word_count(result[-1]) < max_merged_words:
+            result[-1] = _merge_subtitle_segments(result[-1], current)
+            idx += 1
+            continue
+
+        if idx + 1 < len(items) and int(items[idx + 1].get("track", 1)) == current_track:
+            merged = _merge_subtitle_segments(current, items[idx + 1])
+            if _subtitle_word_count(merged) <= max_merged_words:
+                result.append(merged)
+                idx += 2
+                continue
+
+        result.append(current)
+        idx += 1
+    return result
+
 def _style_display_text(text, style):
     clean = str(text or "")
     trans = (style or {}).get("text_transform", "capitalize")
@@ -463,21 +787,7 @@ def _style_display_text(text, style):
     return " ".join(sub_words)
 
 def _css_font_stack(family):
-    primary = str(family or "Arial").replace("\\", "\\\\").replace("'", "\\'")
-    fallbacks = [
-        "TikTok Sans",
-        "Noto Sans SC",
-        "Noto Sans",
-        "Source Han Sans SC",
-        "Microsoft YaHei",
-        "Arial",
-    ]
-    stack = [f"'{primary}'"]
-    for fallback in fallbacks:
-        if fallback.casefold() != primary.casefold():
-            stack.append(f"'{fallback}'")
-    stack.append("sans-serif")
-    return ", ".join(stack)
+    return css_font_stack(family)
 
 def _apply_balanced_breaks(words, line_capacity, max_lines, style=None):
     cleaned = []
@@ -524,7 +834,8 @@ def subtitle_layout_capacity(style, proj_w=1080):
     width_pct = max(28.0, min(92.0, width_pct))
     max_lines = max(1, min(4, int(style.get("max_lines", 2) or 2)))
     line_capacity = max(3.5, (float(proj_w) * width_pct / 100.0) / size * 0.92)
-    if style.get("layout_mode", "standard") == "contrast":
+    layout_mode = style.get("layout_mode", "standard")
+    if layout_mode == "contrast":
         try:
             emphasis_scale = max(100.0, float(style.get("emphasis_scale", 145) or 145)) / 100.0
         except Exception:
@@ -613,21 +924,44 @@ def rebalance_subtitle_layout(subs, fallback_style=None, default_pos=(0.0, 25.0)
             new_sub["track"] = new_sub.get("track", 1)
             balanced.append(new_sub)
 
-    balanced.sort(key=lambda s: (int(s.get("track", 1)), float(s.get("start", 0.0)), float(s.get("end", 1.0))))
+    def shift_sub_words(sub, delta):
+        if abs(delta) < 0.000001:
+            return
+        for word in sub.get("words", []) or []:
+            old_start = _safe_float(word.get("start", 0.0), 0.0)
+            old_end = _safe_float(word.get("end", old_start + MIN_WORD_DURATION_SECONDS), old_start + MIN_WORD_DURATION_SECONDS)
+            word["start"] = max(0.0, old_start + delta)
+            word["end"] = max(word["start"] + MIN_WORD_DURATION_SECONDS, old_end + delta)
+
+    balanced.sort(key=lambda s: (int(s.get("track", 1)), _safe_float(s.get("start", 0.0), 0.0), _safe_float(s.get("end", 1.0), 1.0)))
     last_by_track = {}
     for sub in balanced:
         track = int(sub.get("track", 1))
-        start = float(sub.get("start", 0.0))
-        end = float(sub.get("end", start + 0.05))
+        start = max(0.0, _safe_float(sub.get("start", 0.0), 0.0))
+        end = _safe_float(sub.get("end", start + MIN_SUBTITLE_DURATION_SECONDS), start + MIN_SUBTITLE_DURATION_SECONDS)
+        if end < start + MIN_SUBTITLE_DURATION_SECONDS:
+            end = start + MIN_SUBTITLE_DURATION_SECONDS
+        sub["start"] = start
+        sub["end"] = end
         prev = last_by_track.get(track)
-        if prev is not None and float(prev.get("end", 0.0)) > start - min_gap:
-            prev["end"] = max(float(prev.get("start", 0.0)) + 0.05, start - min_gap)
+        if prev is not None and _safe_float(prev.get("end", 0.0), 0.0) > start - min_gap:
+            prev_start = _safe_float(prev.get("start", 0.0), 0.0)
+            prev_end = _safe_float(prev.get("end", prev_start), prev_start)
+            trimmed_prev_end = start - min_gap
+            if trimmed_prev_end >= prev_start + MIN_SUBTITLE_DURATION_SECONDS:
+                prev["end"] = trimmed_prev_end
+            else:
+                new_start = prev_end + min_gap
+                delta = new_start - start
+                start = new_start
+                end = max(start + MIN_SUBTITLE_DURATION_SECONDS, end + delta)
+                sub["start"] = start
+                sub["end"] = end
+                shift_sub_words(sub, delta)
             stats["overlaps_fixed"] += 1
-        if end <= start:
-            sub["end"] = start + 0.05
         last_by_track[track] = sub
 
-    balanced.sort(key=lambda s: (float(s.get("start", 0.0)), int(s.get("track", 1)), float(s.get("end", 1.0))))
+    balanced.sort(key=lambda s: (_safe_float(s.get("start", 0.0), 0.0), int(s.get("track", 1)), _safe_float(s.get("end", 1.0), 1.0)))
     stats["after"] = len(balanced)
     return balanced, stats
 
@@ -638,60 +972,10 @@ def hex_to_rgb(hex_color):
     return (255, 255, 255)
 
 def get_exact_duration(file_path):
-    if not file_path or not os.path.exists(file_path): return 0.0
-    try:
-        cmd = [get_ffmpeg_cmd(), '-i', file_path]
-        flags = 0x08000000 if os.name == 'nt' else 0
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore', timeout=5, creationflags=flags)
-        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", result.stderr)
-        if match:
-            h, m, s = match.groups()
-            return int(h) * 3600 + int(m) * 60 + float(s)
-        return 0.0
-    except:
-        return 0.0
+    return media_probe.get_exact_duration(file_path)
 
 def get_stream_duration(file_path, stream_selector="v:0"):
-    if not file_path or not os.path.exists(file_path):
-        return 0.0
-    flags = 0x08000000 if os.name == 'nt' else 0
-    try:
-        cmd = [
-            get_ffprobe_cmd(), "-v", "error",
-            "-select_streams", stream_selector,
-            "-show_entries", "stream=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            file_path,
-        ]
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            timeout=8,
-            creationflags=flags,
-        )
-        probed_duration = 0.0
-        for line in result.stdout.splitlines():
-            try:
-                value = float(line.strip())
-                if value > 0:
-                    probed_duration = value
-                    break
-            except Exception:
-                continue
-        if stream_selector.startswith("v"):
-            packet_duration = _estimate_video_packet_duration(file_path)
-            if packet_duration > 0 and (probed_duration <= 0 or packet_duration < probed_duration * 0.985):
-                return packet_duration
-        if probed_duration > 0:
-            return probed_duration
-    except Exception:
-        pass
-
-    return get_exact_duration(file_path)
+    return media_probe.get_stream_duration(file_path, stream_selector)
 
 def get_video_stream_duration(file_path):
     return get_stream_duration(file_path, "v:0")
@@ -699,67 +983,20 @@ def get_video_stream_duration(file_path):
 def get_audio_stream_duration(file_path):
     return get_stream_duration(file_path, "a:0")
 
+def get_timeline_media_duration(file_path, precise=False):
+    return media_probe.get_timeline_media_duration(file_path, precise=precise)
+
+def get_video_import_metadata(file_path):
+    return media_probe.get_video_import_metadata(file_path)
+
 def _parse_rate(value):
-    text = str(value or "").strip()
-    if not text or text in ("0/0", "N/A"):
-        return 0.0
-    try:
-        if "/" in text:
-            num, den = text.split("/", 1)
-            den_f = float(den)
-            return float(num) / den_f if den_f else 0.0
-        return float(text)
-    except Exception:
-        return 0.0
+    return media_probe.parse_rate(value)
 
 def _estimate_video_packet_duration(file_path):
-    if not file_path or not os.path.exists(file_path):
-        return 0.0
-    flags = 0x08000000 if os.name == 'nt' else 0
-    try:
-        cmd = [
-            get_ffprobe_cmd(), "-v", "error",
-            "-select_streams", "v:0",
-            "-count_packets",
-            "-show_entries", "stream=nb_read_packets,avg_frame_rate,r_frame_rate",
-            "-of", "default=noprint_wrappers=1",
-            file_path,
-        ]
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            timeout=20,
-            creationflags=flags,
-        )
-        data = {}
-        for line in result.stdout.splitlines():
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            data[key.strip()] = value.strip()
-        packets = int(float(data.get("nb_read_packets", "0") or 0))
-        rate = _parse_rate(data.get("avg_frame_rate")) or _parse_rate(data.get("r_frame_rate"))
-        if packets > 0 and rate > 0:
-            return packets / rate
-    except Exception:
-        return 0.0
-    return 0.0
+    return media_probe.estimate_video_packet_duration(file_path)
 
 def get_video_dimensions(file_path):
-    if not file_path or not os.path.exists(file_path): return 1080, 1920
-    try:
-        cmd = [get_ffmpeg_cmd(), '-i', file_path]
-        flags = 0x08000000 if os.name == 'nt' else 0
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore', timeout=5, creationflags=flags)
-        match = re.search(r"Video:.*?, (\d+)x(\d+)", result.stderr)
-        if match: return int(match.group(1)), int(match.group(2))
-        return 1080, 1920
-    except:
-        return 1080, 1920
+    return media_probe.get_video_dimensions(file_path)
 
 class AspectRatioContainer(QWidget):
     def __init__(self, child_widget, parent=None):
@@ -872,7 +1109,7 @@ class WebBridge(QObject):
 
 
 
-def render_subtitle_html(sub, current_time, proj_w=1080):
+def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
     def vw(val):
         return f"{float(val) * 100 / proj_w:.4f}vw"
 
@@ -938,13 +1175,17 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
     contrast_small_scale = max(0.78, min(1.0, float(style.get("contrast_small_scale", 0.74) or 0.74)))
     box_layout = style.get("box_layout", "auto")
     use_hl = style.get("use_hl", True)
+    hl_style = str(style.get("hl_style", "text") or "text").lower()
     hl_glow = style.get("hl_glow", False)
     glow_size = int(style.get("glow_size", 20))
     text_texture = style.get("text_texture", "none")
 
     anim_type = style.get("anim_type", "pop")
     font_motion = style.get("font_motion", "none")
-    typewriter_motion = anim_type == "typewriter" or font_motion == "typewriter_left"
+    dynamic_reflow_motion = font_motion == "dynamic_reflow" or layout_mode == "prayer_reflow"
+    typewriter_motion = anim_type == "typewriter" or font_motion in ("typewriter_left", "dynamic_reflow")
+    if dynamic_reflow_motion:
+        layout_mode = "prayer_reflow"
     if anim_type == "typewriter":
         anim_type = "none"
     hl_motion = style.get("hl_motion", "stable")
@@ -959,29 +1200,36 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
     mask_top = style.get("mask_top", 20)
     mask_bot = style.get("mask_bottom", 20)
 
+    canvas_h = float(proj_h if proj_h is not None else style.get("_proj_h", 1920) or 1920)
+    bg_auto_resolution = bool(style.get("bg_auto_resolution", True))
+    bg_resolution_scale = max(0.35, min(4.0, min(float(proj_w or 1080), canvas_h) / 1080.0)) if bg_auto_resolution else 1.0
+
+    def bg_vw(val):
+        return vw(float(val) * bg_resolution_scale)
+
     size_vw = vw(size)
-    rad_vw = vw(rad)
-    pad_y = vw(pad / 2.5)
-    pad_x = vw(pad)
-    pad_top_vw = vw(pad_top)
-    pad_right_vw = vw(pad_right)
-    pad_bottom_vw = vw(pad_bottom)
-    pad_left_vw = vw(pad_left)
+    rad_vw = bg_vw(rad)
+    pad_y = bg_vw(pad / 2.5)
+    pad_x = bg_vw(pad)
+    pad_top_vw = bg_vw(pad_top)
+    pad_right_vw = bg_vw(pad_right)
+    pad_bottom_vw = bg_vw(pad_bottom)
+    pad_left_vw = bg_vw(pad_left)
     ls_vw = vw(letter_spacing)
     ws_vw = vw(word_spacing)
 
-    hl_rad_vw = vw(hl_rad)
-    hl_pad_y = vw(max(0, hl_pad / 3))
-    hl_pad_x = vw(hl_pad)
-    hl_pad_top_vw = vw(hl_pad_top)
-    hl_pad_right_vw = vw(hl_pad_right)
-    hl_pad_bottom_vw = vw(hl_pad_bottom)
-    hl_pad_left_vw = vw(hl_pad_left)
-    hl_spread_vw = vw(max(0, hl_pad, hl_pad_left, hl_pad_right, hl_pad_top, hl_pad_bottom))
+    hl_rad_vw = bg_vw(hl_rad)
+    hl_pad_y = bg_vw(max(0, hl_pad / 3))
+    hl_pad_x = bg_vw(hl_pad)
+    hl_pad_top_vw = bg_vw(hl_pad_top)
+    hl_pad_right_vw = bg_vw(hl_pad_right)
+    hl_pad_bottom_vw = bg_vw(hl_pad_bottom)
+    hl_pad_left_vw = bg_vw(hl_pad_left)
+    hl_spread_vw = bg_vw(max(0, hl_pad, hl_pad_left, hl_pad_right, hl_pad_top, hl_pad_bottom))
 
     r, g, b = hex_to_rgb(bg_col)
     hl_r, hl_g, hl_b = hex_to_rgb(hl_bg_col)
-    stable_word_boxes = bg_mode in ("tape", "block", "full_frame", "sweep", "cinematic_frame") and hl_motion == "stable"
+    stable_word_boxes = bg_mode in ("tape", "canva_fit", "block", "full_frame", "sweep", "cinematic_frame") and hl_motion == "stable"
 
     words = sub.get("words", [])
     if not words:
@@ -996,6 +1244,7 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
     content_indices = [i for i, ww in enumerate(words) if _clean_word_text(ww)]
     content_center = (content_indices[0] + content_indices[-1]) / 2.0 if content_indices else (len(words) - 1) / 2.0
     typewriter_word_order = {}
+    typewriter_reveal_starts = {}
     typewriter_word_interval = pop_speed
     typewriter_intro_duration = max(0.05, min(0.22, pop_speed * 0.9))
     typewriter_active_order = 0
@@ -1006,11 +1255,35 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
         typewriter_word_interval = max(0.045, min(pop_speed, available_span / word_count))
         typewriter_intro_duration = max(0.05, min(0.20, typewriter_word_interval * 1.15))
         typewriter_word_order = {word_idx: order for order, word_idx in enumerate(content_indices)}
+        for word_idx, order in typewriter_word_order.items():
+            timed_start = words[word_idx].get("start", None)
+            try:
+                timed_start = float(timed_start)
+            except Exception:
+                timed_start = None
+            if dynamic_reflow_motion and timed_start is not None and clip_start - 0.001 <= timed_start <= clip_end + 0.001:
+                typewriter_reveal_starts[word_idx] = max(clip_start, min(clip_end, timed_start))
+            else:
+                typewriter_reveal_starts[word_idx] = clip_start + order * typewriter_word_interval
+
+    def _typewriter_reveal_start_for(word_idx):
+        if word_idx not in typewriter_word_order:
+            return clip_end + 999.0
+        return typewriter_reveal_starts.get(
+            word_idx,
+            clip_start + typewriter_word_order.get(word_idx, 0) * typewriter_word_interval,
+        )
+
     typewriter_group_shift_em = 0.0
     if typewriter_motion and content_indices:
-        elapsed = max(0.0, current_time - clip_start)
-        typewriter_active_order = max(0, min(len(content_indices) - 1, int(elapsed / max(0.001, typewriter_word_interval))))
-        active_start = clip_start + typewriter_active_order * typewriter_word_interval
+        if dynamic_reflow_motion:
+            active_indices = [word_idx for word_idx in content_indices if current_time >= _typewriter_reveal_start_for(word_idx)]
+            typewriter_active_order = len(active_indices) - 1 if active_indices else 0
+        else:
+            elapsed = max(0.0, current_time - clip_start)
+            typewriter_active_order = max(0, min(len(content_indices) - 1, int(elapsed / max(0.001, typewriter_word_interval))))
+        active_word_idx = content_indices[max(0, min(len(content_indices) - 1, typewriter_active_order))]
+        active_start = _typewriter_reveal_start_for(active_word_idx)
         typewriter_active_p = ease_out_cubic((current_time - active_start) / typewriter_intro_duration)
         typewriter_group_shift_em = 0.28 * (1.0 - typewriter_active_p)
     head_letter_large_variant = layout_mode == "reel_stack" and layout_variant in ("head-letter-large", "initial-large")
@@ -1079,6 +1352,11 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
             layout_mode = ("axis_stack", "reel_stack", "random_focus")[mix_seed % 3]
         elif count == 4:
             layout_mode = ("side_steps", "random_focus", "reel_stack")[mix_seed % 3]
+    layout_content_indices = content_indices
+    if dynamic_reflow_motion and content_indices:
+        layout_content_indices = [i for i in content_indices if current_time >= _typewriter_reveal_start_for(i)]
+        if not layout_content_indices and current_time >= clip_start:
+            layout_content_indices = [content_indices[0]]
     emphasis_idx = set()
     small_idx = set()
     current_word_idx = None
@@ -1112,14 +1390,14 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
             score += 1.5
         return score
 
-    if layout_mode in ("contrast", "triple", "reel_stack", "random_focus", "axis_stack", "quote_stack") and content_indices:
+    if layout_mode in ("contrast", "triple", "reel_stack", "random_focus", "axis_stack", "quote_stack", "prayer_reflow", "narrative_block") and layout_content_indices:
         variant = layout_variant
         if variant == "auto":
-            m = len(content_indices) % 3
+            m = len(layout_content_indices) % 3
             variant = "small-big-small" if m == 1 else "big-small-mix" if m == 2 else "mix-big-small"
 
         ranked = sorted(
-            content_indices,
+            layout_content_indices,
             key=lambda i: (_token_score(_clean_word_text(words[i])), -abs(i - len(words) / 2)),
             reverse=True,
         )
@@ -1162,18 +1440,70 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
                     emphasis_idx.add(content_indices[-1])
             small_idx.update([i for i in content_indices if i not in emphasis_idx and len(content_indices) > 2])
         elif layout_mode == "quote_stack":
-            emphasis_idx.add(content_indices[0])
-            if len(content_indices) > 1:
-                emphasis_idx.add(content_indices[-1])
-            small_idx.update([i for i in content_indices if i not in emphasis_idx])
+            emphasis_idx.add(layout_content_indices[0])
+            if len(layout_content_indices) > 1:
+                emphasis_idx.add(layout_content_indices[-1])
+            small_idx.update([i for i in layout_content_indices if i not in emphasis_idx])
+        elif layout_mode == "narrative_block":
+            emphasis_idx.add(layout_content_indices[0])
+            if len(layout_content_indices) >= 7:
+                emphasis_idx.add(layout_content_indices[-1])
+            ranked_focus = [idx for idx in ranked[:2] if _token_score(_clean_word_text(words[idx])) >= 6.0]
+            emphasis_idx.update(ranked_focus[:1])
+            small_idx.update([i for i in layout_content_indices if i not in emphasis_idx])
+        elif layout_mode == "prayer_reflow":
+            stop_anchor = {"is", "am", "are", "the", "this", "that", "with", "for", "your", "my", "in", "to"}
+            rows_probe = []
+            n_probe = len(layout_content_indices)
+            if n_probe <= 4:
+                rows_probe = [[item] for item in layout_content_indices]
+            elif n_probe == 5:
+                rows_probe = [layout_content_indices[:3], layout_content_indices[3:]]
+            elif n_probe <= 7:
+                rows_probe = [[layout_content_indices[0]], layout_content_indices[1:3], layout_content_indices[3:-1], [layout_content_indices[-1]]]
+            else:
+                rows_probe = [[layout_content_indices[0]], layout_content_indices[1:3], layout_content_indices[3:6], layout_content_indices[6:]]
+            for row_i, row in enumerate(rows_probe):
+                if not row:
+                    continue
+                anchor = row[0]
+                anchor_txt = _clean_word_text(words[anchor]).lower()
+                if row_i == 0 or anchor_txt not in stop_anchor or len(row) == 1:
+                    emphasis_idx.add(anchor)
+                if len(row) == 1 and anchor_txt in ("is", "the", "this", "that", "with", "for", "in", "to"):
+                    emphasis_idx.discard(anchor)
+            for idx in ranked[:1]:
+                if _token_score(_clean_word_text(words[idx])) >= 6.0:
+                    emphasis_idx.add(idx)
+            small_idx.update([i for i in layout_content_indices if i not in emphasis_idx])
 
     content_order = {word_idx: order for order, word_idx in enumerate(content_indices)}
 
     def _build_layout_rows():
-        items = content_indices
+        items = layout_content_indices
         n = len(items)
-        if not items or layout_mode not in ("reel_stack", "random_focus", "side_steps", "axis_stack", "quote_stack"):
+        if not items or layout_mode not in ("reel_stack", "random_focus", "side_steps", "axis_stack", "quote_stack", "prayer_reflow", "narrative_block"):
             return []
+        if layout_mode == "narrative_block":
+            if n <= 4:
+                return [items]
+            if n <= 7:
+                return [items[:3], items[3:]]
+            if n <= 10:
+                return [items[:3], items[3:7], items[7:]]
+            return [items[:3], items[3:7], items[7:10], items[10:]]
+        if layout_mode == "prayer_reflow":
+            if n <= 4:
+                return [[item] for item in items]
+            if n == 5:
+                return [items[:3], items[3:]]
+            if n == 6:
+                return [[items[0]], items[1:3], items[3:5], [items[5]]]
+            if n == 7:
+                return [[items[0]], items[1:3], items[3:6], [items[6]]]
+            if n <= 10:
+                return [[items[0]], items[1:3], items[3:6], items[6:]]
+            return [[items[0]], items[1:3], items[3:6], items[6:9], items[9:]]
         if layout_mode == "quote_stack":
             if n <= 2:
                 return [[item] for item in items]
@@ -1254,14 +1584,14 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
         if not clean_txt:
             if has_newline:
                 html_words_fg.append("<br>")
-                if bg_mode in ("tape", "block", "sweep"):
+                if bg_mode in ("tape", "canva_fit", "block", "sweep"):
                     html_words_bg.append("<br>")
             continue
 
         typewriter_reveal_start = clip_start
         typewriter_local_p = 1.0
         if typewriter_motion:
-            typewriter_reveal_start = clip_start + typewriter_word_order.get(idx, 0) * typewriter_word_interval
+            typewriter_reveal_start = _typewriter_reveal_start_for(idx)
             if current_time < typewriter_reveal_start:
                 continue
             typewriter_local_p = ease_out_cubic((current_time - typewriter_reveal_start) / typewriter_intro_duration)
@@ -1270,12 +1600,12 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
         if has_newline and idx > 0:
             html_words_fg.append("<br>")
             inserted_break = True
-            if bg_mode in ("tape", "block", "sweep"):
+            if bg_mode in ("tape", "canva_fit", "block", "sweep"):
                 html_words_bg.append("<br>")
 
         if not inserted_break and _layout_breaks_before(idx):
             html_words_fg.append("<br>")
-            if bg_mode in ("tape", "block", "sweep"):
+            if bg_mode in ("tape", "canva_fit", "block", "sweep"):
                 html_words_bg.append("<br>")
 
         clean_txt = _style_display_text(clean_txt, style)
@@ -1517,6 +1847,44 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
                 layout_font_scale = 0.72 if layout_row_len >= 3 else 0.82
                 per_word_translate = 0.025
                 word_margin_right = vw(max(0, word_spacing * 0.18 + 0.52))
+        elif layout_mode == "narrative_block":
+            row_scales = (1.28, 0.88, 1.08, 0.76)
+            layout_font_scale = row_scales[min(layout_row_i, len(row_scales) - 1)]
+            if idx in emphasis_idx:
+                layout_font_scale = max(layout_font_scale, emphasis_scale / 100.0)
+                per_word_translate = -0.035
+            elif idx in small_idx:
+                layout_font_scale = min(layout_font_scale, contrast_small_scale)
+                per_word_translate = 0.018
+            if layout_row_i >= 1:
+                current_translate_x_em += 0.10 if layout_row_i % 2 else 0.0
+            word_margin_right = vw(max(0, word_spacing * 0.20 + 0.62))
+        elif layout_mode == "prayer_reflow":
+            row_shift_patterns = {
+                1: [0.0],
+                2: [0.0, 1.12],
+                3: [0.0, 1.20, 0.42],
+                4: [0.0, 1.18, 0.42, 1.52],
+                5: [0.0, 0.10],
+                6: [0.0, 0.0, 0.0, 0.10],
+                7: [0.0, 0.0, 0.0, 0.10],
+            }
+            visible_count = max(1, len(layout_content_indices))
+            row_shifts = row_shift_patterns.get(visible_count, [0.0, 0.0, 0.0, 0.0, 0.12])
+            current_translate_x_em += row_shifts[min(layout_row_i, len(row_shifts) - 1)]
+            if idx in emphasis_idx:
+                anchor_scale = 1.36 if visible_count <= 4 else 1.44
+                if layout_row_i >= 2 or (visible_count == 5 and layout_row_i == 1):
+                    anchor_scale += 0.16
+                layout_font_scale = max(emphasis_scale / 100.0, anchor_scale)
+                per_word_translate = -0.045
+                word_margin_right = vw(max(0, word_spacing * 0.22 + 0.72))
+            else:
+                layout_font_scale = 0.60 if layout_row_len >= 3 else 0.66
+                if visible_count <= 4 and layout_row_len == 1:
+                    layout_font_scale = 0.70
+                per_word_translate = 0.018
+                word_margin_right = vw(max(0, word_spacing * 0.12 + 0.45))
 
         current_translate_em += per_word_translate
         if font_motion == "wave" and word_started:
@@ -1636,8 +2004,23 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
                 word_css_bg += f" background-color: transparent; border-radius: {hl_rad_vw};"
         elif bg_mode == "block" and is_current and hl_bg_a > 0:
             word_css_fg += f" background-color: rgba({hl_r}, {hl_g}, {hl_b}, {hl_bg_a}); border-radius: {hl_rad_vw}; box-shadow: 0 0 0 {hl_spread_vw} rgba({hl_r}, {hl_g}, {hl_b}, {hl_bg_a});"
+        if is_current and bg_mode != "tape":
+            outline_a = max(0.72, min(1.0, hl_bg_a))
+            outline_spread = bg_vw(max(2, min(10, hl_pad or 4)))
+            underline_h = bg_vw(max(2, min(10, hl_pad_bottom or hl_pad or 4)))
+            underline_offset = bg_vw(max(4, min(18, hl_pad_bottom + 4)))
+            if hl_style == "box":
+                word_css_fg += f" background-color: rgba({hl_r}, {hl_g}, {hl_b}, {max(0.18, hl_bg_a):.3f}); border-radius: {hl_rad_vw}; padding: {hl_pad_top_vw} {hl_pad_right_vw} {hl_pad_bottom_vw} {hl_pad_left_vw};"
+            elif hl_style == "underline":
+                word_css_fg += f" background-image: linear-gradient(rgba({hl_r}, {hl_g}, {hl_b}, {outline_a:.3f}), rgba({hl_r}, {hl_g}, {hl_b}, {outline_a:.3f})); background-repeat: no-repeat; background-size: 100% {underline_h}; background-position: 0 calc(100% + {underline_offset});"
+            elif hl_style == "glow":
+                word_css_fg += f" filter: drop-shadow(0 0 {bg_vw(max(8, glow_size))} rgba({hl_r}, {hl_g}, {hl_b}, 0.72)) drop-shadow(0 0 {bg_vw(max(16, glow_size * 1.7))} rgba({hl_r}, {hl_g}, {hl_b}, 0.42)); -webkit-text-stroke: {bg_vw(max(1.0, hl_pad * 0.18))} rgba({hl_r}, {hl_g}, {hl_b}, 0.82);"
+            elif hl_style == "capsule":
+                word_css_fg += f" border-radius: 999px; padding: {hl_pad_top_vw} {hl_pad_right_vw} {hl_pad_bottom_vw} {hl_pad_left_vw}; box-shadow: inset 0 0 0 {bg_vw(max(1.2, hl_pad * 0.18))} rgba({hl_r}, {hl_g}, {hl_b}, {outline_a:.3f}), 0 0 {bg_vw(max(8, hl_pad * 1.2))} rgba({hl_r}, {hl_g}, {hl_b}, 0.25);"
+            elif hl_style in ("outline", "canva_frame"):
+                word_css_fg += f" border-radius: {hl_rad_vw}; box-shadow: 0 0 0 {outline_spread} rgba({hl_r}, {hl_g}, {hl_b}, {outline_a:.3f});"
 
-        safe_txt = html.escape(clean_txt, quote=False)
+        safe_txt = html_text(clean_txt)
         safe_txt_bg = safe_txt
         if head_letter_large_variant and idx == first_content_idx and not typewriter_motion:
             initial_match = re.search(r"[A-Za-z0-9\u4e00-\u9fff]", clean_txt)
@@ -1645,11 +2028,11 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
                 initial_pos = initial_match.start()
                 initial_scale = max(emphasis_scale / 100.0, 1.58)
                 safe_txt = (
-                    f"{html.escape(clean_txt[:initial_pos], quote=False)}"
+                    f"{html_text(clean_txt[:initial_pos])}"
                     f"<span style=\"display:inline-block; font-size:{initial_scale:.3f}em; "
                     f"line-height:0.78; vertical-align:-0.04em; margin-right:0.018em;\">"
-                    f"{html.escape(clean_txt[initial_pos], quote=False)}</span>"
-                    f"{html.escape(clean_txt[initial_pos + 1:], quote=False)}"
+                    f"{html_text(clean_txt[initial_pos])}</span>"
+                    f"{html_text(clean_txt[initial_pos + 1:])}"
                 )
                 safe_txt_bg = safe_txt
         html_words_fg.append(f"<span style='{word_css_fg}'>{safe_txt}</span>")
@@ -1659,16 +2042,25 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
             next_raw = str(words[idx + 1].get("text") or words[idx + 1].get("word") or "")
             next_is_visible = True
             if typewriter_motion:
-                next_reveal_start = clip_start + typewriter_word_order.get(idx + 1, 9999) * typewriter_word_interval
+                next_reveal_start = _typewriter_reveal_start_for(idx + 1)
                 next_is_visible = current_time >= next_reveal_start
             if next_is_visible and "\n" not in next_raw and not _layout_breaks_before(idx + 1):
-                spacer = "<span style='display:inline-block; width:0.14em;'></span>" if layout_mode in ("contrast", "triple", "reel_stack", "random_focus", "side_steps", "axis_stack", "quote_stack") else " "
+                spacer = "<span style='display:inline-block; width:0.14em;'></span>" if layout_mode in ("contrast", "triple", "reel_stack", "random_focus", "side_steps", "axis_stack", "quote_stack", "prayer_reflow", "narrative_block") else " "
                 html_words_fg.append(spacer)
-                if bg_mode in ("tape", "block", "sweep"):
-                    html_words_bg.append(spacer if layout_mode in ("contrast", "triple", "reel_stack", "random_focus", "side_steps", "axis_stack", "quote_stack") else " ")
+                if bg_mode in ("tape", "canva_fit", "block", "sweep"):
+                    html_words_bg.append(spacer if layout_mode in ("contrast", "triple", "reel_stack", "random_focus", "side_steps", "axis_stack", "quote_stack", "prayer_reflow", "narrative_block") else " ")
 
     inner_html_fg = "".join(html_words_fg)
     inner_html_bg = "".join(html_words_bg)
+
+    def _split_html_lines(html_value):
+        lines = []
+        current = []
+        for part in str(html_value or "").split("<br>"):
+            clean_part = part.strip()
+            if clean_part:
+                lines.append(clean_part)
+        return lines
 
     inner_transform_parts = []
     inner_extra_css = ""
@@ -1739,7 +2131,7 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
         font-weight: {f_weight};
         font-style: {f_style};
         letter-spacing: {ls_vw};
-        word-spacing: {('0vw' if layout_mode in ('contrast', 'triple', 'reel_stack', 'random_focus', 'side_steps', 'axis_stack', 'quote_stack') else ws_vw)};
+        word-spacing: {('0vw' if layout_mode in ('contrast', 'triple', 'reel_stack', 'random_focus', 'side_steps', 'axis_stack', 'quote_stack', 'prayer_reflow', 'narrative_block') else ws_vw)};
         text-transform: none;
         box-sizing: border-box;
         -webkit-font-smoothing: antialiased;
@@ -1773,7 +2165,7 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
 
     height_css = f"max-height: {box_height:.4f}vh;" if box_height > 0 else ""
     line_guard_css = ""
-    if layout_mode in ("standard", "contrast") and max_lines > 0:
+    if layout_mode in ("standard", "contrast", "narrative_block") and max_lines > 0:
         line_guard_css = f"--sub-max-lines: {max_lines};"
     overflow_css = "hidden" if box_height > 0 else "visible"
     outer_box_style = f"{width_css} {height_css} {line_guard_css} margin: 0 auto; outline: none; text-align: {align}; position: relative; {mask_css} transform: rotate({rot}deg); overflow: {overflow_css}; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);"
@@ -1792,6 +2184,42 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
         <div class='sub-box' style='{outer_box_style}'>
             <div style="{inner_transform} width: 100%; display: flex; justify-content: {align_item}; text-align: {align};">
                 <span style="{fg_layer_css}">{inner_html_fg}</span>
+            </div>
+        </div>
+        """
+    elif bg_mode == "canva_fit":
+        fit_outline_a = max(0.0, min(1.0, hl_bg_a))
+        fit_outline_vw = bg_vw(max(1.5, min(8.0, float(hl_pad or 6) * 0.42)))
+        fit_line_shadow = f"box-shadow: 0 0 0 {fit_outline_vw} rgba({hl_r}, {hl_g}, {hl_b}, {fit_outline_a:.3f});" if hl_style == "canva_frame" else ""
+        fit_line_css = base_wrapper_css + f"""
+            display: inline;
+            background-color: rgba({r}, {g}, {b}, {bg_a});
+            border-radius: {rad_vw};
+            padding: {pad_top_vw} {pad_right_vw} {pad_bottom_vw} {pad_left_vw};
+            {fit_line_shadow}
+            line-height: {max(0.8, float(lh))};
+            white-space: normal;
+            overflow-wrap: normal;
+            word-break: normal;
+            background-clip: padding-box;
+            box-sizing: border-box;
+            -webkit-box-decoration-break: clone;
+            box-decoration-break: clone;
+        """
+        fit_lines = _split_html_lines(inner_html_fg)
+        if fit_lines:
+            line_gap = bg_vw(max(3.0 if len(fit_lines) > 1 else 0.0, (float(lh) - 1.0) * float(size) * 0.34))
+            fit_html = "".join(
+                f"<div style=\"display:block; text-align:{align}; width:100%; max-width:100%; margin:{line_gap} 0;\">"
+                f"<span style=\"{fit_line_css}\">{line_html}</span></div>"
+                for line_html in fit_lines
+            )
+        else:
+            fit_html = ""
+        final_html = f"""
+        <div class='sub-box canva-fit-bg' style='{outer_box_style}'>
+            <div style="{inner_transform} width: 100%; max-width: 100%; display: block; text-align: {align};">
+                {fit_html}
             </div>
         </div>
         """
@@ -1940,7 +2368,7 @@ def render_subtitle_html(sub, current_time, proj_w=1080):
     return final_html
 
 
-def render_signature_html(signature, current_time, proj_w=1080):
+def render_signature_html(signature, current_time, proj_w=1080, proj_h=None):
     config = normalize_signature_config(signature)
     text = str(config.get("text", "") or "").strip()
     if not config.get("enabled") or not text:
@@ -1969,7 +2397,7 @@ def render_signature_html(signature, current_time, proj_w=1080):
         "words": [{"text": text, "start": 0.0, "end": end_time}],
         "style": style,
     }
-    inner_html = render_subtitle_html(sig_sub, current_time, proj_w)
+    inner_html = render_subtitle_html(sig_sub, current_time, proj_w, proj_h)
 
     if placement == "top_left":
         pos_css = f"left:{margin_x:.3f}%; top:{margin_y:.3f}%; text-align:left;"
@@ -2043,14 +2471,14 @@ def render_design_html(design_state, current_time, proj_w=1080, proj_h=1920):
             f"box-sizing:border-box; pointer-events:none;"
         )
         if layer.get("type") == "rect":
-            fill = html.escape(str(layer.get("fill", "#000000") or "#000000"), quote=True)
+            fill = html_attr(layer.get("fill", "#000000") or "#000000")
             radius = float(layer.get("cornerRadius", 0) or 0) * 100.0 / design_w
             layer_html.append(
                 f"<div style='{common} height:{h_pct:.5f}%; background:{fill}; border-radius:{radius:.5f}vw;'></div>"
             )
             continue
         if layer.get("type") == "image":
-            src = html.escape(str(layer.get("src", "") or "").strip(), quote=True)
+            src = html_attr(design_image_source(layer))
             if not src:
                 continue
             fit = str(layer.get("fit", "cover") or "cover").strip().lower()
@@ -2060,19 +2488,19 @@ def render_design_html(design_state, current_time, proj_w=1080, proj_h=1920):
             )
             continue
 
-        text = html.escape(str(layer.get("text", "") or ""), quote=False).replace("\n", "<br>")
+        text = html_multiline_text(layer.get("text", "") or "")
         if not text:
             continue
         font_size = float(layer.get("fontSize", 48) or 48) * 100.0 / design_w
-        family = html.escape(str(layer.get("fontFamily", "Noto Sans SC") or "Noto Sans SC"), quote=True)
-        weight = html.escape(str(layer.get("fontWeight", "700") or "700"), quote=True)
-        fill = html.escape(str(layer.get("fill", "#FFFFFF") or "#FFFFFF"), quote=True)
-        align = html.escape(str(layer.get("align", "center") or "center"), quote=True)
+        family = html_attr(layer.get("fontFamily", "Noto Sans SC") or "Noto Sans SC")
+        weight = html_attr(layer.get("fontWeight", "700") or "700")
+        fill = html_attr(layer.get("fill", "#FFFFFF") or "#FFFFFF")
+        align = html_attr(layer.get("align", "center") or "center")
         line_height = max(0.8, min(2.4, float(layer.get("lineHeight", 1.18) or 1.18)))
         bg = str(layer.get("background", "") or "").strip()
         bg_css = ""
         if bg:
-            bg_css = f"background:{html.escape(bg, quote=True)}; border-radius:0.55vw; padding:0.5vw 0.85vw;"
+            bg_css = f"background:{html_attr(bg)}; border-radius:0.55vw; padding:0.5vw 0.85vw;"
         shadow_css = "text-shadow:0 0 0.45vw rgba(0,0,0,0.62), 0 0.28vw 0.85vw rgba(0,0,0,0.38);" if layer.get("shadow", True) else "text-shadow:none;"
         layer_html.append(
             f"<div style='{common} color:{fill}; font-family:{_css_font_stack(family)}; "

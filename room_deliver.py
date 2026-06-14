@@ -19,9 +19,12 @@ from PyQt6.QtCore import QProcess, QTimer, Qt
 from PyQt6.QtGui import QPixmap, QCursor
 from core import get_ffmpeg_cmd
 from app_theme import apply_tinted_styles
+from room_theme_bridge import apply_room_theme_bridge
 from app_config import get_output_resolution, resolution_to_size
+from app_storage import read_json_file, resolve_user_file, write_json_file
 from render_config import build_video_encoder_args, get_render_profile
-from render_timing import build_subtitle_frame_schedule, render_tail_padding_seconds, subtitle_supersample
+from render_pipeline_model import ffconcat_file_entry, ffconcat_inout_entry, ffmpeg_canvas_source, ffmpeg_layer_overlay_xy, ffmpeg_layer_scale_filter
+from render_timing import active_subtitles_for_frame, build_subtitle_frame_schedule, render_tail_padding_seconds, subtitle_supersample
 from playwright.sync_api import sync_playwright
 
 from font_assets import font_face_css
@@ -30,10 +33,12 @@ from project_io import load_project, get_project_folder_paths, get_reels_in_fold
 from workspace_config import WORKSPACE_MODE_CLOUD, get_active_workspace, get_workspace_config
 from project_audit import audit_project, format_project_audit_report
 from font_registry import STATUS_NONCOMMERCIAL
+from job_control import CooperativeJobControl
+from render_range import normalize_render_range, set_render_range
 
-CACHE_FILE = os.path.join(tempfile.gettempdir(), "sh_v8_project_cache.json")
+CACHE_FILE = resolve_user_file("sh_v8_project_cache.json", legacy_root=tempfile.gettempdir(), kind="cache")
 SUBTITLE_SUPERSAMPLE = subtitle_supersample()
-EXPORT_QUEUE_BACKUPS_FILE = os.path.join(os.getcwd(), "export_queue_backups.json")
+EXPORT_QUEUE_BACKUPS_FILE = resolve_user_file("export_queue_backups.json", legacy_root=os.getcwd(), kind="state")
 
 
 def safe_export_queue_name(value, fallback="queue"):
@@ -70,6 +75,27 @@ def launch_render_browser(playwright):
     if b_path:
         kwargs["executable_path"] = b_path
     return playwright.chromium.launch(**kwargs)
+
+
+def clip_speed_value(clip):
+    try:
+        value = float((clip or {}).get("speed", 1.0) or 1.0)
+    except Exception:
+        value = 1.0
+    return max(0.05, min(8.0, value))
+
+
+def atempo_chain(speed):
+    speed = max(0.05, min(8.0, float(speed or 1.0)))
+    parts = []
+    while speed > 2.0:
+        parts.append("atempo=2.000")
+        speed /= 2.0
+    while speed < 0.5:
+        parts.append("atempo=0.500")
+        speed /= 0.5
+    parts.append(f"atempo={speed:.3f}")
+    return ",".join(parts)
 
 
 class ProjectPickCard(QFrame):
@@ -288,6 +314,49 @@ class ProjectPickerDialog(QDialog):
         self._theme_colors = colors
         self._theme_key = theme_key or ""
         apply_tinted_styles(self, colors)
+        apply_room_theme_bridge(self, colors)
+
+    def _polish_deliver_ui(self):
+        text_pairs = {
+            "btn_new_export_queue": "新增队列",
+            "btn_delete_export_queue": "删除队列",
+            "btn_save_export_queue": "保存队列",
+            "btn_load_export_queue": "调用队列",
+            "btn_select_batch_projects": "从工程大厅选择",
+            "btn_add_batch_files": "添加工程文件",
+            "btn_add_batch_folder": "添加文件夹工程",
+            "btn_clear_batch_queue": "清空队列",
+            "btn_select_batch_output": "选择批量成品目录",
+            "btn_batch_render": "导出当前队列",
+            "btn_all_queue_render": "导出全部队列",
+            "btn_export_pause": "暂停",
+            "btn_export_cancel": "取消",
+            "btn_render": "开始导出当前工程",
+        }
+        for attr, text in text_pairs.items():
+            widget = getattr(self, attr, None)
+            if widget:
+                widget.setText(text)
+                widget.setMinimumHeight(36)
+        for label_attr in ("lbl_info", "lbl_batch_projects", "lbl_batch_output", "lbl_export_run_state", "lbl_export_queue_total"):
+            label = getattr(self, label_attr, None)
+            if label:
+                label.setWordWrap(True)
+        if hasattr(self, "chk_render_range"):
+            self.chk_render_range.setText("仅导出范围")
+            self.chk_render_range.setMinimumHeight(30)
+        if hasattr(self, "spin_duration"):
+            self.spin_duration.setMinimumWidth(130)
+        if hasattr(self, "spin_render_start"):
+            self.spin_render_start.setMinimumWidth(100)
+        if hasattr(self, "spin_render_end"):
+            self.spin_render_end.setMinimumWidth(100)
+        if hasattr(self, "export_queue_tabs"):
+            self.export_queue_tabs.setUsesScrollButtons(True)
+            self.export_queue_tabs.setElideMode(Qt.TextElideMode.ElideRight)
+            self.export_queue_tabs.setMinimumHeight(36)
+        if hasattr(self, "log_console"):
+            self.log_console.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
 
     def set_selected(self, path, checked):
         key = self._key(path)
@@ -352,6 +421,8 @@ class DeliverView(QWidget):
         self.active_render_project_state = None
         self.active_render_design_state = None
         self.active_render_duration = None
+        self.active_render_range = None
+        self.export_job_control = CooperativeJobControl()
         self.init_ui()
 
     def init_ui(self):
@@ -359,10 +430,25 @@ class DeliverView(QWidget):
         main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(20)
 
+        left_shell = QFrame()
+        left_shell.setStyleSheet("background-color: #181825; border-radius: 12px;")
+        left_shell.setMinimumWidth(500)
+        left_shell.setMaximumWidth(620)
+        left_shell_layout = QVBoxLayout(left_shell)
+        left_shell_layout.setContentsMargins(0, 0, 0, 0)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         left_panel = QFrame()
-        left_panel.setStyleSheet("background-color: #181825; border-radius: 10px;")
-        left_panel.setFixedWidth(430)
+        left_panel.setStyleSheet("background: transparent; border: none;")
         left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(16, 16, 16, 16)
+        left_layout.setSpacing(12)
+        left_scroll.setWidget(left_panel)
+        left_shell_layout.addWidget(left_scroll)
+        self.left_shell = left_shell
+        self.left_panel = left_panel
         left_layout.addWidget(QLabel("📦 渲染交付设置 (Deliver)", styleSheet="font-size: 18px; font-weight: bold; color: #cdd6f4;"))
         left_layout.addSpacing(20)
         self.lbl_info = QLabel("等待加载工程...")
@@ -377,6 +463,23 @@ class DeliverView(QWidget):
         self.spin_duration.setStyleSheet("background: #313244; color: white; padding: 5px; font-size: 14px; border-radius: 3px;")
         dur_row.addWidget(self.spin_duration)
         left_layout.addLayout(dur_row)
+        range_row = QHBoxLayout()
+        self.chk_render_range = QCheckBox("ä»…å¯¼å‡ºèŒƒå›´")
+        self.chk_render_range.setStyleSheet("color: #cdd6f4; font-weight: bold;")
+        self.spin_render_start = QDoubleSpinBox()
+        self.spin_render_start.setRange(0.0, 36000.0)
+        self.spin_render_start.setSuffix("s")
+        self.spin_render_start.setStyleSheet("background: #313244; color: white; padding: 5px; border-radius: 3px;")
+        self.spin_render_end = QDoubleSpinBox()
+        self.spin_render_end.setRange(0.001, 36000.0)
+        self.spin_render_end.setSuffix("s")
+        self.spin_render_end.setStyleSheet("background: #313244; color: white; padding: 5px; border-radius: 3px;")
+        for widget in (self.chk_render_range, self.spin_render_start, self.spin_render_end):
+            range_row.addWidget(widget)
+        self.chk_render_range.toggled.connect(self._capture_render_range_controls)
+        self.spin_render_start.valueChanged.connect(self._capture_render_range_controls)
+        self.spin_render_end.valueChanged.connect(self._capture_render_range_controls)
+        left_layout.addLayout(range_row)
 
         left_layout.addWidget(QLabel("✅ 多轨道时间推演 / 混音器 / 画面缩放\n底层核心已全量挂载！", styleSheet="color: #89b4fa; margin-top: 15px;"))
         batch_frame = QFrame()
@@ -458,6 +561,24 @@ class DeliverView(QWidget):
         batch_layout.addWidget(self.btn_select_batch_output)
         batch_layout.addWidget(self.btn_batch_render)
         batch_layout.addWidget(self.btn_all_queue_render)
+        export_control_row = QHBoxLayout()
+        export_control_row.setSpacing(6)
+        self.lbl_export_run_state = QLabel("导出状态：空闲")
+        self.lbl_export_run_state.setStyleSheet("color: #a6adc8; border: none; font-weight: bold;")
+        self.btn_export_pause = QPushButton("暂停")
+        self.btn_export_pause.setToolTip("当前工程导出完成后暂停，不会强行打断正在压制的文件。")
+        self.btn_export_cancel = QPushButton("取消")
+        self.btn_export_cancel.setToolTip("当前工程导出完成后停止后续队列。")
+        self.btn_export_pause.setEnabled(False)
+        self.btn_export_cancel.setEnabled(False)
+        self.btn_export_pause.setStyleSheet("background-color: #f9e2af; color: #11111b; font-weight: bold; padding: 7px; border-radius: 5px;")
+        self.btn_export_cancel.setStyleSheet("background-color: #f38ba8; color: #11111b; font-weight: bold; padding: 7px; border-radius: 5px;")
+        self.btn_export_pause.clicked.connect(self.toggle_export_pause)
+        self.btn_export_cancel.clicked.connect(self.request_export_cancel)
+        export_control_row.addWidget(self.lbl_export_run_state, stretch=1)
+        export_control_row.addWidget(self.btn_export_pause)
+        export_control_row.addWidget(self.btn_export_cancel)
+        batch_layout.addLayout(export_control_row)
         left_layout.addWidget(batch_frame)
         left_layout.addStretch()
 
@@ -466,7 +587,7 @@ class DeliverView(QWidget):
         self.btn_render.setStyleSheet("background-color: #f38ba8; color: #11111b; font-size: 16px; font-weight: bold; border-radius: 8px;")
         self.btn_render.clicked.connect(self.start_render)
         left_layout.addWidget(self.btn_render)
-        main_layout.addWidget(left_panel)
+        main_layout.addWidget(left_shell)
 
         right_panel = QFrame()
         right_panel.setStyleSheet("background-color: #1e1e2e; border-radius: 10px;")
@@ -481,12 +602,56 @@ class DeliverView(QWidget):
         self.progress_bar.setValue(0)
         right_layout.addWidget(self.progress_bar)
         main_layout.addWidget(right_panel, stretch=1)
+        self._polish_deliver_ui()
         self._init_default_export_queues()
 
     def apply_theme(self, colors, theme_key=None):
         self._theme_colors = colors
         self._theme_key = theme_key or ""
         apply_tinted_styles(self, colors)
+        apply_room_theme_bridge(self, colors)
+
+    def _polish_deliver_ui(self):
+        text_pairs = {
+            "btn_new_export_queue": "新增队列",
+            "btn_delete_export_queue": "删除队列",
+            "btn_save_export_queue": "保存队列",
+            "btn_load_export_queue": "调用队列",
+            "btn_select_batch_projects": "从工程大厅选择",
+            "btn_add_batch_files": "添加工程文件",
+            "btn_add_batch_folder": "添加文件夹工程",
+            "btn_clear_batch_queue": "清空队列",
+            "btn_select_batch_output": "选择批量成品目录",
+            "btn_batch_render": "导出当前队列",
+            "btn_all_queue_render": "导出全部队列",
+            "btn_export_pause": "暂停",
+            "btn_export_cancel": "取消",
+            "btn_render": "开始导出当前工程",
+        }
+        for attr, text in text_pairs.items():
+            widget = getattr(self, attr, None)
+            if widget:
+                widget.setText(text)
+                widget.setMinimumHeight(36)
+        for label_attr in ("lbl_info", "lbl_batch_projects", "lbl_batch_output", "lbl_export_run_state", "lbl_export_queue_total"):
+            label = getattr(self, label_attr, None)
+            if label:
+                label.setWordWrap(True)
+        if hasattr(self, "chk_render_range"):
+            self.chk_render_range.setText("仅导出范围")
+            self.chk_render_range.setMinimumHeight(30)
+        if hasattr(self, "spin_duration"):
+            self.spin_duration.setMinimumWidth(130)
+        if hasattr(self, "spin_render_start"):
+            self.spin_render_start.setMinimumWidth(100)
+        if hasattr(self, "spin_render_end"):
+            self.spin_render_end.setMinimumWidth(100)
+        if hasattr(self, "export_queue_tabs"):
+            self.export_queue_tabs.setUsesScrollButtons(True)
+            self.export_queue_tabs.setElideMode(Qt.TextElideMode.ElideRight)
+            self.export_queue_tabs.setMinimumHeight(36)
+        if hasattr(self, "log_console"):
+            self.log_console.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
 
     def _safe_float(self, value, default=0.0):
         try:
@@ -548,6 +713,7 @@ class DeliverView(QWidget):
         except Exception:
             dur_value = 10.0
         self.spin_duration.setValue(self._safe_render_duration(dur_value))
+        self._sync_render_range_controls()
 
     def _freeze_render_job(self, project_data=None, project_state=None, design_state=None):
         project_data = project_data if isinstance(project_data, dict) else self.project_data
@@ -561,12 +727,15 @@ class DeliverView(QWidget):
             self.active_render_project_state,
             self.active_render_design_state,
         )
+        self.active_render_range = normalize_render_range(self.active_render_project_state, self.active_render_duration)
+        self.active_render_duration = self.active_render_range["duration"]
 
     def _clear_render_job(self):
         self.active_render_project_data = None
         self.active_render_project_state = None
         self.active_render_design_state = None
         self.active_render_duration = None
+        self.active_render_range = None
 
     def _render_project_state(self):
         if isinstance(self.active_render_project_state, dict):
@@ -581,7 +750,50 @@ class DeliverView(QWidget):
     def _render_duration(self, fallback_state=None, fallback_design_state=None):
         if self.active_render_duration is not None:
             return float(self.active_render_duration)
+        total_duration = self._safe_render_duration(float(self.spin_duration.value()), fallback_state, fallback_design_state)
+        return normalize_render_range(fallback_state or self.project_state, total_duration)["duration"]
+
+    def _render_total_duration(self, fallback_state=None, fallback_design_state=None):
         return self._safe_render_duration(float(self.spin_duration.value()), fallback_state, fallback_design_state)
+
+    def _current_render_range(self, fallback_state=None, fallback_design_state=None):
+        if isinstance(self.active_render_range, dict):
+            return self.active_render_range
+        total_duration = self._render_total_duration(fallback_state, fallback_design_state)
+        return normalize_render_range(fallback_state or self.project_state, total_duration)
+
+    def _sync_render_range_controls(self):
+        if not hasattr(self, "chk_render_range"):
+            return
+        total_duration = self._safe_render_duration(self.project_state.get("duration", 1.0), self.project_state, self.design_state)
+        render_range = normalize_render_range(self.project_state, total_duration)
+        self.chk_render_range.blockSignals(True)
+        self.spin_render_start.blockSignals(True)
+        self.spin_render_end.blockSignals(True)
+        self.chk_render_range.setChecked(render_range["enabled"])
+        self.spin_render_start.setMaximum(max(0.0, total_duration))
+        self.spin_render_end.setMaximum(max(0.001, total_duration))
+        self.spin_render_start.setValue(render_range["start"])
+        self.spin_render_end.setValue(render_range["end"])
+        self.spin_render_start.setEnabled(render_range["enabled"])
+        self.spin_render_end.setEnabled(render_range["enabled"])
+        self.chk_render_range.blockSignals(False)
+        self.spin_render_start.blockSignals(False)
+        self.spin_render_end.blockSignals(False)
+
+    def _capture_render_range_controls(self, *_args):
+        if not hasattr(self, "chk_render_range"):
+            return
+        total_duration = self._safe_render_duration(float(self.spin_duration.value()), self.project_state, self.design_state)
+        render_range = set_render_range(
+            self.project_state,
+            enabled=self.chk_render_range.isChecked(),
+            start=self.spin_render_start.value(),
+            end=self.spin_render_end.value(),
+            total_duration=total_duration,
+        )
+        self.spin_render_start.setEnabled(render_range["enabled"])
+        self.spin_render_end.setEnabled(render_range["enabled"])
 
     def _project_state_score(self, state):
         if not isinstance(state, dict):
@@ -617,8 +829,7 @@ class DeliverView(QWidget):
 
         if os.path.exists(CACHE_FILE):
             try:
-                with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                    cached_state = json.load(f)
+                cached_state = read_json_file(CACHE_FILE, default={})
                 if isinstance(cached_state, dict):
                     candidates.append((self._project_state_score(cached_state), cached_state, self.project_data))
             except Exception:
@@ -655,6 +866,83 @@ class DeliverView(QWidget):
 
     def update_progress_safe(self, val):
         QTimer.singleShot(0, lambda: self.progress_bar.setValue(int(val)))
+
+    @property
+    def export_pause_requested(self):
+        return self.export_job_control.pause_requested
+
+    @export_pause_requested.setter
+    def export_pause_requested(self, value):
+        self.export_job_control.pause_requested = bool(value)
+
+    @property
+    def export_cancel_requested(self):
+        return self.export_job_control.cancel_requested
+
+    @export_cancel_requested.setter
+    def export_cancel_requested(self, value):
+        self.export_job_control.cancel_requested = bool(value)
+
+    @property
+    def export_finish_reason(self):
+        return self.export_job_control.finish_reason
+
+    @export_finish_reason.setter
+    def export_finish_reason(self, value):
+        self.export_job_control.finish_reason = str(value or "completed")
+
+    def _set_export_run_controls(self, running=None, state_text=None):
+        active = self.batch_rendering if running is None else bool(running)
+        if hasattr(self, "btn_export_pause"):
+            self.btn_export_pause.setEnabled(active and not self.export_cancel_requested)
+            self.btn_export_pause.setText("继续" if self.export_pause_requested else "暂停")
+        if hasattr(self, "btn_export_cancel"):
+            self.btn_export_cancel.setEnabled(active and not self.export_cancel_requested)
+        if hasattr(self, "lbl_export_run_state"):
+            if state_text is None:
+                if self.export_cancel_requested:
+                    state_text = "导出状态：取消请求已收到，当前工程完成后停止"
+                elif self.export_pause_requested:
+                    state_text = "导出状态：暂停请求已收到，当前工程完成后停住"
+                elif active:
+                    state_text = "导出状态：导出中"
+                else:
+                    state_text = "导出状态：空闲"
+            self.lbl_export_run_state.setText(state_text)
+
+    def _reset_export_control_flags(self):
+        self.export_job_control.reset("export")
+        self._set_export_run_controls(True)
+
+    def toggle_export_pause(self):
+        if not self.batch_rendering:
+            return
+        paused = self.export_job_control.toggle_pause()
+        if paused:
+            self.log_safe("已请求暂停：当前工程导出完成后停住。", "#f9e2af")
+        else:
+            self.log_safe("已继续导出队列。", "#a6e3a1")
+            QTimer.singleShot(0, self._resume_paused_export)
+        self._set_export_run_controls(True)
+
+    def request_export_cancel(self):
+        if not self.batch_rendering or self.export_cancel_requested:
+            return
+        waiting_between_projects = not self.current_batch_project_path
+        self.export_job_control.request_cancel()
+        self.log_safe("已请求取消：当前工程导出完成后停止后续队列。", "#f38ba8")
+        self._set_export_run_controls(True)
+        if waiting_between_projects:
+            QTimer.singleShot(0, self._finish_batch_render_cancelled)
+
+    def _resume_paused_export(self):
+        if not self.batch_rendering or self.export_pause_requested or self.export_cancel_requested:
+            return
+        if self.all_queue_rendering and not self.current_batch_project_path:
+            self.batch_rendering = False
+            self._start_next_export_queue_from_plan()
+        elif not self.current_batch_project_path:
+            self._start_next_batch_render()
 
     def _new_export_queue_state(self, name=None):
         return {
@@ -740,18 +1028,11 @@ class DeliverView(QWidget):
         self._apply_export_queue_state(self.export_queues[self.current_export_queue_index])
 
     def _load_export_queue_backups(self):
-        if not os.path.exists(EXPORT_QUEUE_BACKUPS_FILE):
-            return []
-        try:
-            with open(EXPORT_QUEUE_BACKUPS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
+        data = read_json_file(EXPORT_QUEUE_BACKUPS_FILE, default=[])
+        return data if isinstance(data, list) else []
 
     def _save_export_queue_backups(self, backups):
-        with open(EXPORT_QUEUE_BACKUPS_FILE, "w", encoding="utf-8") as f:
-            json.dump(backups, f, ensure_ascii=False, indent=2)
+        write_json_file(EXPORT_QUEUE_BACKUPS_FILE, backups, indent=2)
 
     def save_current_export_queue_backup(self):
         self._capture_current_export_queue_state()
@@ -808,6 +1089,7 @@ class DeliverView(QWidget):
         self.all_queue_rendering = True
         self.all_queue_index = 0
         self.all_queue_plan = plan
+        self._reset_export_control_flags()
         self.log_console.clear()
         self.progress_bar.setValue(0)
         total_projects = sum(len(item["paths"]) for item in plan)
@@ -815,12 +1097,22 @@ class DeliverView(QWidget):
         self._start_next_export_queue_from_plan()
 
     def _start_next_export_queue_from_plan(self):
+        if self.export_cancel_requested:
+            self._finish_batch_render_cancelled()
+            return
+        if self.export_pause_requested:
+            self.batch_rendering = True
+            self.current_batch_project_path = ""
+            self._set_export_run_controls(True)
+            self.log_safe("导出已暂停，点击“继续”后进入下一个队列。", "#f9e2af")
+            return
         if self.all_queue_index >= len(self.all_queue_plan):
             self.all_queue_rendering = False
             self.all_queue_plan = []
             self.set_batch_queue_controls_enabled(True)
             self.btn_render.setEnabled(True)
             self.btn_batch_render.setEnabled(True)
+            self._set_export_run_controls(False)
             self.progress_bar.setValue(100)
             self._refresh_export_queue_tabs()
             self.log_safe("全部导出队列已完成。", "#a6e3a1")
@@ -1003,6 +1295,8 @@ class DeliverView(QWidget):
             return QMessageBox.warning(self, "提示", "请先选择批量成品输出目录。")
         os.makedirs(self.batch_output_dir, exist_ok=True)
         self.batch_rendering = True
+        if not self.all_queue_rendering:
+            self._reset_export_control_flags()
         self.batch_render_index = 0
         self.btn_render.setEnabled(False)
         self.btn_batch_render.setEnabled(False)
@@ -1015,6 +1309,15 @@ class DeliverView(QWidget):
         self._start_next_batch_render()
 
     def _start_next_batch_render(self):
+        if self.export_cancel_requested:
+            self._finish_batch_render_cancelled()
+            return
+        if self.export_pause_requested:
+            self.current_batch_project_path = ""
+            self._clear_render_job()
+            self._set_export_run_controls(True)
+            self.log_safe("导出已暂停，点击“继续”后从下一条工程恢复。", "#f9e2af")
+            return
         if self.batch_render_index >= len(self.batch_project_paths):
             self.batch_rendering = False
             self.current_batch_project_path = ""
@@ -1028,6 +1331,7 @@ class DeliverView(QWidget):
             self.btn_render.setEnabled(True)
             self.btn_batch_render.setEnabled(True)
             self.set_batch_queue_controls_enabled(True)
+            self._set_export_run_controls(False)
             self.progress_bar.setValue(100)
             self._refresh_batch_queue_label()
             self.log_safe("批量渲染全部完成。", "#a6e3a1")
@@ -1071,6 +1375,22 @@ class DeliverView(QWidget):
             self._clear_render_job()
             self.batch_render_index += 1
             QTimer.singleShot(0, self._start_next_batch_render)
+
+    def _finish_batch_render_cancelled(self):
+        self.batch_rendering = False
+        self.all_queue_rendering = False
+        self.all_queue_plan = []
+        self.current_batch_project_path = ""
+        self._clear_render_job()
+        self.btn_render.setEnabled(True)
+        self.btn_batch_render.setEnabled(True)
+        self.set_batch_queue_controls_enabled(True)
+        self.export_job_control.clear_requests()
+        self._set_export_run_controls(False, "导出状态：已取消")
+        self._refresh_batch_queue_label()
+        self._refresh_export_queue_tabs()
+        self.log_safe("导出队列已取消，后续工程没有继续启动。", "#f38ba8")
+        QMessageBox.information(self, "导出已取消", "当前工程已收尾，后续导出队列已停止。")
 
     def _unique_batch_output_path(self, project):
         raw_name = project.get("project_name") or os.path.splitext(os.path.basename(project.get("project_path", "output")))[0]
@@ -1162,6 +1482,9 @@ class DeliverView(QWidget):
             subs_data = project_state.get("subs_data", [])
             signature = project_state.get("signature", {})
             total_dur = self._render_duration(project_state, design_state)
+            render_range = self._current_render_range(project_state, design_state)
+            render_start = float(render_range.get("start", 0.0) or 0.0)
+            render_end = render_start + total_dur
 
             clips = project_state.get("video_clips", [])
             res_text = project_state.get("resolution") or get_output_resolution()
@@ -1185,10 +1508,17 @@ class DeliverView(QWidget):
                         extra_styles.append(signature.get("style", {}))
                     frame_schedule = build_subtitle_frame_schedule(
                         subs_data,
-                        total_dur,
+                        render_end,
                         extra_styles=extra_styles,
                         extra_times=design_frame_times(design_state),
                     )
+                    frame_schedule = [
+                        (max(current_time, render_start), min(current_time + duration, render_end) - max(current_time, render_start))
+                        for current_time, duration in frame_schedule
+                        if min(current_time + duration, render_end) > max(current_time, render_start)
+                    ]
+                    if not frame_schedule:
+                        frame_schedule = [(render_start, total_dur)]
                     self.log_safe(
                         f"⚡ 字幕渲染采样: {len(frame_schedule)} 段，超采样 x{SUBTITLE_SUPERSAMPLE}",
                         "#89b4fa",
@@ -1197,30 +1527,26 @@ class DeliverView(QWidget):
                     def write_subtitle_frame(path, duration):
                         nonlocal last_concat_file
                         duration = max(0.001, float(duration or 0.0))
-                        f_concat.write(f"file '{path}'\n")
-                        f_concat.write(f"duration {duration:.3f}\n")
+                        f_concat.write(ffconcat_file_entry(path, duration))
                         last_concat_file = path
 
                     for current_time, frame_duration in frame_schedule:
-                        active_subs = [
-                            s for s in subs_data
-                            if float(s.get('start', 0)) <= current_time < float(s.get('end', 1))
-                        ]
+                        active_subs = active_subtitles_for_frame(subs_data, current_time, frame_duration)
                         design_html = render_design_html(design_state, current_time, proj_w, proj_h)
-                        signature_html = render_signature_html(signature, current_time, proj_w)
+                        signature_html = render_signature_html(signature, current_time, proj_w, proj_h)
                         if not active_subs and not signature_html and not design_html:
                             write_subtitle_frame(blank_path, frame_duration)
-                            self.update_progress_safe(int(((current_time + frame_duration) / total_dur) * 50))
+                            self.update_progress_safe(int((((current_time + frame_duration) - render_start) / total_dur) * 50))
                             continue
 
                         html_subs = design_html + signature_html
-                        for s in active_subs:
+                        for s, sub_time in active_subs:
                             px = s.get("pos_x", 0.0)
                             py = s.get("pos_y", 25.0)
                             trk = s.get("track", 1)
                             z_idx = 10 if trk == 0 else 5
                             base_css = f"position: absolute; left: calc(50% + {px}%); top: calc(50% + {py}%); transform: translate(-50%, -50%); z-index: {z_idx}; width: max-content; max-width: 92%;"
-                            sub_html = render_subtitle_html(s, current_time, proj_w)
+                            sub_html = render_subtitle_html(s, sub_time, proj_w, proj_h)
                             html_subs += f"<div style='{base_css}'>{sub_html}</div>\n"
 
                         # 👑 修复：增加全局抗锯齿和平滑处理
@@ -1255,9 +1581,9 @@ class DeliverView(QWidget):
                         page.screenshot(path=frame_path, omit_background=True, scale="css")
                         write_subtitle_frame(frame_path, frame_duration)
                         frame_idx += 1
-                        self.update_progress_safe(int(((current_time + frame_duration) / total_dur) * 50))
+                        self.update_progress_safe(int((((current_time + frame_duration) - render_start) / total_dur) * 50))
 
-                    f_concat.write(f"file '{last_concat_file}'\n")
+                    f_concat.write(ffconcat_file_entry(last_concat_file))
 
                 browser.close()
             self.log_safe("✅ 多轨道推演截图完毕！准备混音与剪辑...", "#a6e3a1")
@@ -1276,11 +1602,16 @@ class DeliverView(QWidget):
         if music_path and not os.path.exists(music_path):
             music_path = ""
         target_dur = self._render_duration(project_state, design_state)
+        render_range = self._current_render_range(project_state, design_state)
+        render_start = float(render_range.get("start", 0.0) or 0.0)
+        render_end = render_start + target_dur
         video_track_target = max(0.001, target_dur - render_tail_padding_seconds())
         if abs(target_dur - float(self.spin_duration.value())) > 0.01:
             self.spin_duration.setValue(target_dur)
 
         v_scale = project_state.get("v_scale", 100) / 100.0
+        v_pos_x = self._safe_float(project_state.get("v_pos_x", 0), 0.0)
+        v_pos_y = self._safe_float(project_state.get("v_pos_y", 0), 0.0)
         v_vol = project_state.get("v_volume", 100) / 100.0
         a_vol = project_state.get("a_volume", 100) / 100.0
         music_vol = project_state.get("music_volume", 35) / 100.0
@@ -1291,6 +1622,18 @@ class DeliverView(QWidget):
 
         video_concat_path = ""
         has_audio = False
+        clip_speeds = [clip_speed_value(clip) for clip in clips or []]
+        non_default_speeds = [speed for speed in clip_speeds if abs(speed - 1.0) > 0.001]
+        uniform_video_speed = 1.0
+        speed_export_supported = True
+        if non_default_speeds:
+            unique_speeds = {round(speed, 3) for speed in clip_speeds}
+            if len(unique_speeds) == 1:
+                uniform_video_speed = clip_speeds[0]
+                self.log_safe(f"⏩ 视频变速导出: {uniform_video_speed:.2f}x", "#89b4fa")
+            else:
+                speed_export_supported = False
+                self.log_safe("⚠️ 当前工程包含多种视频速度，本轮导出先按 1.0x 处理；预览和时间线仍按片段速度工作。", "#f9e2af")
         if clips:
             try:
                 flags = 0x08000000 if os.name == 'nt' else 0
@@ -1304,22 +1647,30 @@ class DeliverView(QWidget):
             with open(video_concat_path, "w", encoding="utf-8") as f:
                 written_video_dur = 0.0
 
-                def write_looped_clip(clip, duration):
+                def write_looped_clip(clip, duration, source_offset=0.0):
                     clip_path = clip.get("path", "")
                     if not clip_path or duration <= 0:
                         return 0.0
+                    speed = clip_speed_value(clip) if speed_export_supported else 1.0
                     media_dur = get_video_stream_duration(clip_path) or float(clip.get("dur", 0.0) or 0.0) or get_exact_duration(clip_path) or 5.0
                     media_dur = max(0.1, media_dur)
+                    source_in = max(0.0, float(clip.get("source_in", 0.0) or 0.0))
+                    source_out = float(clip.get("source_out", media_dur) or media_dur)
+                    source_len = max(0.1, source_out - source_in)
+                    cursor = (max(0.0, float(source_offset or 0.0)) * speed) % source_len
                     remaining = duration
                     written = 0.0
                     while remaining > 0.001:
-                        part_dur = min(remaining, media_dur)
-                        safe_path = clip_path.replace("\\", "/")
-                        f.write(f"file '{safe_path}'\n")
-                        f.write("inpoint 0\n")
-                        f.write(f"outpoint {part_dur:.3f}\n")
-                        remaining -= part_dur
-                        written += part_dur
+                        inpoint = source_in + cursor
+                        source_part_dur = min(remaining * speed, source_out - inpoint)
+                        if source_part_dur <= 0.001:
+                            cursor = 0.0
+                            continue
+                        f.write(ffconcat_inout_entry(clip_path, inpoint, inpoint + source_part_dur))
+                        timeline_part_dur = source_part_dur / speed
+                        remaining -= timeline_part_dur
+                        written += timeline_part_dur
+                        cursor = 0.0
                     return written
 
                 remaining_track_dur = video_track_target
@@ -1328,8 +1679,13 @@ class DeliverView(QWidget):
                         break
                     c_start = float(clip.get("start", 0))
                     c_end = float(clip.get("end", 5.0))
-                    c_dur = min(max(0.001, c_end - c_start), remaining_track_dur)
-                    written_video_dur += write_looped_clip(clip, c_dur)
+                    overlap_start = max(c_start, render_start)
+                    overlap_end = min(c_end, render_end)
+                    if overlap_end <= overlap_start:
+                        continue
+                    source_offset = max(0.0, overlap_start - c_start)
+                    c_dur = min(max(0.001, overlap_end - overlap_start), remaining_track_dur)
+                    written_video_dur += write_looped_clip(clip, c_dur, source_offset=source_offset)
                     remaining_track_dur -= c_dur
                 if clips and written_video_dur < video_track_target - 0.01:
                     fill_dur = video_track_target - written_video_dur
@@ -1366,23 +1722,31 @@ class DeliverView(QWidget):
         audio_map = None
 
         if video_concat_path:
-            vf_scale = f"scale={proj_w}*{v_scale}:{proj_h}*{v_scale}:force_original_aspect_ratio=increase"
-            vf_crop = f"crop={proj_w}:{proj_h}"
+            vf_scale = ffmpeg_layer_scale_filter(v_scale, proj_w, proj_h, fit="cover")
+            layer_x, layer_y = ffmpeg_layer_overlay_xy(v_pos_x, v_pos_y)
+            speed_filter = f"setpts=PTS/{uniform_video_speed:.6f}," if abs(uniform_video_speed - 1.0) > 0.001 else ""
             video_guard = f"tpad=stop_mode=clone:stop_duration={target_dur:.3f},trim=duration={target_dur:.3f},setpts=PTS-STARTPTS"
             sub_guard = f"tpad=stop_mode=clone:stop_duration={target_dur:.3f},trim=duration={target_dur:.3f},setpts=PTS-STARTPTS"
-            fc_parts.append(f"[0:v]{vf_scale},{vf_crop},format=rgba,{video_guard}[bg];[{sub_idx}:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos,{sub_guard}[sub];[bg][sub]overlay=0:0:eof_action=pass:format=auto,format=yuv420p[outv]")
+            fc_parts.append(
+                f"{ffmpeg_canvas_source(proj_w, proj_h, target_dur)};"
+                f"[{video_idx}:v]{speed_filter}{vf_scale},format=rgba,{video_guard}[fg];"
+                f"[canvas][fg]overlay=x='{layer_x}':y='{layer_y}':eof_action=pass:format=auto[bg];"
+                f"[{sub_idx}:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos,{sub_guard}[sub];"
+                f"[bg][sub]overlay=0:0:eof_action=pass:format=auto,format=yuv420p[outv]"
+            )
         else:
             fc_parts.append(f"[{sub_idx}:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos,tpad=stop_mode=clone:stop_duration={target_dur:.3f},trim=duration={target_dur:.3f},setpts=PTS-STARTPTS,format=yuv420p[outv]")
 
         audio_sources = []
         if video_idx is not None and has_audio:
-            fc_parts.append(f"[{video_idx}:a]volume={v_vol:.3f},atrim=duration={target_dur:.3f},asetpts=PTS-STARTPTS[va]")
+            speed_audio = f",{atempo_chain(uniform_video_speed)}" if abs(uniform_video_speed - 1.0) > 0.001 else ""
+            fc_parts.append(f"[{video_idx}:a]volume={v_vol:.3f}{speed_audio},atrim=duration={target_dur:.3f},asetpts=PTS-STARTPTS[va]")
             audio_sources.append("[va]")
         if audio_idx is not None:
-            fc_parts.append(f"[{audio_idx}:a]volume={a_vol:.3f},atrim=duration={target_dur:.3f},asetpts=PTS-STARTPTS[aa]")
+            fc_parts.append(f"[{audio_idx}:a]volume={a_vol:.3f},atrim=start={render_start:.3f}:duration={target_dur:.3f},asetpts=PTS-STARTPTS[aa]")
             audio_sources.append("[aa]")
         if music_idx is not None:
-            fc_parts.append(f"[{music_idx}:a]volume={music_vol:.3f},atrim=duration={target_dur:.3f},asetpts=PTS-STARTPTS[ma]")
+            fc_parts.append(f"[{music_idx}:a]volume={music_vol:.3f},atrim=start={render_start:.3f}:duration={target_dur:.3f},asetpts=PTS-STARTPTS[ma]")
             audio_sources.append("[ma]")
         if len(audio_sources) == 1:
             audio_map = audio_sources[0]

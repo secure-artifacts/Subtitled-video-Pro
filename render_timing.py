@@ -1,6 +1,9 @@
 import os
+import math
 
 DEFAULT_RENDER_TAIL_PAD_SECONDS = 0.75
+SUBTITLE_ACTIVE_EPSILON_SECONDS = 0.002
+TIME_QUANTUM_SECONDS = 0.001
 
 
 def render_tail_padding_seconds():
@@ -65,10 +68,65 @@ def _bounded_time(value, lower, upper):
     return max(lower, min(upper, t))
 
 
+def quantize_sample_time(value, quantum=TIME_QUANTUM_SECONDS):
+    try:
+        value = float(value)
+    except Exception:
+        value = 0.0
+    quantum = max(0.000001, float(quantum or TIME_QUANTUM_SECONDS))
+    return round(math.ceil(max(0.0, value) / quantum - 1e-9) * quantum, 3)
+
+
+def subtitle_frame_sample_time(sub, frame_start, frame_duration=None, epsilon=SUBTITLE_ACTIVE_EPSILON_SECONDS):
+    start = _bounded_time(sub.get("start", 0.0), 0.0, float("inf"))
+    end = _bounded_time(sub.get("end", start), 0.0, float("inf"))
+    frame_start = max(0.0, float(frame_start or 0.0))
+    if end <= start:
+        return None
+    if start <= frame_start < end:
+        return frame_start
+    return None
+
+
+def active_subtitles_at_time(subs_data, current_time, epsilon=SUBTITLE_ACTIVE_EPSILON_SECONDS):
+    active = []
+    for sub in subs_data or []:
+        if not isinstance(sub, dict):
+            continue
+        sample_time = subtitle_frame_sample_time(sub, current_time, epsilon=epsilon)
+        if sample_time is not None:
+            active.append((sub, sample_time))
+    return active
+
+
+def active_subtitles_for_frame(subs_data, frame_start, frame_duration, epsilon=SUBTITLE_ACTIVE_EPSILON_SECONDS):
+    frame_start = max(0.0, float(frame_start or 0.0))
+    frame_duration = max(0.0, float(frame_duration or 0.0))
+    if frame_duration <= 0:
+        return active_subtitles_at_time(subs_data, frame_start, epsilon=epsilon)
+    active = active_subtitles_at_time(subs_data, frame_start, epsilon=epsilon)
+    if active:
+        return active
+    frame_end = frame_start + frame_duration
+    short_window = frame_duration <= epsilon * 2.0
+    if not short_window:
+        return []
+    for sub in subs_data or []:
+        if not isinstance(sub, dict):
+            continue
+        start = _bounded_time(sub.get("start", 0.0), 0.0, float("inf"))
+        end = _bounded_time(sub.get("end", start), 0.0, float("inf"))
+        if end <= start:
+            continue
+        if frame_start < start < frame_end:
+            active.append((sub, start))
+    return active
+
+
 def _add_time(times, value, total_duration):
     if value < 0 or value > total_duration:
-        return
-    times.add(round(float(value), 3))
+        return None
+    times.add(min(round(float(total_duration), 3), quantize_sample_time(value)))
 
 
 def _add_range_samples(times, start, end, fps, total_duration):

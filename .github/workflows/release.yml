@@ -5,6 +5,12 @@ on:
     tags:
       - "v*"
       - "V*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example V0.1.12"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -14,7 +20,6 @@ permissions:
 env:
   APP_NAME: SubtitleComposer
   PYTHON_VERSION: "3.12"
-  NODE_VERSION: "20"
 
 jobs:
   build-windows:
@@ -27,7 +32,7 @@ jobs:
     steps:
       - name: Resolve release tag
         run: |
-          $tag = "${{ github.ref_name }}".Trim()
+          $tag = "${{ github.event.inputs.tag || github.ref_name }}".Trim()
           if (-not ($tag -match '^[vV][0-9]+\.[0-9]+\.[0-9]+$')) {
             throw "Release tag must look like v0.1.0 or V0.1.0. Received: $tag"
           }
@@ -44,19 +49,6 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             requirements-build.txt
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Install web dependencies
-        working-directory: web_tools
-        run: npm ci --legacy-peer-deps --no-audit --no-fund --cache "$env:RUNNER_TEMP\npm-cache"
-
-      - name: Build web tools
-        working-directory: web_tools
-        run: npm run build
 
       - name: Validate release inputs
         run: |
@@ -124,7 +116,6 @@ jobs:
             "--add-data", "nlp_dictionary.txt;.",
             "--add-data", "fonts/open;fonts/open",
             "--add-data", "vendor/windows/ffmpeg;vendor/windows/ffmpeg",
-            "--add-data", "web_tools/dist;web_tools/dist",
             "--collect-all", "PyQt6",
             "--collect-all", "playwright",
             "--hidden-import", "PyQt6.QtWebEngineWidgets",
@@ -205,7 +196,7 @@ jobs:
     steps:
       - name: Resolve release tag
         run: |
-          tag="$(printf '%s' "$GITHUB_REF_NAME" | xargs)"
+          tag="$(printf '%s' "${{ github.event.inputs.tag || github.ref_name }}" | xargs)"
           if [[ ! "$tag" =~ ^[vV][0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Release tag must look like v0.1.0 or V0.1.0. Received: $tag" >&2
             exit 1
@@ -223,19 +214,6 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             requirements-build.txt
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Install web dependencies
-        working-directory: web_tools
-        run: npm ci --legacy-peer-deps --no-audit --no-fund --cache "$RUNNER_TEMP/npm-cache"
-
-      - name: Build web tools
-        working-directory: web_tools
-        run: npm run build
 
       - name: Validate release inputs
         run: |
@@ -309,7 +287,6 @@ jobs:
             --add-data "nlp_dictionary.txt:." \
             --add-data "fonts/open:fonts/open" \
             --add-data "vendor/darwin/ffmpeg:vendor/darwin/ffmpeg" \
-            --add-data "web_tools/dist:web_tools/dist" \
             --collect-all PyQt6 \
             --collect-all playwright \
             --hidden-import PyQt6.QtWebEngineWidgets \
@@ -329,8 +306,6 @@ jobs:
               --exclude "build" \
               --exclude "dist" \
               --exclude "release" \
-              --exclude "web_tools/node_modules" \
-              --exclude "web_tools/.npm-cache*" \
               --exclude "__pycache__" \
               ./ "$fallback_dir/"
             cat > "$fallback_dir/run.command" <<'EOF'
@@ -444,5 +419,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: release/**/*
           generate_release_notes: true

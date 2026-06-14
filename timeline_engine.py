@@ -1,24 +1,18 @@
 # ==========================================
 # 文件名: timeline_engine.py (无损升级版：6轨道平铺引擎)
 # ==========================================
-from PyQt6.QtWidgets import QGraphicsScene, QGraphicsView, QGraphicsRectItem, QGraphicsItem, QWidget, QSizePolicy
+from PyQt6.QtWidgets import QApplication, QGraphicsScene, QGraphicsView, QGraphicsRectItem, QGraphicsItem, QGraphicsSimpleTextItem, QWidget, QSizePolicy
 from PyQt6.QtCore import Qt, QRectF, QObject, pyqtSignal, pyqtSlot, QPointF
 from PyQt6.QtGui import QBrush, QColor, QPen, QPainter, QFont
 import os
 
+from timeline_interaction import SNAP_STEP_SECONDS, format_timecode, format_timing_label, item_key, parse_item_key, shift_timing, snap_time_with_points, update_selection
+
 TRACK_H = 26
 HEADER_H = 22
 TRACK_COUNT = 8
-SNAP_STEP_SECONDS = 0.05
-
-
 def _format_time(seconds):
-    seconds = max(0.0, float(seconds or 0.0))
-    minutes = int(seconds // 60)
-    secs = seconds - minutes * 60
-    if seconds < 60:
-        return f"{secs:04.1f}s"
-    return f"{minutes:02d}:{secs:04.1f}"
+    return format_timecode(seconds)
 
 def _timeline_colors(controller=None):
     c = getattr(controller, "_theme_colors", None) or {}
@@ -93,6 +87,9 @@ class ClipSignals(QObject):
 class ClipItem(QGraphicsRectItem):
     def __init__(self, clip_type, idx, start_t, end_t, track_idx, pps, text="", media_dur=0):
         self.clip_type = clip_type; self.idx = idx; self.pps = pps; self.track_idx = track_idx; self.text = text; self.media_dur = media_dur; self.signals = ClipSignals()
+        self.resize_mode = None; self.start_rect = None; self.start_scene_pos = None
+        self._suppress_signals = True
+        self._user_interacting = False
         
         # 👑 动态坐标定位
         if clip_type == "sub": y_pos = HEADER_H + self.track_idx * TRACK_H
@@ -109,7 +106,7 @@ class ClipItem(QGraphicsRectItem):
         elif clip_type in ("audio", "music"): self.base_color = QColor("#a6e3a1")
         elif clip_type == "design": self.base_color = QColor("#cba6f7")
         else: self.base_color = QColor("#f9e2af")
-        self.resize_mode = None; self.start_rect = None; self.start_scene_pos = None
+        self._suppress_signals = False
 
     def _controller(self):
         return self.scene().views()[0].controller if self.scene() and self.scene().views() else None
@@ -117,13 +114,15 @@ class ClipItem(QGraphicsRectItem):
     def _edit_mode_enabled(self):
         if self.clip_type == "music":
             return False
-        controller = self._controller()
-        return bool(getattr(controller, "edit_mode", False))
+        return True
 
     def _snap_time(self, seconds):
         controller = self._controller()
         if controller and getattr(controller, "timeline_snap_enabled", True):
-            return round(float(seconds) / SNAP_STEP_SECONDS) * SNAP_STEP_SECONDS
+            view = self.scene().views()[0] if self.scene() and self.scene().views() else None
+            points = view.timeline_snap_points(self.clip_type, self.idx) if view and hasattr(view, "timeline_snap_points") else []
+            threshold = 8.0 / max(1.0, self.pps)
+            return snap_time_with_points(seconds, enabled=True, step=SNAP_STEP_SECONDS, points=points, max_point_distance=threshold)
         return float(seconds)
 
     def hoverMoveEvent(self, event):
@@ -157,12 +156,18 @@ class ClipItem(QGraphicsRectItem):
             if controller and getattr(controller, "timeline_snap_enabled", True):
                 snapped_x = self._snap_time(new_pos.x() / self.pps) * self.pps
                 new_pos.setX(max(0.0, snapped_x))
+            view = self.scene().views()[0] if self.scene() and self.scene().views() else None
+            if view and hasattr(view, "auto_scroll_for_scene_x"):
+                view.auto_scroll_for_scene_x(new_pos.x())
             return new_pos
         elif change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
-            if not self.resize_mode: self.emit_moved()
+            if not self.resize_mode and self._user_interacting and not self._suppress_signals:
+                self.emit_moved()
         return super().itemChange(change, value)
 
     def emit_moved(self):
+        if self._suppress_signals or not self._user_interacting:
+            return
         new_start = self._snap_time(self.scenePos().x() / self.pps)
         new_end = self._snap_time(new_start + (self.rect().width() / self.pps))
         if new_end <= new_start:
@@ -170,6 +175,10 @@ class ClipItem(QGraphicsRectItem):
         self.signals.moved.emit(self.clip_type, self.idx, new_start, new_end, self.track_idx)
 
     def mousePressEvent(self, event):
+        view = self.scene().views()[0] if self.scene() and self.scene().views() else None
+        if view and hasattr(view, "begin_clip_interaction"):
+            view.begin_clip_interaction()
+        self._user_interacting = True
         self.setZValue(100); self.setSelected(True); self.signals.clicked.emit(self.clip_type, self.idx)
         if not self._edit_mode_enabled():
             self.resize_mode = None
@@ -196,6 +205,9 @@ class ClipItem(QGraphicsRectItem):
             elif self.resize_mode == "right":
                 new_w = self.start_rect.width() + scene_dx
                 if new_w >= 2.0: self.setRect(0, 0, new_w, self.start_rect.height()); self.emit_moved()
+            view = self.scene().views()[0] if self.scene() and self.scene().views() else None
+            if view and hasattr(view, "auto_scroll_for_scene_x"):
+                view.auto_scroll_for_scene_x(event.scenePos().x())
         else: super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -203,6 +215,10 @@ class ClipItem(QGraphicsRectItem):
         super().mouseReleaseEvent(event)
         final_start = self.scenePos().x() / self.pps
         self.signals.drag_finished.emit(self.clip_type, self.idx, final_start)
+        self._user_interacting = False
+        view = self.scene().views()[0] if self.scene() and self.scene().views() else None
+        if view and hasattr(view, "end_clip_interaction"):
+            view.end_clip_interaction()
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -247,6 +263,13 @@ class ClipItem(QGraphicsRectItem):
         painter.setPen(handle_pen)
         for hx in (7, max(7, int(self.rect().width()) - 8)):
             painter.drawLine(QPointF(hx, 7), QPointF(hx, self.rect().height() - 7))
+        if self._edit_mode_enabled():
+            grip = QColor(c["selected_text"])
+            grip.setAlpha(210 if self.isSelected() else 145)
+            painter.setBrush(QBrush(grip))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(QRectF(3, 4, 5, self.rect().height() - 8), 2, 2)
+            painter.drawRoundedRect(QRectF(self.rect().width() - 8, 4, 5, self.rect().height() - 8), 2, 2)
 
         label_color = QColor(c["selected_text"] if self.clip_type != "sub" else c["bg"])
         label_color.setAlpha(235)
@@ -281,6 +304,8 @@ class AdvancedTimeline(QGraphicsView):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setAcceptDrops(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setStyleSheet("""
             QGraphicsView { background-color: #11111b; border: none; }
             QScrollBar:horizontal { background: #11131f; height: 10px; border: none; }
@@ -290,7 +315,22 @@ class AdvancedTimeline(QGraphicsView):
         """)
         self.playhead = PlayheadItem(HEADER_H + TRACK_H * TRACK_COUNT + 12, controller)
         self.scene.addItem(self.playhead)
+        self.snap_guide = QGraphicsRectItem(0, HEADER_H, 1, TRACK_H * TRACK_COUNT)
+        self.snap_guide.setPen(QPen(QColor("#f9e2af"), 1, Qt.PenStyle.DashLine))
+        self.snap_guide.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self.snap_guide.setZValue(999)
+        self.snap_guide.hide()
+        self.scene.addItem(self.snap_guide)
+        self.drag_tip = QGraphicsSimpleTextItem("")
+        self.drag_tip.setBrush(QBrush(QColor("#f9e2af")))
+        self.drag_tip.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        self.drag_tip.setZValue(1001)
+        self.drag_tip.hide()
+        self.scene.addItem(self.drag_tip)
         self.is_scrubbing = False
+        self.selected_items = set()
+        self._clip_interaction_depth = 0
+        self._pending_sync_after_interaction = False
 
     def drawBackground(self, painter, rect):
         super().drawBackground(painter, rect); pps = self.controller.zoom_factor; dur = max(10.0, self.controller.state.get("duration", 10.0)); w = max(rect.width(), dur * pps + 240); scene_h = HEADER_H + TRACK_H * TRACK_COUNT + 12; self.scene.setSceneRect(0, 0, w, scene_h)
@@ -343,16 +383,23 @@ class AdvancedTimeline(QGraphicsView):
             min_x = min([clip["start"] for clip in clips]) * pps; max_x = max([clip["end"] for clip in clips]) * pps; t_rect = QRectF(min_x, HEADER_H + TRACK_H*4 + 5, max_x - min_x, TRACK_H - 4); painter.fillRect(t_rect, QColor(c["hint"])); painter.setClipRect(t_rect); painter.drawPixmap(t_rect, v_wave, QRectF(v_wave.rect())); painter.setClipping(False)
 
     def sync_from_controller(self):
+        if self._clip_interaction_depth > 0:
+            self._pending_sync_after_interaction = True
+            return
         for item in self.scene.items():
             if isinstance(item, ClipItem): self.scene.removeItem(item)
         pps = self.controller.zoom_factor
+        self.selected_items = {
+            key for key in self.selected_items
+            if self._item_key_exists(key)
+        }
         
         # 👑 修复渲染轨道映射
         for i, clip in enumerate(self.controller.state.get("video_clips", [])):
             clip_name = os.path.basename(clip.get("path", "")) or "复合片段"
             item = ClipItem("video", i, clip["start"], clip["end"], 3, pps, f"V1 · {clip_name}", media_dur=clip.get("dur", 0)); item.signals.clicked.connect(self.on_clip_clicked); item.signals.moved.connect(self.on_clip_moved); item.signals.drag_finished.connect(self.on_clip_drag_finished)
-            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, bool(getattr(self.controller, "edit_mode", False)))
-            if self.controller.selected_track == "video" and self.controller.current_v_idx == i: item.setSelected(True)
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+            if item_key("video", i) in self.selected_items or (self.controller.selected_track == "video" and self.controller.current_v_idx == i): item.setSelected(True)
             self.scene.addItem(item)
             
         if self.controller.state.get("audio_path"):
@@ -382,8 +429,8 @@ class AdvancedTimeline(QGraphicsView):
             
         for i, s in enumerate(self.controller.state.get("subs_data", [])):
             trk_idx = s.get('track', 1); item = ClipItem("sub", i, float(s.get('start', 0)), float(s.get('end', 1)), trk_idx, pps, f"T{3 - trk_idx} · {s.get('text', '').replace(chr(10), ' ')}"); item.signals.clicked.connect(self.on_clip_clicked); item.signals.moved.connect(self.on_clip_moved); item.signals.drag_finished.connect(self.on_clip_drag_finished)
-            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, bool(getattr(self.controller, "edit_mode", False)))
-            if i == self.controller.current_selected_idx: item.setSelected(True)
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+            if item_key("sub", i) in self.selected_items or i == self.controller.current_selected_idx: item.setSelected(True)
             self.scene.addItem(item)
 
         if hasattr(self.controller, "design_timeline_layers"):
@@ -398,20 +445,74 @@ class AdvancedTimeline(QGraphicsView):
                 item.signals.clicked.connect(self.on_clip_clicked)
                 item.signals.moved.connect(self.on_clip_moved)
                 item.signals.drag_finished.connect(self.on_clip_drag_finished)
-                item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, bool(getattr(self.controller, "edit_mode", False)))
+                item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
                 if getattr(self.controller, "selected_track", "") == "design" and layer.get("id") == getattr(self.controller, "selected_design_layer_id", ""):
                     item.setSelected(True)
                 self.scene.addItem(item)
         self.update_playhead(self.controller.current_play_time); self.scene.update()
 
+    def begin_clip_interaction(self):
+        self._clip_interaction_depth += 1
+
+    def end_clip_interaction(self):
+        self._clip_interaction_depth = max(0, self._clip_interaction_depth - 1)
+        if self._clip_interaction_depth == 0 and self._pending_sync_after_interaction:
+            self._pending_sync_after_interaction = False
+            self.sync_from_controller()
+
+    def _item_key_exists(self, key):
+        clip_type, idx = parse_item_key(key)
+        state = getattr(self.controller, "state", {}) or {}
+        if clip_type == "video":
+            return 0 <= idx < len(state.get("video_clips", []) or [])
+        if clip_type == "sub":
+            return 0 <= idx < len(state.get("subs_data", []) or [])
+        if clip_type == "audio":
+            return idx == 0 and bool(state.get("audio_path"))
+        if clip_type == "music":
+            return idx == 0 and bool(state.get("music_path"))
+        if clip_type == "design" and hasattr(self.controller, "design_timeline_layers"):
+            return 0 <= idx < len(self.controller.design_timeline_layers())
+        return False
+
     def update_playhead(self, time_sec):
         pps = self.controller.zoom_factor; self.playhead.setPos(time_sec * pps, 0); view_width = self.viewport().width(); head_x = time_sec * pps; scroll_bar = self.horizontalScrollBar()
         if head_x > scroll_bar.value() + view_width - 50: scroll_bar.setValue(int(head_x - view_width + 100))
 
+    def timeline_snap_points(self, exclude_type=None, exclude_idx=None):
+        points = [float(getattr(self.controller, "current_play_time", 0.0) or 0.0)]
+        state = getattr(self.controller, "state", {}) or {}
+        for idx, clip in enumerate(state.get("video_clips", []) or []):
+            if exclude_type == "video" and idx == exclude_idx:
+                continue
+            points.extend([float(clip.get("start", 0.0) or 0.0), float(clip.get("end", 0.0) or 0.0)])
+        for idx, sub in enumerate(state.get("subs_data", []) or []):
+            if exclude_type == "sub" and idx == exclude_idx:
+                continue
+            points.extend([float(sub.get("start", 0.0) or 0.0), float(sub.get("end", 0.0) or 0.0)])
+        if state.get("audio_path") and not (exclude_type == "audio" and exclude_idx == 0):
+            a_trim = state.get("a_trim", [0.0, 0.0])
+            if len(a_trim) >= 2:
+                points.extend([float(a_trim[0] or 0.0), float(a_trim[1] or 0.0)])
+        return sorted({round(max(0.0, point), 3) for point in points})
+
+    def auto_scroll_for_scene_x(self, scene_x):
+        margin = 42
+        step = 28
+        viewport_x = self.mapFromScene(float(scene_x), 0).x()
+        scroll_bar = self.horizontalScrollBar()
+        if viewport_x > self.viewport().width() - margin:
+            scroll_bar.setValue(min(scroll_bar.maximum(), scroll_bar.value() + step))
+        elif viewport_x < margin:
+            scroll_bar.setValue(max(scroll_bar.minimum(), scroll_bar.value() - step))
+
     @pyqtSlot(str, int)
     def on_clip_clicked(self, clip_type, idx):
+        modifiers = QApplication.keyboardModifiers()
+        additive = bool(modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier))
+        self.selected_items = update_selection(self.selected_items, clip_type, idx, additive=additive)
         if clip_type == "sub": self.controller.current_selected_idx = idx
-        elif clip_type == "video": self.controller.current_v_idx = idx
+        elif clip_type == "video": self.controller.current_v_idx = idx; self.controller.current_selected_idx = -1
         elif clip_type == "music":
             self.controller.selected_track = "music"
             self.controller.show_canvas_context_toolbar("audio")
@@ -421,11 +522,18 @@ class AdvancedTimeline(QGraphicsView):
             self.controller.select_design_layer_by_index(idx)
             return
         self.controller.switch_inspector(clip_type)
+        self._update_selection_status()
+
+    def _update_selection_status(self):
+        count = len(self.selected_items)
+        if count > 1 and hasattr(self.controller, "status_lbl"):
+            self.controller.status_lbl.setText(f"Timeline selection: {count} clips")
 
     @pyqtSlot(str, int, float, float, int)
     def on_clip_moved(self, clip_type, idx, new_start, new_end, new_track):
-        if not getattr(self.controller, "edit_mode", False):
+        if clip_type == "music":
             return
+        self._show_drag_feedback(clip_type, new_start, new_end)
         if clip_type == "sub":
             sub = self.controller.state["subs_data"][idx]
             old_start = float(sub.get("start", 0)); old_end = float(sub.get("end", 1))
@@ -452,27 +560,113 @@ class AdvancedTimeline(QGraphicsView):
                 self.controller.sub_start_spin.blockSignals(False); self.controller.sub_end_spin.blockSignals(False)
                 
         elif clip_type == "video":
-            self.controller.state["video_clips"][idx]["start"] = new_start; self.controller.state["video_clips"][idx]["end"] = new_end
+            clip = self.controller.state["video_clips"][idx]
+            old_start = float(clip.get("start", 0.0) or 0.0)
+            old_end = float(clip.get("end", old_start) or old_start)
+            old_dur = max(0.001, old_end - old_start)
+            new_dur = max(0.001, new_end - new_start)
+            if item_key(clip_type, idx) in self.selected_items and len(self.selected_items) > 1 and abs(old_dur - new_dur) < 0.001:
+                self._shift_selected_items(item_key(clip_type, idx), new_start - old_start)
+            clip["start"] = new_start; clip["end"] = new_end
+            self.controller.current_v_idx = idx
             if getattr(self.controller, 'current_v_idx', -1) == idx and getattr(self.controller, 'selected_track', '') == 'video':
                 self.controller.v_start_spin.blockSignals(True); self.controller.v_end_spin.blockSignals(True)
                 self.controller.v_start_spin.setValue(new_start); self.controller.v_end_spin.setValue(new_end)
                 self.controller.v_start_spin.blockSignals(False); self.controller.v_end_spin.blockSignals(False)
         elif clip_type == "audio":
+            a_trim = self.controller.state.get("a_trim", [0.0, 0.0])
+            old_start = float(a_trim[0] or 0.0) if len(a_trim) >= 1 else 0.0
+            old_end = float(a_trim[1] or old_start) if len(a_trim) >= 2 else old_start
+            old_dur = max(0.001, old_end - old_start)
+            new_dur = max(0.001, new_end - new_start)
+            if item_key(clip_type, idx) in self.selected_items and len(self.selected_items) > 1 and abs(old_dur - new_dur) < 0.001:
+                self._shift_selected_items(item_key(clip_type, idx), new_start - old_start)
             self.controller.state["a_trim"] = [new_start, new_end]
         elif clip_type == "design" and hasattr(self.controller, "update_design_layer_timing_by_index"):
             self.controller.update_design_layer_timing_by_index(idx, new_start, new_end, new_track)
 
     @pyqtSlot(str, int, float)
     def on_clip_drag_finished(self, clip_type, idx, final_start):
-        if not getattr(self.controller, "edit_mode", False):
+        if clip_type == "music":
             return
-        self.controller.update_timeline_size()
+        self._hide_drag_feedback()
+        if clip_type == "video":
+            clips = self.controller.state.get("video_clips", [])
+            if 0 <= idx < len(clips):
+                selected_clip = clips[idx]
+                selected_video_clips = [
+                    clips[video_idx]
+                    for key in self.selected_items
+                    for key_type, video_idx in [parse_item_key(key)]
+                    if key_type == "video" and 0 <= video_idx < len(clips)
+                ]
+                self.controller.state["video_clips"] = sorted(clips, key=lambda clip: (float(clip.get("start", 0.0) or 0.0), float(clip.get("end", 0.0) or 0.0)))
+                self.controller.current_v_idx = self.controller.state["video_clips"].index(selected_clip)
+                non_video_selection = {key for key in self.selected_items if not key.startswith("video:")}
+                self.selected_items = non_video_selection | {
+                    item_key("video", self.controller.state["video_clips"].index(clip))
+                    for clip in selected_video_clips
+                    if clip in self.controller.state["video_clips"]
+                }
+        if hasattr(self.controller, "_recalc_duration"):
+            self.controller._recalc_duration()
+        else:
+            self.controller.update_timeline_size()
         self.controller.auto_save_cache()
+        if hasattr(self.controller, "push_history"):
+            self.controller.push_history()
+        if hasattr(self.controller, "refresh_media_pool"):
+            self.controller.refresh_media_pool()
         self.controller.sync_player_to_time(final_start)
+
+    def _shift_selected_items(self, anchor_key, delta):
+        if abs(float(delta or 0.0)) < 0.0001:
+            return
+        state = getattr(self.controller, "state", {}) or {}
+        for key in list(self.selected_items):
+            if key == anchor_key:
+                continue
+            clip_type, idx = parse_item_key(key)
+            if clip_type == "video":
+                clips = state.get("video_clips", []) or []
+                if 0 <= idx < len(clips):
+                    clip = clips[idx]
+                    clip["start"], clip["end"] = shift_timing(clip.get("start", 0.0), clip.get("end", 0.0), delta)
+            elif clip_type == "sub":
+                subs = state.get("subs_data", []) or []
+                if 0 <= idx < len(subs):
+                    sub = subs[idx]
+                    old_start = float(sub.get("start", 0.0) or 0.0)
+                    sub["start"], sub["end"] = shift_timing(sub.get("start", 0.0), sub.get("end", 0.0), delta)
+                    actual_delta = float(sub.get("start", 0.0) or 0.0) - old_start
+                    for word in sub.get("words", []) or []:
+                        word["start"] = max(0.0, float(word.get("start", 0.0) or 0.0) + actual_delta)
+                        word["end"] = max(word["start"], float(word.get("end", 0.0) or 0.0) + actual_delta)
+            elif clip_type == "audio" and state.get("audio_path"):
+                a_trim = state.get("a_trim", [0.0, 0.0])
+                if len(a_trim) >= 2:
+                    state["a_trim"] = list(shift_timing(a_trim[0], a_trim[1], delta))
+
+    def _show_drag_feedback(self, clip_type, start, end):
+        track_labels = {"video": "V1", "audio": "A2", "sub": "T", "design": "D"}
+        label = format_timing_label(start, end, track_labels.get(clip_type, ""))
+        pps = self.controller.zoom_factor
+        x = max(0.0, float(start or 0.0) * pps)
+        self.snap_guide.setRect(x, HEADER_H, 1, TRACK_H * TRACK_COUNT)
+        self.snap_guide.show()
+        self.drag_tip.setText(label)
+        self.drag_tip.setPos(x + 6, 2)
+        self.drag_tip.show()
+        if hasattr(self.controller, "status_lbl"):
+            self.controller.status_lbl.setText(f"Timeline adjust: {label}")
+
+    def _hide_drag_feedback(self):
+        self.snap_guide.hide()
+        self.drag_tip.hide()
         
     def mousePressEvent(self, event):
         item = self.itemAt(event.position().toPoint())
-        if not isinstance(item, ClipItem): self.is_scrubbing = True; self.controller.switch_inspector("empty"); self.scrub_playhead(event.position().x())
+        if not isinstance(item, ClipItem): self.selected_items.clear(); self.is_scrubbing = True; self.controller.switch_inspector("empty"); self.scrub_playhead(event.position().x())
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -481,6 +675,52 @@ class AdvancedTimeline(QGraphicsView):
 
     def mouseReleaseEvent(self, event):
         self.is_scrubbing = False; super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if hasattr(self.controller, "delete_timeline_selection") and self.controller.delete_timeline_selection(show_message=False):
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def dragEnterEvent(self, event):
+        mime = event.mimeData()
+        if mime and mime.hasUrls() and hasattr(self.controller, "_supported_media_path"):
+            for url in mime.urls():
+                path = url.toLocalFile()
+                media_type = self.controller._supported_media_path(path) if path else ""
+                if media_type in ("video", "audio"):
+                    event.acceptProposedAction()
+                    return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        mime = event.mimeData()
+        if mime and mime.hasUrls() and hasattr(self.controller, "_supported_media_path"):
+            for url in mime.urls():
+                path = url.toLocalFile()
+                media_type = self.controller._supported_media_path(path) if path else ""
+                if media_type in ("video", "audio"):
+                    event.acceptProposedAction()
+                    return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        mime = event.mimeData()
+        if not (mime and mime.hasUrls() and hasattr(self.controller, "add_media_from_path_at_time")):
+            super().dropEvent(event)
+            return
+        drop_time = max(0.0, self.mapToScene(event.position().toPoint()).x() / max(0.001, self.controller.zoom_factor))
+        accepted = False
+        for url in mime.urls():
+            path = url.toLocalFile()
+            media_type = self.controller._supported_media_path(path) if hasattr(self.controller, "_supported_media_path") else ""
+            if path and media_type in ("video", "audio") and self.controller.add_media_from_path_at_time(path, drop_time):
+                accepted = True
+        if accepted:
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
 
     def scrub_playhead(self, x_pos):
         t = max(0.0, self.mapToScene(int(x_pos), 0).x() / self.controller.zoom_factor); self.controller.sync_player_to_time(t)

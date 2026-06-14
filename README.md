@@ -1,8 +1,7 @@
 # Subtitle Composer / Subtitled Video Pro
 
 Desktop subtitle composition and video delivery tool for project-based editing,
-batch transcription, rolling subtitle utilities, ElevenLabs voice workflows,
-open-font subtitle styling, and FFmpeg-based export.
+batch transcription, open-font subtitle styling, and FFmpeg-based export.
 
 ## Project Layout
 
@@ -10,8 +9,6 @@ open-font subtitle styling, and FFmpeg-based export.
 | --- | --- |
 | `main.py` | PyQt6 desktop entry point |
 | `room_*.py` | Main application rooms and workflows |
-| `web_tools/` | Vite/TypeScript panels loaded through Qt WebEngine |
-| `web_tools/package-lock.json` | Locked frontend build dependency graph |
 | `fonts/open/` | Bundled open font pack and per-font license files |
 | `font_registry.json` | Font policy registry used by the app and release audit |
 | `scripts/download_open_fonts.py` | Google Fonts starter-pack downloader |
@@ -35,15 +32,6 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-```
-
-Build the web panels when changing `web_tools/src`:
-
-```powershell
-cd web_tools
-npm ci
-npm run build
-cd ..
 ```
 
 Run from source:

@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
+*.bak
 .venv/
 venv/
 
@@ -9,11 +10,10 @@ venv/
 /settings.*.json
 /effects.json
 /MyWorkspace/
-/ElevenLabs_Config.json
-/ElevenLabs_*.csv
 /batch_queue_backups.json
 /style_presets.json
 /signature_presets.json
+/_subtitle_effect_analysis/
 /updates/
 .env
 .env.*
@@ -22,17 +22,12 @@ venv/
 # Build output
 /build/
 /dist/
+/_reference_caption_analysis/
 /*.spec
 !/main.spec
 /release/
 ffmpeg.exe
 ffprobe.exe
-
-# Keep checked-in web runtime builds, but ignore transient Node modules.
-web_tools/node_modules/
-web_tools/.npm-cache*/
-web_tools/.vite/
-web_tools/*.log
 
 # OS/editor
 .DS_Store

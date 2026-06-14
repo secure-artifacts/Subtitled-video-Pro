@@ -3,15 +3,14 @@
 ## Pre-Release Checklist
 
 1. Confirm the project license baseline is acceptable: `GPL-3.0-only`.
-2. Confirm no `settings.json`, API keys, Cloudflare tokens, ElevenLabs tokens,
+2. Confirm no `settings.json`, API keys, Cloudflare tokens, API tokens,
    or personal local workspace paths are staged.
 3. Rotate any credentials that previously existed in the directory, repository,
    release artifact, or local git history.
 4. Run the dependency license audit after dependency or bundled-font changes.
 5. Confirm `fonts/open/open_fonts_manifest.json` matches the bundled font files
    and that font license files remain beside the fonts.
-6. Build `web_tools/dist` from current TypeScript sources.
-7. Push a clean tag such as `V0.1.12`.
+6. Push a clean tag such as `V0.1.12`.
 
 ## Recommended First Public Push
 
@@ -47,18 +46,17 @@ git push origin V0.1.12
 
 The `Release` workflow will:
 
-1. install locked Node dependencies with `npm ci` and Python dependencies;
-2. build Vite web panels;
-3. validate that required release notices and font manifest files exist;
-4. reject a checkout that contains local-only `settings.json`;
-5. build Windows x64 with PyInstaller on `windows-latest`;
-6. build macOS x64 on `macos-15-intel`;
-7. build macOS arm64 on `macos-15`;
-8. bundle `fonts/open`, FFmpeg/FFprobe runtime files, `font_registry.json`, `nlp_dictionary.txt`, and notices;
-9. apply ad-hoc signing to the macOS `.app` bundles;
-10. create per-platform checksum files and a combined `checksums.sha256`;
-11. create GitHub artifact attestations with `actions/attest-build-provenance`;
-12. publish the GitHub release with GitHub-generated notes.
+1. install Python dependencies;
+2. validate that required release notices and font manifest files exist;
+3. reject a checkout that contains local-only `settings.json`;
+4. build Windows x64 with PyInstaller on `windows-latest`;
+5. build macOS x64 on `macos-15-intel`;
+6. build macOS arm64 on `macos-15`;
+7. bundle `fonts/open`, FFmpeg/FFprobe runtime files, `font_registry.json`, `nlp_dictionary.txt`, and notices;
+8. apply ad-hoc signing to the macOS `.app` bundles;
+9. create per-platform checksum files and a combined `checksums.sha256`;
+10. create GitHub artifact attestations with `actions/attest-build-provenance`;
+11. publish the GitHub release with GitHub-generated notes.
 
 The macOS `.app` packages are ad-hoc signed when PyInstaller succeeds. If the
 hosted macOS runner cannot produce a standalone `.app`, the workflow uploads a

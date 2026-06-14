@@ -14,12 +14,14 @@ import sys
 import copy
 import time
 import html
+import hashlib
 
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QTextEdit, QScrollArea, QTabWidget, QComboBox, 
                              QSlider, QFileDialog, QGridLayout, QFrame, 
                              QCheckBox, QMessageBox, QColorDialog, QFontComboBox, 
-                             QStackedWidget, QDoubleSpinBox, QSpinBox, QSplitter, QInputDialog, QProgressDialog, QLineEdit, QSizePolicy, QDialog)
+                             QStackedWidget, QDoubleSpinBox, QSpinBox, QSplitter, QInputDialog, QProgressDialog, QLineEdit, QSizePolicy, QDialog,
+                             QListWidget, QListWidgetItem)
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
@@ -32,18 +34,44 @@ from PyQt6.QtCore import QRectF
 from timeline_engine import TimelineHeader, AdvancedTimeline, TRACK_H, HEADER_H, TRACK_COUNT
 from core import get_ffmpeg_cmd, get_ffprobe_cmd, get_app_dir, FFMPEG_DOWNLOAD_URL, download_file_with_progress
 from app_theme import apply_tinted_styles
-from ui_components import (hex_to_rgb, get_exact_duration, get_video_dimensions,
+from room_theme_bridge import apply_room_theme_bridge
+from ui_components import (hex_to_rgb, get_exact_duration, get_video_dimensions, get_video_stream_duration,
+                           get_video_import_metadata,
                            AspectRatioContainer, default_signature_config,
                            default_design_room_state, normalize_design_room_state,
                            normalize_signature_config, render_design_html, render_signature_html,
                            render_subtitle_html,
                            rebalance_subtitle_layout, tokenize_display_text,
                            normalize_word_timestamps, align_reference_text_to_timestamps,
+                           format_subtitle_text_spacing, normalize_scripture_quote_text,
+                           should_defer_subtitle_break_for_readability,
+                           merge_single_word_subtitle_segments,
                            FAITH_WORDS)
 from project_io import copy_media_to_project_assets, load_project, save_project, sync_project_assets_to_project_dir, update_room_state
-from app_config import OUTPUT_RESOLUTION_OPTIONS, get_output_resolution, resolution_to_size
+from app_config import OUTPUT_RESOLUTION_OPTIONS, get_output_resolution, get_preview_fullscreen_shortcut, load_app_config, resolution_to_size
+from app_storage import read_json_file, resolve_user_file, write_json_file
 from font_assets import font_face_css
+from render_pipeline_model import canvas_layer_rect
 from render_timing import render_tail_padding_seconds
+from image_asset_cache import DEFAULT_IMAGE_PROXY_MAX_SIDE, ensure_downscaled_image
+from media_pool_panel import MediaPoolPanel
+from caption_presets import (
+    REFERENCE_NARRATIVE_CHUNK_MODE,
+    built_in_style_presets,
+    is_reference_narrative_chunk_mode,
+    merge_built_in_style_presets,
+)
+from preview_proxy import (
+    PROXY_STATUS_FAILED,
+    PROXY_STATUS_GENERATING,
+    PROXY_STATUS_PENDING,
+    PROXY_STATUS_READY,
+    build_preview_proxy_command,
+    clip_should_auto_proxy,
+    prepare_clip_for_preview_proxy,
+    preview_proxy_is_ready,
+    preview_source_for_clip,
+)
 from font_registry import (
     STATUS_NONCOMMERCIAL,
     STATUS_OPEN,
@@ -55,9 +83,9 @@ from font_registry import (
     safe_font_keys,
 )
 
-CACHE_FILE = os.path.join(tempfile.gettempdir(), "sh_v8_project_cache.json")
-PRESETS_FILE = os.path.join(os.getcwd(), "style_presets.json") 
-SIGNATURE_PRESETS_FILE = os.path.join(os.getcwd(), "signature_presets.json")
+CACHE_FILE = resolve_user_file("sh_v8_project_cache.json", legacy_root=tempfile.gettempdir(), kind="cache")
+PRESETS_FILE = resolve_user_file("style_presets.json", legacy_root=os.getcwd(), kind="config")
+SIGNATURE_PRESETS_FILE = resolve_user_file("signature_presets.json", legacy_root=os.getcwd(), kind="config")
 STYLE_PRESET_POSITION_KEY = "__position__"
 
 def split_style_preset(raw):
@@ -86,13 +114,7 @@ def split_style_preset(raw):
     return style, position
 
 def local_get_cf_accounts():
-    config_path = os.path.join(os.getcwd(), "settings.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                return json.load(f).get("cf_accounts", [])
-        except: pass
-    return []
+    return load_app_config().get("cf_accounts", [])
     
 # ==========================================
 # 👑 滚轮屏蔽组件：强制鼠标滚轮穿透，只滚动页面不改参数
@@ -493,11 +515,11 @@ class EditView(QWidget):
         
         self.default_style = {
             "size": 100, "font": "Noto Sans SC", "font_weight": "700", "font_style": "normal", "color_txt": "#FFFFFF", "color_hl": "#FFFFFF",
-            "bg_mode": "none", "bg_color": "#000000", "bg_alpha": 80, "bg_radius": 15, "bg_padding": 20,
+            "bg_mode": "none", "bg_color": "#000000", "bg_alpha": 80, "bg_radius": 15, "bg_padding": 20, "bg_auto_resolution": True,
             "hl_bg_color": "#FF0050", "hl_bg_alpha": 100, "hl_bg_radius": 8, "hl_bg_padding": 8, 
             "stroke_width": 4, "stroke_color": "#000000", "stroke_o_width": 0, "stroke_o_color": "#000000", "stroke_softness": 0,
             "shadow_x": 5, "shadow_y": 5, "shadow_blur": 0, "shadow_color": "#000000", "shadow_alpha": 100,
-            "line_height": 1.1, "text_dir": "ltr", "use_hl": True, "hl_glow": False, "glow_size": 20,
+            "line_height": 1.1, "text_dir": "ltr", "use_hl": True, "hl_style": "text", "hl_glow": False, "glow_size": 20,
             "anim_type": "pop", "font_motion": "none", "hl_motion": "stable", "pop_speed": 0.18, "pop_bounce": 128, "inactive_alpha": 100, 
             "text_texture": "none",
             "text_transform": "capitalize", "text_align": "center", "letter_spacing": 0, "word_spacing": 0,
@@ -529,6 +551,7 @@ class EditView(QWidget):
         self._audio_exts = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
         self.zoom_factor = 50.0; self.timeline_snap_enabled = True; self.active_subs_cache = set(); self.last_render_hash = None
         self.preview_zoom = 1.0; self.preview_pan_x = 0.0; self.preview_pan_y = 0.0
+        self.preview_overlay_enabled = True; self._preview_overlay_has_content = False; self._preview_frame_retry_pending = False; self._preview_frame_retry_count = 0
         self.v_wave_pixmap = None; self.a_wave_pixmap = None; self.video_thumbs = []; self.last_video_image = None
         self.proj_width = 1080; self.proj_height = 1920
         self.safe_font_only = False
@@ -536,6 +559,8 @@ class EditView(QWidget):
         self.project_autosave_timer.setSingleShot(True)
         self.project_autosave_timer.timeout.connect(self.flush_project_autosave)
         self.project_autosave_busy = False
+        self._preview_proxy_jobs = set()
+        self.preview_proxy_auto_generate = True
         
         self.sig_ai_progress.connect(self._on_ai_progress); self.sig_ai_success.connect(self._on_ai_success)
         self.sig_ai_error.connect(self._on_ai_error); self.sig_ai_finish.connect(self._on_ai_finish)
@@ -727,6 +752,7 @@ class EditView(QWidget):
         self.selected_design_layer_id = new_layers[-1]["id"]
         self.selected_track = "design"
         self._commit_design_state(state, "🎨 已添加设计组件。")
+        self.push_history()
 
     def add_design_image_dialog(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -742,6 +768,8 @@ class EditView(QWidget):
             file_path, _, _ = copy_media_to_project_assets(project_data, file_path)
         except Exception:
             pass
+        image_path, original_image_path, image_proxy_info = self._prepare_design_image_asset(file_path)
+        proxy_used = bool(image_proxy_info and image_proxy_info.used_proxy and image_path != file_path)
         state = self._current_design_state()
         page = self._design_page(state)
         page["duration"] = max(float(page.get("duration", 5.0) or 5.0), float(self.state.get("duration", 5.0) or 5.0))
@@ -749,8 +777,12 @@ class EditView(QWidget):
             "id": f"design-image-{int(time.time() * 1000)}",
             "type": "image",
             "name": os.path.splitext(os.path.basename(file_path))[0] or "图片素材",
-            "src": QUrl.fromLocalFile(file_path).toString(),
-            "path": file_path,
+            "src": QUrl.fromLocalFile(image_path).toString(),
+            "path": image_path,
+            "source_path": original_image_path,
+            "original_path": original_image_path,
+            "proxy_path": image_path if proxy_used else "",
+            "proxy_max_side": DEFAULT_IMAGE_PROXY_MAX_SIDE if proxy_used else 0,
             "fit": "cover",
             "x": 140,
             "y": 520,
@@ -766,7 +798,19 @@ class EditView(QWidget):
         page.setdefault("layers", []).append(layer)
         self.selected_design_layer_id = layer["id"]
         self.selected_track = "design"
+        if proxy_used:
+            self._commit_design_state(state, "🖼️ 已添加图片设计层（2K 预览代理）。")
+            self.push_history()
+            return
         self._commit_design_state(state, "🖼️ 已添加图片设计层。")
+        self.push_history()
+
+    def _prepare_design_image_asset(self, file_path):
+        try:
+            image_path, info = ensure_downscaled_image(file_path, max_side=DEFAULT_IMAGE_PROXY_MAX_SIDE)
+            return image_path or file_path, file_path, info
+        except Exception:
+            return file_path, file_path, None
 
     def _selected_design_layer(self, state=None):
         state = state or self._current_design_state()
@@ -894,6 +938,7 @@ class EditView(QWidget):
             return
         layer["fill"] = color.name().upper()
         self._commit_design_state(state, "🎨 已更新设计颜色。")
+        self.push_history()
 
     def move_design_layer(self, direction):
         state = self._current_design_state()
@@ -905,6 +950,7 @@ class EditView(QWidget):
             return
         layers[idx]["zIndex"], layers[next_idx]["zIndex"] = layers[next_idx].get("zIndex", next_idx), layers[idx].get("zIndex", idx)
         self._commit_design_state(state)
+        self.push_history()
 
     def delete_selected_design_layer(self):
         state = self._current_design_state()
@@ -915,6 +961,7 @@ class EditView(QWidget):
             return
         self.selected_design_layer_id = page["layers"][-1].get("id", "") if page["layers"] else ""
         self._commit_design_state(state, "🗑️ 已删除设计图层。")
+        self.push_history()
 
     def clear_design_layers(self):
         state = self._current_design_state()
@@ -922,6 +969,7 @@ class EditView(QWidget):
         page["layers"] = []
         self.selected_design_layer_id = ""
         self._commit_design_state(state, "已清空设计叠层。")
+        self.push_history()
 
     def design_timeline_layers(self):
         state = self._current_design_state()
@@ -1015,8 +1063,19 @@ class EditView(QWidget):
         self.shortcut_preview_zoom_reset.activated.connect(self.reset_preview_view_from_shortcut)
         self.shortcut_focus_canvas = QShortcut(QKeySequence("F11"), self)
         self.shortcut_focus_canvas.activated.connect(self.toggle_canvas_focus_mode)
-        self.shortcut_preview_fullscreen = QShortcut(QKeySequence("Ctrl+F"), self)
+        self.preview_fullscreen_shortcut_text = "Ctrl+F"
+        self._preview_fullscreen_active = False
+        self.shortcut_preview_fullscreen = QShortcut(QKeySequence(), self)
+        self.shortcut_preview_fullscreen.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.shortcut_preview_fullscreen.activated.connect(self.toggle_preview_fullscreen_from_shortcut)
+        self.shortcut_preview_fullscreen_escape = QShortcut(QKeySequence("Esc"), self)
+        self.shortcut_preview_fullscreen_escape.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.shortcut_preview_fullscreen_escape.setEnabled(False)
+        self.shortcut_preview_fullscreen_escape.activated.connect(self.exit_preview_fullscreen)
+        self.apply_preview_fullscreen_shortcut()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self.shortcut_prev_project = QShortcut(QKeySequence("Alt+Left"), self)
         self.shortcut_prev_project.activated.connect(lambda: self.switch_sibling_project(-1))
         self.shortcut_next_project = QShortcut(QKeySequence("Alt+Right"), self)
@@ -1138,10 +1197,11 @@ class EditView(QWidget):
         self.top_app_bar = top_app_bar
 
         # ================= 1. 左侧面板 =================
-        left_panel = QFrame(); left_panel.setStyleSheet("background-color: #181b24; border-radius: 0px;"); left_layout = QVBoxLayout(left_panel)
+        left_panel = QFrame(); left_panel.setStyleSheet("background-color: #181b24; border-radius: 0px;")
         left_panel.setMinimumWidth(200)
-        left_layout.setContentsMargins(14, 14, 14, 12)
-        left_layout.setSpacing(8)
+        left_root_layout = QVBoxLayout(left_panel)
+        left_root_layout.setContentsMargins(14, 14, 14, 12)
+        left_root_layout.setSpacing(8)
 
         project_header = QHBoxLayout()
         self.lbl_side_panel_title = QLabel("工程")
@@ -1154,7 +1214,25 @@ class EditView(QWidget):
         project_header.addWidget(self.lbl_side_panel_title)
         project_header.addStretch()
         self.btn_collapse_left_panel.setVisible(False)
-        left_layout.addLayout(project_header)
+        left_root_layout.addLayout(project_header)
+
+        self.left_page_stack = QStackedWidget()
+        self.left_edit_page = QWidget()
+        left_layout = QVBoxLayout(self.left_edit_page)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+        self.left_media_page = QWidget()
+        self.left_media_layout = QVBoxLayout(self.left_media_page)
+        self.left_media_layout.setContentsMargins(0, 0, 0, 0)
+        self.left_media_layout.setSpacing(8)
+        self.left_design_page = QWidget()
+        self.left_design_layout = QVBoxLayout(self.left_design_page)
+        self.left_design_layout.setContentsMargins(0, 0, 0, 0)
+        self.left_design_layout.setSpacing(8)
+        self.left_page_stack.addWidget(self.left_edit_page)
+        self.left_page_stack.addWidget(self.left_media_page)
+        self.left_page_stack.addWidget(self.left_design_page)
+        left_root_layout.addWidget(self.left_page_stack, stretch=1)
 
         self.side_search = QLineEdit()
         self.side_search.setPlaceholderText("搜索工程 / 字幕 / 素材")
@@ -1167,6 +1245,64 @@ class EditView(QWidget):
         self.btn_undo = QPushButton("↩️ 撤销"); self.btn_undo.setFixedHeight(35); self.btn_undo.setStyleSheet("background-color: #313244; border-radius: 5px; color: white;"); self.btn_undo.clicked.connect(self.undo)
         self.btn_save = QPushButton("💾 保存"); self.btn_save.setFixedHeight(35); self.btn_save.setStyleSheet("background-color: #a6e3a1; font-weight: bold; border-radius: 5px; color: #11111b;"); self.btn_save.clicked.connect(self.manual_save)
         top_btn_row.addWidget(self.btn_reset); top_btn_row.addWidget(self.btn_undo); top_btn_row.addWidget(self.btn_save); left_layout.addLayout(top_btn_row)
+
+        self.media_pool_panel = MediaPoolPanel(self)
+        self.media_pool_panel.importRequested.connect(self.import_media_dialog)
+        self.media_pool_panel.addRequested.connect(self.add_selected_media_pool_item_to_timeline)
+        self.media_pool_panel.refreshRequested.connect(self.refresh_media_pool)
+        self.media_pool_panel.selectionChangedPayload.connect(self.select_media_pool_payload)
+        self.left_media_layout.addWidget(self.media_pool_panel)
+        media_hint = QLabel("素材页独立管理导入素材；双击或点“入线”加入当前播放头。")
+        media_hint.setWordWrap(True)
+        media_hint.setStyleSheet("color:#8f9bb3; background:#10131b; border:1px solid #252c3d; border-radius:7px; padding:8px; font-size:11px;")
+        self.left_media_layout.addWidget(media_hint)
+
+        self.assembly_media_paths = []
+        self.assembly_panel = QFrame()
+        self.assembly_panel.setStyleSheet("""
+            QFrame { background-color:#111620; border:1px solid #2d3548; border-radius:8px; }
+            QLabel { color:#cdd6f4; border:none; }
+            QListWidget { background-color:#0d111a; color:#cdd6f4; border:1px solid #252c3d; border-radius:6px; padding:3px; outline:none; }
+            QListWidget::item { min-height:24px; padding:3px 6px; border-radius:4px; }
+            QListWidget::item:selected { background-color:#3f6fb5; color:white; }
+        """)
+        assembly_layout = QVBoxLayout(self.assembly_panel)
+        assembly_layout.setContentsMargins(9, 8, 9, 9)
+        assembly_layout.setSpacing(6)
+        assembly_header = QHBoxLayout()
+        assembly_title_box = QVBoxLayout()
+        assembly_title_box.setSpacing(0)
+        assembly_title_box.addWidget(QLabel("ASSEMBLY CUT", styleSheet="color:#f9e2af; font-weight:900; font-size:12px; letter-spacing:0px;"))
+        assembly_title_box.addWidget(QLabel("多素材组接", styleSheet="color:#ffffff; font-weight:900; font-size:13px;"))
+        assembly_header.addLayout(assembly_title_box)
+        assembly_header.addStretch()
+        self.assembly_count_label = QLabel("0 段")
+        self.assembly_count_label.setStyleSheet("color:#a6adc8; font-size:11px;")
+        assembly_header.addWidget(self.assembly_count_label)
+        assembly_layout.addLayout(assembly_header)
+        self.assembly_list = QListWidget()
+        self.assembly_list.setFixedHeight(116)
+        assembly_layout.addWidget(self.assembly_list)
+        assembly_actions = QHBoxLayout()
+        self.btn_assembly_pick = QPushButton("选择素材")
+        self.btn_assembly_pick.setFixedHeight(27)
+        self.btn_assembly_pick.setStyleSheet("background-color:#89b4fa; color:#11111b; border-radius:5px; font-weight:900;")
+        self.btn_assembly_pick.clicked.connect(self.pick_assembly_media_dialog)
+        self.btn_assembly_clear = QPushButton("清空")
+        self.btn_assembly_clear.setFixedHeight(27)
+        self.btn_assembly_clear.setStyleSheet("background-color:#242b3f; color:#cdd6f4; border:1px solid #3a425a; border-radius:5px; font-weight:800;")
+        self.btn_assembly_clear.clicked.connect(self.clear_assembly_media)
+        self.btn_assembly_cut = QPushButton("一键组接")
+        self.btn_assembly_cut.setFixedHeight(27)
+        self.btn_assembly_cut.setStyleSheet("background-color:#f9e2af; color:#11111b; border-radius:5px; font-weight:900;")
+        self.btn_assembly_cut.clicked.connect(self.assemble_selected_media_to_timeline)
+        assembly_actions.addWidget(self.btn_assembly_pick)
+        assembly_actions.addWidget(self.btn_assembly_clear)
+        assembly_actions.addWidget(self.btn_assembly_cut)
+        assembly_layout.addLayout(assembly_actions)
+        self.left_media_layout.addWidget(self.assembly_panel)
+        self.refresh_assembly_media_list()
+        self.left_media_layout.addStretch(1)
         
         left_layout.addWidget(QLabel("🎥 V1 画面轨道控制:", styleSheet="color: #89b4fa; font-weight: bold; margin-top: 5px;"))
         self.btn_v = QPushButton("➕ 导入第一段画面 (MP4)"); self.btn_v.setFixedHeight(35); self.btn_v.setStyleSheet("background-color: #313244; color: white;"); self.btn_v.clicked.connect(self.load_video)
@@ -1304,8 +1440,8 @@ class EditView(QWidget):
             btn.clicked.connect(callback)
             design_action_row.addWidget(btn)
         design_layout.addLayout(design_action_row)
-        left_layout.addWidget(design_box)
-        design_box.hide()
+        self.left_design_layout.addWidget(design_box)
+        self.left_design_layout.addStretch(1)
         
         # 👑 改造剪贴板 UI：加入一键排版按钮
         text_header_layout = QHBoxLayout()
@@ -1325,7 +1461,7 @@ class EditView(QWidget):
         chunk_row = QHBoxLayout()
         chunk_row.addWidget(QLabel("✂️ 断句模式:", styleSheet="color: #89b4fa; font-weight: bold;"))
         self.chunk_mode = QComboBox()
-        self.chunk_mode.addItems(["短句快速 (1-3字)", "智能重点短句 (3-4词为主)", "智能听译 (4-6词，适配双行按词)", "自然短句 (1-4词)", "双词节奏 (2词/句)", "三词短句 (3词/句)", "四词短句 (4词/句)", "双行大段 (约10字，智能折行)", "单字轰炸 (1字/句)"])
+        self.chunk_mode.addItems(["短句快速 (1-3字)", "智能重点短句 (3-4词为主)", "智能听译 (4-7词，适配双行按词)", REFERENCE_NARRATIVE_CHUNK_MODE, "自然短句 (1-4词)", "双词节奏 (2词/句)", "三词短句 (3词/句)", "四词短句 (4词/句)", "双行大段 (约10字，智能折行)", "单字轰炸 (1字/句)"])
         self.chunk_mode.setStyleSheet("background-color: #313244; color: white; padding: 5px; border-radius: 4px;")
         chunk_row.addWidget(self.chunk_mode, stretch=1)
         self.chunk_mode.currentTextChanged.connect(self._on_chunk_mode_change)
@@ -1357,9 +1493,11 @@ class EditView(QWidget):
 
         # ================= 2. 中间面板 =================
         center_panel = QFrame(); center_panel.setStyleSheet("background-color: #090b12; border: none; border-radius: 0px;"); center_layout = QVBoxLayout(center_panel)
+        self.center_panel = center_panel
         center_layout.setContentsMargins(12, 8, 12, 8)
         center_layout.setSpacing(8)
         monitor_bar = QFrame()
+        self.monitor_bar = monitor_bar
         monitor_bar.setStyleSheet("QFrame { background-color: #171a23; border: 1px solid #2b3040; border-radius: 8px; } QLabel { border: none; }")
         monitor_bar_layout = QHBoxLayout(monitor_bar)
         monitor_bar_layout.setContentsMargins(10, 6, 10, 6)
@@ -1471,19 +1609,20 @@ class EditView(QWidget):
         self.music_player.mediaStatusChanged.connect(self._on_music_media_status_changed)
         
         self.browser = QWebEngineView(); self.browser.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
-        self.browser.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground); self.browser.page().setBackgroundColor(Qt.GlobalColor.transparent)
+        self._force_preview_web_transparency()
         self.browser.setAcceptDrops(False)
         self.video_label.setAcceptDrops(False)
         
         self.bridge = WebBridge(self); self.channel = QWebChannel(); self.channel.registerObject("backend", self.bridge); self.browser.page().setWebChannel(self.channel)
         
-        grid.addWidget(self.video_label, 0, 0); grid.addWidget(self.browser, 0, 0); self.browser.raise_()
+        grid.addWidget(self.video_label, 0, 0); grid.addWidget(self.browser, 0, 0); self.browser.hide(); self.video_label.raise_()
         self.preview_workspace = PreviewWorkspace(stack_widget, self)
         self.aspect_container = self.preview_workspace
         center_layout.addWidget(self.preview_workspace, stretch=1)
         self.canvas_context_toolbar.raise_()
 
         controls_panel = QFrame()
+        self.preview_controls_panel = controls_panel
         controls_panel.setStyleSheet("QFrame { background-color: #171a23; border: 1px solid #2b3040; border-radius: 8px; }")
         controls_layout = QVBoxLayout(controls_panel)
         controls_layout.setContentsMargins(8, 6, 8, 6)
@@ -1552,7 +1691,7 @@ class EditView(QWidget):
         view_row.addWidget(self.lbl_preview_zoom)
         self.btn_preview_zoom_in = QPushButton("+"); self.btn_preview_zoom_in.setFixedSize(28, 26); self.btn_preview_zoom_in.setToolTip("放大监看预览 Ctrl++"); self.btn_preview_zoom_in.setStyleSheet("background-color: #313244; color: #cdd6f4; font-weight: bold; border-radius: 5px;"); self.btn_preview_zoom_in.clicked.connect(lambda: self.adjust_preview_zoom(1)); view_row.addWidget(self.btn_preview_zoom_in)
         self.btn_preview_reset = QPushButton("100"); self.btn_preview_reset.setFixedSize(38, 26); self.btn_preview_reset.setToolTip("重置监看视窗 Ctrl+0"); self.btn_preview_reset.setStyleSheet("background-color: #313244; color: #a6e3a1; font-family: Consolas; font-weight: bold; border-radius: 5px;"); self.btn_preview_reset.clicked.connect(self.reset_preview_view); view_row.addWidget(self.btn_preview_reset)
-        self.btn_preview_fullscreen = QPushButton("⛶"); self.btn_preview_fullscreen.setFixedSize(32, 26); self.btn_preview_fullscreen.setToolTip("全屏观看预览 Ctrl+F / Esc 退出"); self.btn_preview_fullscreen.setStyleSheet("background-color: #313244; color: #f9e2af; font-weight: bold; border-radius: 5px;"); self.btn_preview_fullscreen.clicked.connect(self.toggle_preview_fullscreen); view_row.addWidget(self.btn_preview_fullscreen)
+        self.btn_preview_fullscreen = QPushButton("全屏"); self.btn_preview_fullscreen.setFixedSize(52, 26); self.btn_preview_fullscreen.setToolTip(f"全屏观看预览 {self.preview_fullscreen_shortcut_text} / Esc 退出"); self.btn_preview_fullscreen.setStyleSheet("background-color: #313244; color: #f9e2af; font-weight: bold; border-radius: 5px;"); self.btn_preview_fullscreen.clicked.connect(self.toggle_preview_fullscreen); view_row.addWidget(self.btn_preview_fullscreen)
         view_row.addStretch()
         controls_layout.addLayout(view_row)
         center_layout.addWidget(controls_panel)
@@ -1875,6 +2014,11 @@ class EditView(QWidget):
         hl_row = QHBoxLayout()
         self.chk_use_hl = QCheckBox("🌟 启用高亮"); self.chk_use_hl.setChecked(True); self.chk_use_hl.stateChanged.connect(self._on_style_change); hl_row.addWidget(self.chk_use_hl)
         self.chk_hl_glow = QCheckBox("✨ 加光特效"); self.chk_hl_glow.setChecked(False); self.chk_hl_glow.stateChanged.connect(self._on_style_change); hl_row.addWidget(self.chk_hl_glow); fx_layout.addLayout(hl_row)
+        self.hl_style_combo = QComboBox()
+        self.hl_style_combo.addItems(["高亮样式: 纯字变色", "高亮样式: 文字红框", "高亮样式: 背景色块", "高亮样式: 下划线", "高亮样式: 发光描边", "高亮样式: 胶囊描边", "高亮样式: Canva 行框"])
+        self.hl_style_combo.setStyleSheet("background-color: #313244; padding: 5px; font-weight: bold;")
+        self.hl_style_combo.currentTextChanged.connect(self._on_style_change)
+        fx_layout.addWidget(self.hl_style_combo)
         self.glow_size_slider, self.glow_size_spin = create_slider_spinbox(fx_layout, "发光强度:", 0, 100, 20, self._on_style_change)
         self.text_texture_combo = QComboBox(); self.text_texture_combo.addItems(["字体质感: 无", "字体质感: Grain 轻微颗粒", "字体质感: Noise 噪点", "字体质感: Roughen 粗糙边", "字体质感: Distress texture 破碎磨损", "字体质感: 叠加 Grain+Noise+Roughen+Distress"]); self.text_texture_combo.setStyleSheet("background-color: #313244; padding: 5px;"); self.text_texture_combo.currentTextChanged.connect(self._on_style_change); fx_layout.addWidget(self.text_texture_combo)
         color_row = QHBoxLayout(); self.btn_color_txt = QPushButton("🤍 正文色"); self.btn_color_txt.setStyleSheet("background-color: #313244; padding: 5px;"); self.btn_color_txt.clicked.connect(lambda: self._pick_color("txt")); self.btn_color_hl = QPushButton("💛 高亮文字色"); self.btn_color_hl.setStyleSheet("background-color: #313244; padding: 5px;"); self.btn_color_hl.clicked.connect(lambda: self._pick_color("hl")); color_row.addWidget(self.btn_color_txt); color_row.addWidget(self.btn_color_hl); fx_layout.addLayout(color_row)
@@ -1897,13 +2041,18 @@ class EditView(QWidget):
         page_bg_layout.addWidget(sec_shadow)
         sec_bg, bg_layout = create_section_frame("🔲 底框与贴纸 (Background)", "#f9e2af")
         self.bg_mode_combo = QComboBox()
-        self.bg_mode_combo.addItems(["🚫 无底框 (纯白字默认)", "🟥 逐字单点底盒 (Tape)", "🌊 KTV渐变底盒 (Sweep)", "🔲 全局大底框 (Block)", "🧱 全部框架 (Full Frame)", "🌙 圣洁柔光电影玻璃框 (Cinematic Glass)"])
+        self.bg_mode_combo.addItems(["🚫 无底框 (纯白字默认)", "🟥 逐字单点底盒 (Tape)", "Canva 贴合文字背景 (Fit)", "🌊 KTV渐变底盒 (Sweep)", "🔲 全局大底框 (Block)", "🧱 全部框架 (Full Frame)", "🌙 圣洁柔光电影玻璃框 (Cinematic Glass)"])
         self.bg_mode_combo.setStyleSheet("background-color: #313244; padding: 5px; font-weight: bold;")
         self.bg_mode_combo.currentTextChanged.connect(self._on_style_change)
         bg_layout.addWidget(self.bg_mode_combo)
         bg_color_row = QHBoxLayout(); self.btn_color_bg = QPushButton("⬛ 底层胶带色"); self.btn_color_bg.setStyleSheet("background-color: #313244; padding: 5px;"); self.btn_color_bg.clicked.connect(lambda: self._pick_color("bg")); self.btn_color_hl_bg = QPushButton("🟥 单词高亮底盒色"); self.btn_color_hl_bg.setStyleSheet("background-color: #313244; padding: 5px;"); self.btn_color_hl_bg.clicked.connect(lambda: self._pick_color("hl_bg")); bg_color_row.addWidget(self.btn_color_bg); bg_color_row.addWidget(self.btn_color_hl_bg); bg_layout.addLayout(bg_color_row)
         self.alpha_slider, self.alpha_spin = create_slider_spinbox(bg_layout, "透明度 %:", 0, 100, 80, self._on_style_change)
         self.radius_slider, self.radius_spin = create_slider_spinbox(bg_layout, "圆角:", 0, 100, 15, self._on_style_change)
+        self.chk_bg_auto_resolution = QCheckBox("自动按画布分辨率缩放背景")
+        self.chk_bg_auto_resolution.setChecked(True)
+        self.chk_bg_auto_resolution.setStyleSheet("color:#a6e3a1; font-weight:700; padding:4px 0;")
+        self.chk_bg_auto_resolution.stateChanged.connect(self._on_style_change)
+        bg_layout.addWidget(self.chk_bg_auto_resolution)
         self.padding_slider, self.padding_spin = create_slider_spinbox(bg_layout, "扩展边缘:", 0, 100, 20, self._on_style_change)
         self.bg_pad_left_slider, self.bg_pad_left_spin = create_slider_spinbox(bg_layout, "左扩展:", 0, 120, 20, self._on_style_change)
         self.bg_pad_right_slider, self.bg_pad_right_spin = create_slider_spinbox(bg_layout, "右扩展:", 0, 120, 20, self._on_style_change)
@@ -2097,7 +2246,9 @@ class EditView(QWidget):
                 btn.setChecked(True)
             return btn
 
-        self.btn_side_edit_workspace = make_side_nav("⌂\n精修", "字幕、素材与导入", lambda: self.request_parent_workspace("edit"), active=True)
+        self.btn_side_edit_workspace = make_side_nav("⌂\n精修", "字幕精修与剪辑", lambda: self.set_workspace_mode("edit"), active=True)
+        self.btn_side_media_pool = make_side_nav("▦\n素材", "打开素材池", self.focus_media_pool)
+        self.btn_side_design = make_side_nav("◇\n设计", "打开设计组件", self.focus_design_panel)
         side_rail_layout.addStretch()
         make_side_nav("⚙\n设置", "前往设置界面", lambda: self.parent_window().switch_room(4) if self.parent_window() and hasattr(self.parent_window(), "switch_room") else self.manual_save())
 
@@ -2149,6 +2300,7 @@ class EditView(QWidget):
         self.set_workspace_mode(self.workspace_mode, initial=True)
         QTimer.singleShot(300, self.update_floating_subtitle)
         QTimer.singleShot(500, self.auto_fit_editor_layout)
+        QTimer.singleShot(680, self.refresh_media_pool)
 
         QTimer.singleShot(1000, self.check_and_download_ffmpeg)
 
@@ -2390,7 +2542,11 @@ class EditView(QWidget):
 
     def request_parent_workspace(self, workspace_key):
         if workspace_key == "design":
-            workspace_key = "edit"
+            self.focus_design_panel()
+            return
+        if workspace_key in ("media", "素材"):
+            self.focus_media_pool()
+            return
         parent = self.parent_window()
         if parent and hasattr(parent, "switch_room"):
             parent.switch_room(1, workspace_key=workspace_key)
@@ -2398,6 +2554,13 @@ class EditView(QWidget):
             self.set_workspace_mode(workspace_key)
 
     def set_workspace_mode(self, mode="edit", initial=False):
+        requested_mode = str(mode or "edit").lower()
+        if requested_mode == "design":
+            self.focus_design_panel()
+            return
+        if requested_mode in ("media", "素材"):
+            self.focus_media_pool()
+            return
         mode = "edit"
         self.workspace_mode = mode
         parent = self.parent_window()
@@ -2407,6 +2570,10 @@ class EditView(QWidget):
                 parent._update_nav_selection()
         if hasattr(self, "design_box"):
             self.design_box.setVisible(False)
+        if hasattr(self, "left_page_stack"):
+            self.left_page_stack.setCurrentIndex(0)
+            if hasattr(self, "left_content_panel") and self.left_content_panel.verticalScrollBar():
+                self.left_content_panel.verticalScrollBar().setValue(0)
         if hasattr(self, "lbl_side_panel_title"):
             self.lbl_side_panel_title.setText("精修")
         if hasattr(self, "side_search"):
@@ -2415,11 +2582,7 @@ class EditView(QWidget):
             self.lbl_monitor_title.setText("PROGRAM MONITOR")
         if hasattr(self, "lbl_timeline_title"):
             self.lbl_timeline_title.setText("TIMELINE")
-        btn = getattr(self, "btn_side_edit_workspace", None)
-        if btn is not None:
-            btn.blockSignals(True)
-            btn.setChecked(True)
-            btn.blockSignals(False)
+        self._set_side_nav_active(getattr(self, "btn_side_edit_workspace", None))
         if not initial:
             if self.selected_track == "design":
                 self.switch_inspector("empty")
@@ -2428,6 +2591,47 @@ class EditView(QWidget):
         if hasattr(self, "timeline_widget"):
             self.timeline_widget.sync_from_controller()
         self._update_workspace_status()
+
+    def _set_side_nav_active(self, active_button):
+        for btn in getattr(self, "side_nav_buttons", []) or []:
+            btn.blockSignals(True)
+            btn.setChecked(btn is active_button)
+            btn.blockSignals(False)
+
+    def focus_media_pool(self):
+        self._set_side_nav_active(getattr(self, "btn_side_media_pool", None))
+        if hasattr(self, "left_content_panel"):
+            self.set_left_sidebar_visible(True)
+        if hasattr(self, "left_page_stack"):
+            self.left_page_stack.setCurrentIndex(1)
+            if hasattr(self, "left_content_panel") and self.left_content_panel.verticalScrollBar():
+                self.left_content_panel.verticalScrollBar().setValue(0)
+        if hasattr(self, "lbl_side_panel_title"):
+            self.lbl_side_panel_title.setText("素材")
+        if hasattr(self, "media_pool_panel"):
+            self.media_pool_panel.setVisible(True)
+            self.media_pool_panel.set_highlighted(True)
+            self.refresh_media_pool()
+            QTimer.singleShot(900, lambda: self.media_pool_panel.set_highlighted(False) if hasattr(self, "media_pool_panel") else None)
+        if hasattr(self, "status_lbl"):
+            self.status_lbl.setText("素材池已打开：可导入、选择素材，或拖到时间线。")
+
+    def focus_design_panel(self):
+        self._set_side_nav_active(getattr(self, "btn_side_design", None))
+        if hasattr(self, "left_content_panel"):
+            self.set_left_sidebar_visible(True)
+        if hasattr(self, "left_page_stack"):
+            self.left_page_stack.setCurrentIndex(2)
+            if hasattr(self, "left_content_panel") and self.left_content_panel.verticalScrollBar():
+                self.left_content_panel.verticalScrollBar().setValue(0)
+        if hasattr(self, "lbl_side_panel_title"):
+            self.lbl_side_panel_title.setText("设计")
+        if hasattr(self, "design_box"):
+            self.design_box.setVisible(True)
+        if hasattr(self, "sync_design_panel_controls"):
+            self.sync_design_panel_controls()
+        if hasattr(self, "status_lbl"):
+            self.status_lbl.setText("设计组件已打开：可添加文字、色块、图片组件。")
 
     def set_edit_mode(self, enabled=True):
         self.edit_mode = True
@@ -2488,6 +2692,94 @@ class EditView(QWidget):
         if file_path:
             self.add_media_from_path(file_path)
 
+    def add_media_paths_to_timeline(self, file_paths, start_t=None):
+        paths = [path for path in file_paths or [] if path and self._supported_media_path(path)]
+        if not paths:
+            if hasattr(self, "status_lbl"):
+                self.status_lbl.setText("⚠️ 没有可导入的素材。")
+            return False
+
+        cursor = max(0.0, float(start_t if start_t is not None else self.current_play_time or 0.0))
+        added_video = 0
+        added_audio = 0
+        for path in paths:
+            media_type = self._supported_media_path(path)
+            if media_type == "video":
+                before = len(self.state.get("video_clips", []) or [])
+                if self.add_video_clip_from_path(path, start_t=cursor):
+                    clips = self.state.get("video_clips", []) or []
+                    new_clip = self.state["video_clips"][self.current_v_idx] if 0 <= self.current_v_idx < len(clips) else None
+                    if new_clip:
+                        cursor = max(cursor, float(new_clip.get("end", cursor) or cursor))
+                    elif len(clips) > before:
+                        cursor = max(cursor, float(clips[-1].get("end", cursor) or cursor))
+                    added_video += 1
+            elif media_type == "audio" and added_audio == 0:
+                if self.set_audio_path_from_file(path):
+                    added_audio += 1
+
+        if added_video or added_audio:
+            if hasattr(self, "status_lbl"):
+                parts = []
+                if added_video:
+                    parts.append(f"{added_video} 段画面已顺序入线")
+                if added_audio:
+                    parts.append("配音已导入")
+                self.status_lbl.setText("；".join(parts) + "。")
+            return True
+        return False
+
+    def pick_assembly_media_dialog(self):
+        if not self._ensure_edit_mode("多素材组接"):
+            return
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择要组接的视频素材",
+            "",
+            "Video Files (*.mp4 *.mov *.webm *.mkv *.avi)"
+        )
+        if not file_paths:
+            return
+        self.assembly_media_paths = [
+            path for path in file_paths
+            if path and os.path.exists(path) and self._supported_media_path(path) == "video"
+        ]
+        self.refresh_assembly_media_list()
+        if hasattr(self, "status_lbl"):
+            self.status_lbl.setText(f"已选择 {len(self.assembly_media_paths)} 段素材，点击“一键组接”放入时间线。")
+
+    def clear_assembly_media(self):
+        self.assembly_media_paths = []
+        self.refresh_assembly_media_list()
+        if hasattr(self, "status_lbl"):
+            self.status_lbl.setText("组接素材已清空。")
+
+    def refresh_assembly_media_list(self):
+        if not hasattr(self, "assembly_list"):
+            return
+        self.assembly_list.clear()
+        for idx, path in enumerate(getattr(self, "assembly_media_paths", []) or []):
+            self.assembly_list.addItem(QListWidgetItem(f"{idx + 1}. {os.path.basename(path)}"))
+        if not self.assembly_media_paths:
+            self.assembly_list.addItem(QListWidgetItem("暂无组接素材，点击“选择素材”"))
+        if hasattr(self, "assembly_count_label"):
+            self.assembly_count_label.setText(f"{len(self.assembly_media_paths)} 段")
+
+    def assemble_selected_media_to_timeline(self):
+        paths = [
+            path for path in getattr(self, "assembly_media_paths", []) or []
+            if path and os.path.exists(path) and self._supported_media_path(path) == "video"
+        ]
+        if not paths:
+            return QMessageBox.information(self, "没有组接素材", "请先在组接面板里选择几个视频素材。")
+        start_t = self.current_play_time if self.edit_mode else None
+        if self.add_media_paths_to_timeline(paths, start_t=start_t):
+            if hasattr(self, "status_lbl"):
+                self.status_lbl.setText(f"已组接 {len(paths)} 段画面素材。")
+            self.focus_media_pool()
+            return True
+        return False
+
     def dragEnterEvent(self, event):
         if not self.edit_mode:
             event.ignore()
@@ -2521,6 +2813,83 @@ class EditView(QWidget):
         if hasattr(self, "status_lbl"):
             self.status_lbl.setText("⚠️ 暂不支持这个素材格式。")
         return False
+
+    def add_media_from_path_at_time(self, file_path, time_sec):
+        media_type = self._supported_media_path(file_path)
+        drop_time = max(0.0, float(time_sec or 0.0))
+        if media_type == "video":
+            return self.add_video_clip_from_path(file_path, start_t=drop_time)
+        if media_type == "audio":
+            if self.set_audio_path_from_file(file_path, record_history=False):
+                a_dur = get_exact_duration(self.state.get("audio_path", ""))
+                if a_dur > 0:
+                    self.state["a_trim"] = [drop_time, drop_time + a_dur]
+                    self._recalc_duration()
+                    self.update_timeline_size()
+                    self.auto_save_cache()
+                    self.push_history()
+                return True
+        if hasattr(self, "status_lbl"):
+            self.status_lbl.setText("⚠️ 暂不支持拖入这个素材格式。")
+        return False
+
+    def refresh_media_pool(self):
+        if not hasattr(self, "media_pool_panel"):
+            return
+        items = []
+
+        for idx, clip in enumerate(self.state.get("video_clips", []) or []):
+            path = clip.get("path", "")
+            name = os.path.basename(path) or f"视频 {idx + 1}"
+            start = self._format_monitor_time(clip.get("start", 0.0)) if hasattr(self, "_format_monitor_time") else f"{float(clip.get('start', 0.0) or 0.0):.1f}s"
+            end = self._format_monitor_time(clip.get("end", 0.0)) if hasattr(self, "_format_monitor_time") else f"{float(clip.get('end', 0.0) or 0.0):.1f}s"
+            items.append((f"V{idx + 1}  {name}  {start}-{end}", {"type": "video", "path": path, "index": idx}))
+        if self.state.get("audio_path"):
+            items.append((f"A1  {os.path.basename(self.state.get('audio_path'))}", {"type": "audio", "path": self.state.get("audio_path"), "index": 0}))
+        if self.state.get("music_path"):
+            items.append((f"M1  {os.path.basename(self.state.get('music_path'))}", {"type": "music", "path": self.state.get("music_path"), "index": 0}))
+        self.media_pool_panel.set_items(items)
+
+    def add_selected_media_pool_item_to_timeline(self):
+        if not hasattr(self, "media_pool_panel"):
+            return False
+        payload = self.media_pool_panel.current_payload()
+        if not isinstance(payload, dict) or payload.get("type") == "empty":
+            self.import_media_dialog()
+            return False
+        path = payload.get("path", "")
+        media_type = payload.get("type", "")
+        if media_type == "video" and path:
+            return self.add_video_clip_from_path(path, start_t=self.current_play_time)
+        if media_type == "audio" and path:
+            return self.set_audio_path_from_file(path)
+        if media_type == "music" and path:
+            return self.set_music_path_from_file(path)
+        return False
+
+    def select_media_pool_payload(self, payload):
+        if not isinstance(payload, dict) or payload.get("type") == "empty":
+            return
+        media_type = payload.get("type")
+        idx = int(payload.get("index", 0) or 0)
+        if media_type == "video":
+            clips = self.state.get("video_clips", []) or []
+            if 0 <= idx < len(clips):
+                self.current_v_idx = idx
+                self.current_selected_idx = -1
+                self.selected_track = "video"
+                self.switch_inspector("video")
+                self.sync_player_to_time(float(clips[idx].get("start", 0.0) or 0.0))
+        elif media_type == "audio":
+            self.current_selected_idx = -1
+            self.selected_track = "audio"
+            self.switch_inspector("audio")
+        elif media_type == "music":
+            self.current_selected_idx = -1
+            self.selected_track = "music"
+            if hasattr(self, "timeline_widget"):
+                self.timeline_widget.sync_from_controller()
+            self._update_workspace_status()
 
     def _find_subtitle_at_time(self, time_sec):
         for i, s in enumerate(self.state.get("subs_data", [])):
@@ -2637,6 +3006,7 @@ class EditView(QWidget):
         self.switch_inspector("video")
         self._recalc_duration()
         self.auto_save_cache()
+        self.push_history()
         self.status_lbl.setText("✂️ 视频片段已在播放头切分。")
         return True
 
@@ -2648,6 +3018,7 @@ class EditView(QWidget):
             clip["transition"] = {"type": "fade", "duration": 0.35}
             self.timeline_widget.sync_from_controller()
             self.auto_save_cache()
+            self.push_history()
             self.status_lbl.setText("✨ 已给当前视频片段标记 0.35s 淡化转场。")
             return
         if self.selected_track == "sub" and 0 <= self.current_selected_idx < len(self.state.get("subs_data", [])):
@@ -2657,6 +3028,7 @@ class EditView(QWidget):
             self.update_floating_subtitle()
             self.timeline_widget.sync_from_controller()
             self.auto_save_cache()
+            self.push_history()
             self.status_lbl.setText("✨ 已给当前字幕设置柔和淡入。")
             return
         self.status_lbl.setText("⚠️ 请先选中视频或字幕片段，再添加转场。")
@@ -2703,7 +3075,9 @@ class EditView(QWidget):
             "inactive_alpha": 0,
             "font_motion": "typewriter_left",
             "hl_motion": "stable",
-            "use_hl": False,
+            "use_hl": True,
+            "hl_style": "canva_frame",
+            "color_hl": "#FF3B30",
         }
         for clip in target_clips:
             clip["pos_x"] = 0.0
@@ -2715,7 +3089,7 @@ class EditView(QWidget):
             self.state["default_pos_y"] = -23.0
             self.default_style.update(reference_layout)
 
-        smart_chunk_mode = "智能听译 (4-6词，适配双行按词)"
+        smart_chunk_mode = "智能听译 (4-7词，适配双行按词)"
         self.state["chunk_mode"] = smart_chunk_mode
         if hasattr(self, "chunk_mode"):
             self.chunk_mode.blockSignals(True)
@@ -2743,6 +3117,119 @@ class EditView(QWidget):
             self.delete_current_clip()
         elif self.state.get("video_clips"):
             self.remove_last_video_clip()
+
+    def delete_timeline_selection(self, show_message=True):
+        if not self._ensure_edit_mode("删除时间线片段"):
+            return False
+        selected = set(getattr(getattr(self, "timeline_widget", None), "selected_items", set()) or set())
+        if not selected:
+            before = copy.deepcopy(self._make_history_snapshot())
+            self.delete_context_selection()
+            return before != self._make_history_snapshot()
+
+        parsed = []
+        for key in selected:
+            try:
+                clip_type, idx_text = str(key).split(":", 1)
+                parsed.append((clip_type, int(idx_text)))
+            except Exception:
+                continue
+        if not parsed:
+            return False
+
+        changed = False
+        video_indices = sorted({idx for clip_type, idx in parsed if clip_type == "video"}, reverse=True)
+        sub_indices = sorted({idx for clip_type, idx in parsed if clip_type == "sub"}, reverse=True)
+        design_indices = sorted({idx for clip_type, idx in parsed if clip_type == "design"}, reverse=True)
+
+        clips = self.state.get("video_clips", []) or []
+        for idx in video_indices:
+            if 0 <= idx < len(clips):
+                clips.pop(idx)
+                changed = True
+        if video_indices:
+            self.state["video_clips"] = clips
+            self.current_v_idx = min(max(0, self.current_v_idx), len(clips) - 1) if clips else -1
+            if not clips:
+                self.v_wave_pixmap = None
+                self.video_thumbs = []
+                self.last_video_image = None
+                if hasattr(self, "btn_v"):
+                    self.btn_v.setText("➕ 导入第一段画面 (MP4)")
+                try:
+                    self.player.stop()
+                    self.player.setSource(QUrl())
+                except Exception:
+                    pass
+
+        subs = self.state.get("subs_data", []) or []
+        for idx in sub_indices:
+            if 0 <= idx < len(subs):
+                subs.pop(idx)
+                changed = True
+        if sub_indices:
+            self.state["subs_data"] = subs
+            self.current_selected_idx = -1
+
+        if any(clip_type == "audio" for clip_type, _ in parsed) and self.state.get("audio_path"):
+            self.state["audio_path"] = ""
+            self.a_wave_pixmap = None
+            try:
+                self.audio_player.stop()
+                self.audio_player.setSource(QUrl())
+            except Exception:
+                pass
+            if hasattr(self, "btn_a"):
+                self.btn_a.setText("🎵 导入独立配音 (可选)")
+            changed = True
+
+        if any(clip_type == "music" for clip_type, _ in parsed) and self.state.get("music_path"):
+            self.state["music_path"] = ""
+            self.state.pop("music_dur", None)
+            self.state.pop("music_match_duration", None)
+            self.state.pop("music_loop", None)
+            try:
+                self.music_player.stop()
+                self.music_player.setSource(QUrl())
+            except Exception:
+                pass
+            if hasattr(self, "btn_music"):
+                self.btn_music.setText("🎼 导入配乐 (可选)")
+            changed = True
+
+        if design_indices:
+            state = self._current_design_state()
+            page = self._design_page(state)
+            layers = page.get("layers", []) or []
+            delete_ids = {
+                layers[idx].get("id", "")
+                for idx in design_indices
+                if 0 <= idx < len(layers)
+            }
+            if delete_ids:
+                page["layers"] = [layer for layer in layers if layer.get("id", "") not in delete_ids]
+                self.selected_design_layer_id = page["layers"][-1].get("id", "") if page["layers"] else ""
+                self._commit_design_state(state, sync_controls=True, sync_timeline=False)
+                changed = True
+
+        if not changed:
+            return False
+        if hasattr(self, "timeline_widget"):
+            self.timeline_widget.selected_items.clear()
+        self._recalc_duration()
+        self.render_ui_list()
+        self.update_timeline_size()
+        self.update_floating_subtitle()
+        self.refresh_media_pool()
+        self.auto_save_cache()
+        self.push_history()
+        if hasattr(self, "timeline_widget"):
+            self.timeline_widget.sync_from_controller()
+        if hasattr(self, "status_lbl"):
+            self.status_lbl.setText("🗑️ 已删除选中的时间线片段。")
+        if show_message:
+            QMessageBox.information(self, "已删除", "选中的时间线片段已删除。")
+        return True
 
     def open_effects_dialog(self, target="caption"):
         title_map = {
@@ -2802,6 +3289,7 @@ class EditView(QWidget):
         self._theme_colors = colors
         self._theme_key = theme_key or ""
         apply_tinted_styles(self, colors)
+        apply_room_theme_bridge(self, colors)
         if hasattr(self, "tl_header"):
             self.tl_header.update()
         if hasattr(self, "timeline_widget"):
@@ -2891,6 +3379,129 @@ class EditView(QWidget):
             QTimer.singleShot(0, self._sync_preview_overlay_transform)
 
     # 👑 时光机核心引擎
+    def _history_design_state(self):
+        try:
+            project_data = self._design_project_data()
+            room_state = project_data.get("room_state", {}) if isinstance(project_data, dict) else {}
+            return copy.deepcopy(room_state.get("design_room", default_design_room_state()))
+        except Exception:
+            return default_design_room_state()
+
+    def _make_history_snapshot(self):
+        return {
+            "kind": "edit_snapshot_v2",
+            "state": copy.deepcopy(self.state),
+            "design_room": self._history_design_state(),
+            "selected_track": self.selected_track,
+            "current_selected_idx": self.current_selected_idx,
+            "current_v_idx": self.current_v_idx,
+            "selected_design_layer_id": self.selected_design_layer_id,
+            "current_play_time": self.current_play_time,
+        }
+
+    def _restore_design_state_from_history(self, design_state):
+        if not isinstance(design_state, dict):
+            return
+        design_state = normalize_design_room_state(design_state)
+        parent = self.parent_window()
+        project_data = self._design_project_data()
+        try:
+            project_data = update_room_state(project_data, "design_room", design_state)
+        except Exception:
+            project_data.setdefault("room_state", {})["design_room"] = copy.deepcopy(design_state)
+        self.project_data = project_data
+        if parent and hasattr(parent, "project"):
+            parent.project = project_data
+
+    def _apply_history_snapshot(self, snapshot):
+        if isinstance(snapshot, list):
+            self.state["subs_data"] = copy.deepcopy(snapshot)
+            return
+        if not isinstance(snapshot, dict):
+            return
+        if snapshot.get("kind") == "edit_snapshot_v2":
+            self.state = copy.deepcopy(snapshot.get("state", self.state))
+            self._restore_design_state_from_history(snapshot.get("design_room", {}))
+            self.selected_track = snapshot.get("selected_track", "empty")
+            self.current_selected_idx = int(snapshot.get("current_selected_idx", -1) or -1)
+            self.current_v_idx = int(snapshot.get("current_v_idx", 0) or 0)
+            self.selected_design_layer_id = snapshot.get("selected_design_layer_id", "")
+            self.current_play_time = float(snapshot.get("current_play_time", 0.0) or 0.0)
+
+    def _refresh_after_history_restore(self):
+        self.last_render_hash = None
+        clips = self.state.get("video_clips", []) or []
+        if clips:
+            self.current_v_idx = max(0, min(self.current_v_idx, len(clips) - 1))
+            if hasattr(self, "btn_v"):
+                self.btn_v.setText("✅ 已导原素材")
+            try:
+                clip = clips[self.current_v_idx]
+                self._queue_preview_proxy_for_clip(clip, announce=True)
+                self._prime_video_preview_source(clip, announce=True)
+            except Exception:
+                pass
+        else:
+            self.current_v_idx = -1
+            self.last_video_image = None
+            self.video_thumbs = []
+            self.v_wave_pixmap = None
+            if hasattr(self, "btn_v"):
+                self.btn_v.setText("➕ 导入第一段画面 (MP4)")
+            try:
+                self.player.stop()
+                self.player.setSource(QUrl())
+            except Exception:
+                pass
+        audio_path = self.state.get("audio_path", "")
+        if audio_path and os.path.exists(audio_path):
+            if hasattr(self, "btn_a"):
+                self.btn_a.setText("✅ " + os.path.basename(audio_path)[:15])
+            try:
+                self.audio_player.setSource(QUrl.fromLocalFile(audio_path))
+            except Exception:
+                pass
+        else:
+            self.state["audio_path"] = ""
+            self.a_wave_pixmap = None
+            if hasattr(self, "btn_a"):
+                self.btn_a.setText("🎵 导入独立配音 (可选)")
+            try:
+                self.audio_player.stop()
+                self.audio_player.setSource(QUrl())
+            except Exception:
+                pass
+        music_path = self.state.get("music_path", "")
+        if music_path and os.path.exists(music_path):
+            if hasattr(self, "btn_music"):
+                self.btn_music.setText("✅ " + os.path.basename(music_path)[:15])
+            try:
+                self.music_player.setSource(QUrl.fromLocalFile(music_path))
+                self.music_player.setLoops(QMediaPlayer.Loops.Infinite)
+            except Exception:
+                pass
+        else:
+            self.state["music_path"] = ""
+            if hasattr(self, "btn_music"):
+                self.btn_music.setText("🎼 导入配乐 (可选)")
+            try:
+                self.music_player.stop()
+                self.music_player.setSource(QUrl())
+            except Exception:
+                pass
+        if self.current_selected_idx >= len(self.state.get("subs_data", []) or []):
+            self.current_selected_idx = -1
+        self.render_ui_list()
+        if hasattr(self, "sync_design_panel_controls"):
+            self.sync_design_panel_controls()
+        self.update_timeline_size()
+        if hasattr(self, "timeline_widget"):
+            self.timeline_widget.sync_from_controller()
+        self.update_floating_subtitle()
+        self.refresh_media_pool()
+        self._update_workspace_status()
+        self.auto_save_cache()
+
     def push_history(self):
         if not hasattr(self, "history"):
             self.history = []
@@ -2899,7 +3510,7 @@ class EditView(QWidget):
         if self.history_ptr < len(self.history) - 1:
             self.history = self.history[:self.history_ptr + 1]
             
-        current_state = copy.deepcopy(self.state["subs_data"])
+        current_state = self._make_history_snapshot()
         
         if self.history and self.history[-1] == current_state:
             return
@@ -2914,21 +3525,15 @@ class EditView(QWidget):
     def undo(self):
         if getattr(self, "history_ptr", -1) > 0:
             self.history_ptr -= 1
-            self.state["subs_data"] = copy.deepcopy(self.history[self.history_ptr])
-            self.render_ui_list()
-            self.update_timeline_size()
-            self.update_floating_subtitle()
-            self.auto_save_cache()
+            self._apply_history_snapshot(self.history[self.history_ptr])
+            self._refresh_after_history_restore()
             self.status_lbl.setText("↩️ 已撤销操作")
 
     def redo(self):
         if hasattr(self, "history") and self.history_ptr < len(self.history) - 1:
             self.history_ptr += 1
-            self.state["subs_data"] = copy.deepcopy(self.history[self.history_ptr])
-            self.render_ui_list()
-            self.update_timeline_size()
-            self.update_floating_subtitle()
-            self.auto_save_cache()
+            self._apply_history_snapshot(self.history[self.history_ptr])
+            self._refresh_after_history_restore()
             self.status_lbl.setText("↪️ 已重做操作")
 
     def check_and_download_ffmpeg(self):
@@ -3100,8 +3705,8 @@ class EditView(QWidget):
         <head>
             <style>
                 __FONT_FACE_CSS__
-                html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; width: 100vw; height: 100vh; display: flex; justify-content: center; align-items: center; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; touch-action: none; }
-                #scale-wrapper { width: 100vw; height: 100vh; position: absolute; left: 0; top: 0; cursor: grab; will-change: transform; }
+                html, body { margin: 0; padding: 0; background: transparent !important; overflow: hidden; width: 100vw; height: 100vh; display: flex; justify-content: center; align-items: center; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; touch-action: none; }
+                #scale-wrapper { width: 100vw; height: 100vh; position: absolute; left: 0; top: 0; cursor: grab; will-change: transform; background: transparent !important; }
                 #scale-wrapper.panning { cursor: grabbing; }
                 #design-layer { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
                 #signature-layer { position: absolute; inset: 0; pointer-events: none; z-index: 90; }
@@ -3432,7 +4037,11 @@ class EditView(QWidget):
         </html>
         """
         html_content = html_content.replace("__FONT_FACE_CSS__", font_face_css())
+        self._force_preview_web_transparency()
         self.browser.setHtml(html_content)
+        QTimer.singleShot(0, self._force_preview_web_transparency)
+        QTimer.singleShot(0, lambda: self._set_preview_overlay_visible(getattr(self, "_preview_overlay_has_content", False)))
+        QTimer.singleShot(160, self._force_preview_web_transparency)
     # 👑 新增：实时将文案同步到内存，按 Ctrl+S 时就会一起写入工程文件
     def _on_custom_text_changed(self):
         self.state["custom_text"] = self.text_editor.toPlainText()
@@ -3455,15 +4064,17 @@ class EditView(QWidget):
         self.status_lbl.setText("🧹 文案清洗完毕！空格与大小写已修正。")    
 
     def load_style_presets(self):
-        if os.path.exists(PRESETS_FILE):
-            try:
-                with open(PRESETS_FILE, 'r', encoding='utf-8') as f: return json.load(f)
-            except: pass
-        return {}
+        presets = {}
+        loaded = read_json_file(PRESETS_FILE, default={})
+        if isinstance(loaded, dict):
+            presets = loaded
+        return merge_built_in_style_presets(presets)
 
     def save_style_presets(self, data):
         try:
-            with open(PRESETS_FILE, 'w', encoding='utf-8') as f: json.dump(data, f, ensure_ascii=False, indent=2)
+            built_ins = set(built_in_style_presets().keys())
+            user_data = {k: v for k, v in (data or {}).items() if k not in built_ins}
+            write_json_file(PRESETS_FILE, user_data, indent=2)
         except: pass
 
     def notify_batch_presets_changed(self, style_name=None, signature_name=None):
@@ -3503,22 +4114,16 @@ class EditView(QWidget):
 
     def load_signature_presets(self):
         presets = self._built_in_signature_presets()
-        if os.path.exists(SIGNATURE_PRESETS_FILE):
-            try:
-                with open(SIGNATURE_PRESETS_FILE, "r", encoding="utf-8") as f:
-                    saved = json.load(f)
-                if isinstance(saved, dict):
-                    presets.update(saved)
-            except Exception:
-                pass
+        saved = read_json_file(SIGNATURE_PRESETS_FILE, default={})
+        if isinstance(saved, dict):
+            presets.update(saved)
         return presets
 
     def save_signature_presets(self, data):
         try:
             built_ins = set(self._built_in_signature_presets().keys())
             user_data = {k: v for k, v in data.items() if k not in built_ins}
-            with open(SIGNATURE_PRESETS_FILE, "w", encoding="utf-8") as f:
-                json.dump(user_data, f, ensure_ascii=False, indent=2)
+            write_json_file(SIGNATURE_PRESETS_FILE, user_data, indent=2)
         except Exception:
             pass
 
@@ -3764,7 +4369,7 @@ class EditView(QWidget):
                 "pos_x": 0.0,
                 "pos_y": 25.0,
             }
-            rendered = render_subtitle_html(preview_sub, 1.05, 1080)
+            rendered = render_subtitle_html(preview_sub, 1.05, self.proj_width, self.proj_height)
             preview_html = f"""
 <!doctype html>
 <html>
@@ -3864,7 +4469,60 @@ body {{
         current_index = next((i for i, path in enumerate(paths) if os.path.normcase(path) == normalized_current), -1)
         return paths, current_index
 
+    def _release_media_before_project_switch(self):
+        if hasattr(self, "play_timer"):
+            self.play_timer.stop()
+        self.is_playing = False
+        if hasattr(self, "btn_play"):
+            self.btn_play.setText("▶ 播放")
+        for player in (getattr(self, "player", None), getattr(self, "audio_player", None), getattr(self, "music_player", None)):
+            if player is None:
+                continue
+            try:
+                player.stop()
+                player.setSource(QUrl())
+            except Exception:
+                pass
+        self.last_video_image = None
+        self._preview_scaled_pixmap_key = None
+        self._preview_scaled_pixmap = None
+        self._preview_frame_retry_pending = False
+        self._preview_frame_retry_count = 0
+        self.v_wave_pixmap = None
+        self.a_wave_pixmap = None
+        self.video_thumbs = []
+        if hasattr(self, "video_label"):
+            self.video_label.clear()
+            self.video_label.setText("切换中...")
+        if hasattr(self, "browser"):
+            self.browser.page().runJavaScript("if(typeof syncSubs === 'function') syncSubs('[]');")
+
+    def _finish_switch_sibling_project(self, next_path, next_index, total_count):
+        try:
+            next_project = load_project(next_path)
+            self.project_data = next_project
+            parent = self.parent_window()
+            if parent and hasattr(parent, "project"):
+                parent.project = next_project
+                if hasattr(parent, "reload_rooms_from_project"):
+                    parent.reload_rooms_from_project()
+                elif hasattr(parent, "refresh_room_links"):
+                    parent.refresh_room_links()
+            else:
+                self.load_project_on_boot()
+            self.status_lbl.setText(f"已切换到 {next_index + 1}/{total_count}：{os.path.basename(next_path)}")
+        except Exception as e:
+            QMessageBox.warning(self, "切换失败", f"无法切换工程：\n{next_path}\n\n原因：{e}")
+        finally:
+            self._switching_sibling_project = False
+            for btn_name in ("btn_prev_project", "btn_next_project"):
+                btn = getattr(self, btn_name, None)
+                if btn is not None:
+                    btn.setEnabled(True)
+
     def switch_sibling_project(self, direction):
+        if getattr(self, "_switching_sibling_project", False):
+            return
         paths, current_index = self._sibling_project_paths()
         if not paths:
             QMessageBox.information(self, "没有可切换工程", "当前工程文件夹里没有找到 .scomp 工程文件。")
@@ -3879,30 +4537,23 @@ body {{
         next_index = (current_index + int(direction)) % len(paths)
         next_path = paths[next_index]
         try:
+            self._switching_sibling_project = True
+            for btn_name in ("btn_prev_project", "btn_next_project"):
+                btn = getattr(self, btn_name, None)
+                if btn is not None:
+                    btn.setEnabled(False)
             current_project = self.save_to_project(silent=True)
             if current_project.get("project_path"):
                 save_project(current_project["project_path"], current_project)
-            self.player.pause()
-            self.audio_player.pause()
-            if hasattr(self, "play_timer"):
-                self.play_timer.stop()
-            self.is_playing = False
-            if hasattr(self, "btn_play"):
-                self.btn_play.setText("▶ 播放")
-
-            next_project = load_project(next_path)
-            self.project_data = next_project
-            parent = self.parent_window()
-            if parent and hasattr(parent, "project"):
-                parent.project = next_project
-                if hasattr(parent, "reload_rooms_from_project"):
-                    parent.reload_rooms_from_project()
-                elif hasattr(parent, "refresh_room_links"):
-                    parent.refresh_room_links()
-            else:
-                self.load_project_on_boot()
-            self.status_lbl.setText(f"已切换到 {next_index + 1}/{len(paths)}：{os.path.basename(next_path)}")
+            self._release_media_before_project_switch()
+            self.status_lbl.setText("正在切换视频，释放旧预览...")
+            QTimer.singleShot(120, lambda: self._finish_switch_sibling_project(next_path, next_index, len(paths)))
         except Exception as e:
+            self._switching_sibling_project = False
+            for btn_name in ("btn_prev_project", "btn_next_project"):
+                btn = getattr(self, btn_name, None)
+                if btn is not None:
+                    btn.setEnabled(True)
             QMessageBox.warning(self, "切换失败", f"无法切换工程：\n{next_path}\n\n原因：{e}")
 
     def is_cloud_project_active(self):
@@ -4029,19 +4680,19 @@ body {{
         return f"{minutes:02d}:{secs:04.1f}"
 
     def _update_time_label(self):
+        duration = self._preview_playback_duration()
         if hasattr(self, "lbl_time"):
             self.lbl_time.setText(
-                f"{self._format_monitor_time(self.current_play_time)} / {self._format_monitor_time(self.state.get('duration', 0.0))}"
+                f"{self._format_monitor_time(self.current_play_time)} / {self._format_monitor_time(duration)}"
             )
         if hasattr(self, "preview_seek_slider") and not self.preview_seek_slider.isSliderDown():
-            duration = max(0.001, float(self.state.get("duration", 0.0) or 0.0))
             value = int(max(0.0, min(1.0, self.current_play_time / duration)) * self.preview_seek_slider.maximum())
             self.preview_seek_slider.blockSignals(True)
             self.preview_seek_slider.setValue(value)
             self.preview_seek_slider.blockSignals(False)
 
     def _preview_slider_time(self, value):
-        duration = max(0.0, float(self.state.get("duration", 0.0) or 0.0))
+        duration = self._preview_playback_duration()
         if duration <= 0:
             return 0.0
         maximum = max(1, self.preview_seek_slider.maximum() if hasattr(self, "preview_seek_slider") else 10000)
@@ -4124,12 +4775,94 @@ body {{
             self.lbl_edit_health.setText(f"{self._format_monitor_time(self.current_play_time)} / {self._format_monitor_time(duration)}")
 
     def seek_relative(self, delta):
-        target = max(0.0, min(float(self.state.get("duration", 0.0) or 0.0), self.current_play_time + float(delta)))
+        target = max(0.0, min(self._preview_playback_duration(), self.current_play_time + float(delta)))
         self.sync_player_to_time(target)
+
+    def _normalize_shortcut_sequence(self, sequence_text):
+        default = "Ctrl+F"
+        text = str(sequence_text or "").strip() or default
+        sequence = QKeySequence(text)
+        normalized = sequence.toString(QKeySequence.SequenceFormat.PortableText).strip()
+        return normalized or default
+
+    def apply_preview_fullscreen_shortcut(self, sequence_text=None):
+        value = sequence_text if sequence_text is not None else get_preview_fullscreen_shortcut()
+        shortcut_text = self._normalize_shortcut_sequence(value)
+        self.preview_fullscreen_shortcut_text = shortcut_text
+        sequence = QKeySequence(shortcut_text)
+        if hasattr(self, "shortcut_preview_fullscreen"):
+            self.shortcut_preview_fullscreen.setKey(sequence)
+            self.shortcut_preview_fullscreen.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        if hasattr(self, "btn_preview_fullscreen"):
+            self.btn_preview_fullscreen.setToolTip(f"全屏观看预览 {shortcut_text} / Esc 退出")
+        dlg = getattr(self, "preview_fullscreen_dialog", None)
+        if dlg is not None:
+            dlg.setWindowTitle(f"预览全屏 - Esc / {shortcut_text} 退出")
+            exit_shortcut = getattr(dlg, "_preview_exit_shortcut", None)
+            if exit_shortcut is not None:
+                exit_shortcut.setKey(sequence)
+        return shortcut_text
 
     def _shortcut_editing_guard(self):
         focused = QApplication.focusWidget()
+        if focused is not None and focused.__class__.__name__ == "QKeySequenceEdit":
+            return False
         return not isinstance(focused, (QTextEdit, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox))
+
+    def _shortcut_compare_text(self, sequence_text):
+        return str(sequence_text or "").replace("Control", "Ctrl").replace(" ", "").lower()
+
+    def _key_value(self, key):
+        return int(key.value) if hasattr(key, "value") else int(key)
+
+    def _event_shortcut_text(self, event):
+        key = int(event.key())
+        ignored = {
+            self._key_value(Qt.Key.Key_Control),
+            self._key_value(Qt.Key.Key_Shift),
+            self._key_value(Qt.Key.Key_Alt),
+            self._key_value(Qt.Key.Key_Meta),
+        }
+        if key in ignored:
+            return ""
+        parts = []
+        modifiers = event.modifiers()
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            parts.append("Ctrl")
+        if modifiers & Qt.KeyboardModifier.ShiftModifier:
+            parts.append("Shift")
+        if modifiers & Qt.KeyboardModifier.AltModifier:
+            parts.append("Alt")
+        if modifiers & Qt.KeyboardModifier.MetaModifier:
+            parts.append("Meta")
+        key_text = QKeySequence(key).toString(QKeySequence.SequenceFormat.PortableText).strip()
+        if not key_text:
+            if self._key_value(Qt.Key.Key_A) <= key <= self._key_value(Qt.Key.Key_Z):
+                key_text = chr(key)
+            elif self._key_value(Qt.Key.Key_0) <= key <= self._key_value(Qt.Key.Key_9):
+                key_text = chr(key)
+        if not key_text:
+            return ""
+        parts.append(key_text)
+        return "+".join(parts)
+
+    def _event_matches_preview_fullscreen_shortcut(self, event):
+        target = self._shortcut_compare_text(self._normalize_shortcut_sequence(self.preview_fullscreen_shortcut_text))
+        pressed = self._shortcut_compare_text(self._event_shortcut_text(event))
+        return bool(target and pressed and target == pressed)
+
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() == QEvent.Type.KeyPress and self.isVisible():
+                if getattr(self, "_preview_fullscreen_active", False) and event.key() == self._key_value(Qt.Key.Key_Escape):
+                    self.exit_preview_fullscreen()
+                    return True
+                if self._event_matches_preview_fullscreen_shortcut(event) and self._shortcut_editing_guard():
+                    self.toggle_preview_fullscreen()
+                    return True
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
 
     def toggle_play_from_shortcut(self):
         if self._shortcut_editing_guard():
@@ -4148,18 +4881,80 @@ body {{
             self.reset_preview_view()
 
     def toggle_preview_fullscreen_from_shortcut(self):
-        if self._shortcut_editing_guard():
+        if self.isVisible() and self._shortcut_editing_guard():
             self.toggle_preview_fullscreen()
 
     def toggle_preview_fullscreen(self):
-        if getattr(self, "preview_fullscreen_dialog", None):
+        if getattr(self, "_preview_fullscreen_active", False):
             self.exit_preview_fullscreen()
         else:
             self.enter_preview_fullscreen()
 
+    def _force_preview_web_transparency(self):
+        if not hasattr(self, "browser"):
+            return
+        try:
+            self.browser.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            opaque_attr = getattr(Qt.WidgetAttribute, "WA_OpaquePaintEvent", None)
+            if opaque_attr is not None:
+                self.browser.setAttribute(opaque_attr, False)
+            self.browser.setAutoFillBackground(False)
+            self.browser.setStyleSheet("background: transparent; border: none;")
+            page = self.browser.page()
+            if page is not None:
+                page.setBackgroundColor(QColor(0, 0, 0, 0))
+                page.runJavaScript("""
+                    (() => {
+                        document.documentElement.style.setProperty('background', 'transparent', 'important');
+                        if (document.body) {
+                            document.body.style.setProperty('background', 'transparent', 'important');
+                        }
+                        const wrapper = document.getElementById('scale-wrapper');
+                        if (wrapper) {
+                            wrapper.style.setProperty('background', 'transparent', 'important');
+                        }
+                    })();
+                """)
+        except Exception:
+            pass
+
+    def _set_preview_overlay_visible(self, visible):
+        wants_overlay = bool(visible)
+        visible = wants_overlay and bool(getattr(self, "preview_overlay_enabled", True))
+        previous_wants_overlay = bool(getattr(self, "_preview_overlay_has_content", False))
+        self._preview_overlay_has_content = wants_overlay
+        try:
+            if hasattr(self, "video_label"):
+                self.video_label.show()
+            if not hasattr(self, "browser"):
+                return
+            browser_visible = self.browser.isVisible()
+            if visible:
+                if not browser_visible or not previous_wants_overlay:
+                    self._force_preview_web_transparency()
+                    self.browser.show()
+                    self.browser.raise_()
+            else:
+                if browser_visible:
+                    self.browser.hide()
+                if hasattr(self, "video_label") and browser_visible:
+                    self.video_label.raise_()
+        except Exception:
+            pass
+
+    def _request_preview_video_refresh(self):
+        try:
+            last_image = getattr(self, "last_video_image", None)
+            if (last_image is None or last_image.isNull()) and self.state.get("video_clips"):
+                self._sync_video_playback_to_time(self.current_play_time, force_seek=True)
+        except Exception:
+            pass
+        self.redraw_video_preview()
+
     def _sync_preview_web_state(self):
         if not hasattr(self, "browser"):
             return
+        self._force_preview_web_transparency()
         self.last_render_hash = None
         self.active_subs_cache = set()
         try:
@@ -4178,8 +4973,8 @@ body {{
                 self.browser.loadFinished.disconnect(self._on_preview_web_reloaded_after_reparent)
             except Exception:
                 pass
-            self.browser.show()
-            self.browser.raise_()
+            self._force_preview_web_transparency()
+            self._set_preview_overlay_visible(getattr(self, "_preview_overlay_has_content", False))
         QTimer.singleShot(0, self._sync_preview_web_state)
         QTimer.singleShot(120, self._sync_preview_web_state)
 
@@ -4189,11 +4984,9 @@ body {{
         if hasattr(self, "video_label"):
             self.video_label.show()
         if hasattr(self, "browser"):
-            self.browser.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-            self.browser.page().setBackgroundColor(Qt.GlobalColor.transparent)
-            self.browser.show()
-            self.browser.raise_()
-        self.redraw_video_preview()
+            self._force_preview_web_transparency()
+            self._set_preview_overlay_visible(getattr(self, "_preview_overlay_has_content", False))
+        self._request_preview_video_refresh()
         if reload_web and hasattr(self, "browser"):
             try:
                 self.browser.loadFinished.disconnect(self._on_preview_web_reloaded_after_reparent)
@@ -4203,9 +4996,12 @@ body {{
             self.init_web_engine_once()
         else:
             self._sync_preview_web_state()
-        QTimer.singleShot(80, self.redraw_video_preview)
+        QTimer.singleShot(0, self._force_preview_web_transparency)
+        QTimer.singleShot(80, self._force_preview_web_transparency)
+        QTimer.singleShot(80, self._request_preview_video_refresh)
 
-    def enter_preview_fullscreen(self):
+    def _legacy_enter_preview_fullscreen_reparent(self):
+        return
         if not hasattr(self, "preview_workspace") or getattr(self, "preview_fullscreen_dialog", None):
             return
         origin_parent = self.preview_workspace.parentWidget()
@@ -4219,8 +5015,9 @@ body {{
         if origin_layout is not None:
             origin_layout.removeWidget(self.preview_workspace)
 
+        shortcut_text = self.apply_preview_fullscreen_shortcut()
         dlg = QDialog(self.window())
-        dlg.setWindowTitle("预览全屏 - Esc / Ctrl+F 退出")
+        dlg.setWindowTitle(f"预览全屏 - Esc / {shortcut_text} 退出")
         dlg.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         dlg.setStyleSheet("background-color:#000000;")
@@ -4231,19 +5028,22 @@ body {{
         esc_shortcut = QShortcut(QKeySequence("Esc"), dlg)
         esc_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         esc_shortcut.activated.connect(self.exit_preview_fullscreen)
-        ctrl_f_shortcut = QShortcut(QKeySequence("Ctrl+F"), dlg)
-        ctrl_f_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        ctrl_f_shortcut.activated.connect(self.exit_preview_fullscreen)
-        dlg._preview_shortcuts = (esc_shortcut, ctrl_f_shortcut)
+        exit_shortcut = QShortcut(QKeySequence(shortcut_text), dlg)
+        exit_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        exit_shortcut.activated.connect(self.exit_preview_fullscreen)
+        dlg._preview_exit_shortcut = exit_shortcut
+        dlg._preview_shortcuts = (esc_shortcut, exit_shortcut)
         dlg.finished.connect(lambda *_: self.exit_preview_fullscreen())
         self.preview_fullscreen_dialog = dlg
         if hasattr(self, "btn_preview_fullscreen"):
-            self.btn_preview_fullscreen.setText("↙")
+            self.btn_preview_fullscreen.setText("退出")
         dlg.showFullScreen()
-        QTimer.singleShot(0, lambda: self._refresh_preview_surface_after_reparent(reload_web=True))
+        QTimer.singleShot(0, self._refresh_preview_surface_after_reparent)
         QTimer.singleShot(220, self._refresh_preview_surface_after_reparent)
+        QTimer.singleShot(420, lambda: self.sync_player_to_time(self.current_play_time))
 
-    def exit_preview_fullscreen(self):
+    def _legacy_exit_preview_fullscreen_reparent(self):
+        return
         dlg = getattr(self, "preview_fullscreen_dialog", None)
         origin = getattr(self, "_preview_fullscreen_origin", {}) or {}
         if not dlg and not origin:
@@ -4268,12 +5068,120 @@ body {{
             self.preview_fullscreen_dialog = None
             self._preview_fullscreen_origin = {}
             if hasattr(self, "btn_preview_fullscreen"):
-                self.btn_preview_fullscreen.setText("⛶")
+                self.btn_preview_fullscreen.setText("全屏")
             if dlg is not None and dlg.isVisible():
                 dlg.close()
-            QTimer.singleShot(0, lambda: self._refresh_preview_surface_after_reparent(reload_web=True))
+            QTimer.singleShot(0, self._refresh_preview_surface_after_reparent)
             QTimer.singleShot(220, self._refresh_preview_surface_after_reparent)
+            QTimer.singleShot(420, lambda: self.sync_player_to_time(self.current_play_time))
         finally:
+            self._restoring_preview_fullscreen = False
+
+    def _preview_fullscreen_widget_state(self, window):
+        widgets = {
+            "app_topbar": getattr(window, "topbar", None) if window is not None else None,
+            "top_app_bar": getattr(self, "top_app_bar", None),
+            "monitor_bar": getattr(self, "monitor_bar", None),
+            "edit_status_strip": getattr(self, "edit_status_strip", None),
+            "left_shell": getattr(self, "left_shell", None),
+            "left_content_panel": getattr(self, "left_content_panel", None),
+            "right_panel": getattr(self, "right_panel", None),
+            "timeline_outer": getattr(self, "timeline_outer", None),
+            "btn_left_float_toggle": getattr(self, "btn_left_float_toggle", None),
+            "btn_right_float_toggle": getattr(self, "btn_right_float_toggle", None),
+            "canvas_context_toolbar": getattr(self, "canvas_context_toolbar", None),
+        }
+        return {
+            name: (widget, widget.isVisible() if widget is not None else False)
+            for name, widget in widgets.items()
+        }
+
+    def _set_preview_fullscreen_button(self, active):
+        shortcut_text = self.apply_preview_fullscreen_shortcut()
+        if hasattr(self, "btn_preview_fullscreen"):
+            self.btn_preview_fullscreen.setText("退出" if active else "全屏")
+            tip = f"再次按 {shortcut_text} 或 Esc 退出" if active else f"全屏观看预览 {shortcut_text} / Esc 退出"
+            self.btn_preview_fullscreen.setToolTip(tip)
+        if hasattr(self, "shortcut_preview_fullscreen_escape"):
+            self.shortcut_preview_fullscreen_escape.setEnabled(bool(active))
+        if hasattr(self, "shortcut_preview_fullscreen"):
+            self.shortcut_preview_fullscreen.setEnabled(True)
+
+    def _schedule_preview_fullscreen_refresh(self):
+        for delay in (0, 80, 220):
+            QTimer.singleShot(delay, self.refresh_preview_layout)
+        QTimer.singleShot(320, lambda: self.sync_player_to_time(self.current_play_time))
+
+    def enter_preview_fullscreen(self):
+        if getattr(self, "_preview_fullscreen_active", False):
+            return
+        window = self.parent_window() or self.window()
+        self._preview_fullscreen_restore = {
+            "window": window,
+            "window_was_fullscreen": bool(window.isFullScreen()) if window is not None else False,
+            "window_was_maximized": bool(window.isMaximized()) if window is not None else False,
+            "top_splitter_sizes": self.top_h_splitter.sizes() if hasattr(self, "top_h_splitter") else [],
+            "main_splitter_sizes": self.main_v_splitter.sizes() if hasattr(self, "main_v_splitter") else [],
+            "left_shell_min_width": self.left_shell.minimumWidth() if hasattr(self, "left_shell") else None,
+            "widgets": self._preview_fullscreen_widget_state(window),
+        }
+        self._preview_fullscreen_active = True
+        self._set_preview_fullscreen_button(True)
+
+        for name in ("app_topbar", "top_app_bar", "monitor_bar", "edit_status_strip",
+                     "btn_left_float_toggle", "btn_right_float_toggle", "canvas_context_toolbar"):
+            widget, _ = self._preview_fullscreen_restore["widgets"].get(name, (None, False))
+            if widget is not None:
+                widget.setVisible(False)
+        if hasattr(self, "left_shell"):
+            self.left_shell.setMinimumWidth(0)
+            self.left_shell.setVisible(False)
+        if hasattr(self, "right_panel"):
+            self.right_panel.setVisible(False)
+        if hasattr(self, "timeline_outer"):
+            self.timeline_outer.setVisible(False)
+        if hasattr(self, "top_h_splitter"):
+            total = max(900, sum(self.top_h_splitter.sizes()) or self.width())
+            self.top_h_splitter.setSizes([0, total, 0])
+        if hasattr(self, "main_v_splitter"):
+            total = max(620, sum(self.main_v_splitter.sizes()) or self.height())
+            self.main_v_splitter.setSizes([total, 0])
+        if window is not None and not window.isFullScreen():
+            window.showFullScreen()
+        self._schedule_preview_fullscreen_refresh()
+
+    def exit_preview_fullscreen(self):
+        if not getattr(self, "_preview_fullscreen_active", False):
+            return
+        if getattr(self, "_restoring_preview_fullscreen", False):
+            return
+        self._restoring_preview_fullscreen = True
+        restore = getattr(self, "_preview_fullscreen_restore", {}) or {}
+        try:
+            self._preview_fullscreen_active = False
+            widgets = restore.get("widgets", {})
+            for name, (widget, was_visible) in widgets.items():
+                if widget is not None:
+                    widget.setVisible(bool(was_visible))
+            if hasattr(self, "left_shell"):
+                min_width = restore.get("left_shell_min_width")
+                self.left_shell.setMinimumWidth(68 if min_width is None else int(min_width))
+            if hasattr(self, "top_h_splitter") and restore.get("top_splitter_sizes"):
+                self.top_h_splitter.setSizes(restore.get("top_splitter_sizes"))
+            if hasattr(self, "main_v_splitter") and restore.get("main_splitter_sizes"):
+                self.main_v_splitter.setSizes(restore.get("main_splitter_sizes"))
+            window = restore.get("window")
+            if window is not None and not restore.get("window_was_fullscreen") and window.isFullScreen():
+                if restore.get("window_was_maximized"):
+                    window.showMaximized()
+                else:
+                    window.showNormal()
+            self._set_preview_fullscreen_button(False)
+            self._sync_panel_toggle_buttons()
+            self._position_floating_panel_toggles()
+            self._schedule_preview_fullscreen_refresh()
+        finally:
+            self._preview_fullscreen_restore = {}
             self._restoring_preview_fullscreen = False
 
     def adjust_timeline_zoom(self, factor):
@@ -4748,7 +5656,8 @@ body {{
         clip = self.state["subs_data"][self.current_selected_idx]
         st = clip.get("style", clip) 
         
-        controls = [self.sub_start_spin, self.sub_end_spin, self.pos_x_spin, self.pos_x_slider, self.pos_y_spin, self.pos_y_slider, self.size_slider, self.size_spin, self.box_width_slider, self.box_width_spin, self.box_height_slider, self.box_height_spin, self.max_lines_slider, self.max_lines_spin, self.alpha_slider, self.alpha_spin, self.radius_slider, self.radius_spin, self.padding_slider, self.padding_spin, self.bg_pad_left_slider, self.bg_pad_left_spin, self.bg_pad_right_slider, self.bg_pad_right_spin, self.bg_pad_top_slider, self.bg_pad_top_spin, self.bg_pad_bottom_slider, self.bg_pad_bottom_spin, self.hl_alpha_slider, self.hl_alpha_spin, self.hl_radius_slider, self.hl_radius_spin, self.hl_padding_slider, self.hl_padding_spin, self.hl_pad_left_slider, self.hl_pad_left_spin, self.hl_pad_right_slider, self.hl_pad_right_spin, self.hl_pad_top_slider, self.hl_pad_top_spin, self.hl_pad_bottom_slider, self.hl_pad_bottom_spin, self.spacing_slider, self.spacing_spin, self.word_spacing_slider, self.word_spacing_spin, self.lineh_slider, self.lineh_spin, self.stroke_slider, self.stroke_spin, self.stroke_o_slider, self.stroke_o_spin, self.stroke_soft_slider, self.stroke_soft_spin, self.rot_slider, self.rot_spin, self.glow_size_slider, self.glow_size_spin, self.sh_x_slider, self.sh_x_spin, self.sh_y_slider, self.sh_y_spin, self.sh_blur_slider, self.sh_blur_spin, self.sh_a_slider, self.sh_a_spin, self.pop_speed_slider, self.pop_speed_spin, self.pop_bounce_slider, self.pop_bounce_spin, self.inactive_alpha_slider, self.inactive_alpha_spin, self.mask_top_slider, self.mask_top_spin, self.mask_bot_slider, self.mask_bot_spin, self.merge_bridge_width_slider, self.merge_bridge_width_spin, self.merge_bridge_height_slider, self.merge_bridge_height_spin, self.merge_bridge_alpha_slider, self.merge_bridge_alpha_spin, self.transform_combo, self.align_combo, self.anim_combo, self.font_motion_combo, self.hl_motion_combo, self.text_texture_combo, self.bg_mode_combo, self.layout_mode_combo, self.layout_variant_combo, self.box_layout_combo, self.emphasis_slider, self.emphasis_spin]
+        controls = [self.sub_start_spin, self.sub_end_spin, self.pos_x_spin, self.pos_x_slider, self.pos_y_spin, self.pos_y_slider, self.size_slider, self.size_spin, self.box_width_slider, self.box_width_spin, self.box_height_slider, self.box_height_spin, self.max_lines_slider, self.max_lines_spin, self.alpha_slider, self.alpha_spin, self.radius_slider, self.radius_spin, self.padding_slider, self.padding_spin, self.bg_pad_left_slider, self.bg_pad_left_spin, self.bg_pad_right_slider, self.bg_pad_right_spin, self.bg_pad_top_slider, self.bg_pad_top_spin, self.bg_pad_bottom_slider, self.bg_pad_bottom_spin, self.hl_alpha_slider, self.hl_alpha_spin, self.hl_radius_slider, self.hl_radius_spin, self.hl_padding_slider, self.hl_padding_spin, self.hl_pad_left_slider, self.hl_pad_left_spin, self.hl_pad_right_slider, self.hl_pad_right_spin, self.hl_pad_top_slider, self.hl_pad_top_spin, self.hl_pad_bottom_slider, self.spacing_slider, self.spacing_spin, self.word_spacing_slider, self.word_spacing_spin, self.lineh_slider, self.lineh_spin, self.stroke_slider, self.stroke_spin, self.stroke_o_slider, self.stroke_o_spin, self.stroke_soft_slider, self.stroke_soft_spin, self.rot_slider, self.rot_spin, self.glow_size_slider, self.glow_size_spin, self.sh_x_slider, self.sh_x_spin, self.sh_y_slider, self.sh_y_spin, self.sh_blur_slider, self.sh_blur_spin, self.sh_a_slider, self.sh_a_spin, self.pop_speed_slider, self.pop_speed_spin, self.pop_bounce_slider, self.pop_bounce_spin, self.inactive_alpha_slider, self.inactive_alpha_spin, self.mask_top_slider, self.mask_top_spin, self.mask_bot_slider, self.mask_bot_spin, self.merge_bridge_width_slider, self.merge_bridge_width_spin, self.merge_bridge_height_slider, self.merge_bridge_height_spin, self.merge_bridge_alpha_slider, self.merge_bridge_alpha_spin, self.chk_bg_auto_resolution, self.transform_combo, self.align_combo, self.anim_combo, self.font_motion_combo, self.hl_motion_combo, self.text_texture_combo, self.bg_mode_combo, self.layout_mode_combo, self.layout_variant_combo, self.box_layout_combo, self.emphasis_slider, self.emphasis_spin]
+        controls.append(self.hl_style_combo)
         if hasattr(self, "font_var"):
             controls.append(self.font_var)
         for c in controls: c.blockSignals(True)
@@ -4801,6 +5710,7 @@ body {{
         self.bg_pad_right_spin.setValue(int(st.get("bg_pad_right", st.get("bg_padding", 20)))); self.bg_pad_right_slider.setValue(int(st.get("bg_pad_right", st.get("bg_padding", 20))))
         self.bg_pad_top_spin.setValue(int(st.get("bg_pad_top", st.get("bg_padding", 20) / 2.5))); self.bg_pad_top_slider.setValue(int(st.get("bg_pad_top", st.get("bg_padding", 20) / 2.5)))
         self.bg_pad_bottom_spin.setValue(int(st.get("bg_pad_bottom", st.get("bg_padding", 20) / 2.5))); self.bg_pad_bottom_slider.setValue(int(st.get("bg_pad_bottom", st.get("bg_padding", 20) / 2.5)))
+        self.chk_bg_auto_resolution.setChecked(bool(st.get("bg_auto_resolution", True)))
         
         self.hl_alpha_spin.setValue(int(st.get("hl_bg_alpha", 100))); self.hl_alpha_slider.setValue(int(st.get("hl_bg_alpha", 100)))
         self.hl_radius_spin.setValue(int(st.get("hl_bg_radius", 8))); self.hl_radius_slider.setValue(int(st.get("hl_bg_radius", 8)))
@@ -4842,6 +5752,8 @@ body {{
         texture_map = {"none": "字体质感: 无", "grain": "字体质感: Grain 轻微颗粒", "noise": "字体质感: Noise 噪点", "roughen": "字体质感: Roughen 粗糙边", "distressed": "字体质感: Distress texture 破碎磨损", "stacked_distress": "字体质感: 叠加 Grain+Noise+Roughen+Distress"}
         self.text_texture_combo.setCurrentText(texture_map.get(st.get("text_texture", "none"), texture_map["none"]))
         self.hl_motion_combo.setCurrentIndex({"stable": 0, "pop": 1, "push": 2}.get(st.get("hl_motion", "stable"), 0))
+        hl_style_map = {"text": "高亮样式: 纯字变色", "outline": "高亮样式: 文字红框", "box": "高亮样式: 背景色块", "underline": "高亮样式: 下划线", "glow": "高亮样式: 发光描边", "capsule": "高亮样式: 胶囊描边", "canva_frame": "高亮样式: Canva 行框"}
+        self.hl_style_combo.setCurrentText(hl_style_map.get(st.get("hl_style", "text"), hl_style_map["text"]))
         
         try:
             font_name = self._usable_font_name(st.get("font", self.default_style.get("font", "Segoe UI")))
@@ -4860,14 +5772,16 @@ body {{
             b_idx = 0
         elif bm == "tape":
             b_idx = 1
-        elif bm == "sweep":
+        elif bm == "canva_fit":
             b_idx = 2
-        elif bm == "full_frame":
-            b_idx = 4
-        elif bm == "cinematic_frame":
-            b_idx = 5
-        else:
+        elif bm == "sweep":
             b_idx = 3
+        elif bm == "full_frame":
+            b_idx = 5
+        elif bm == "cinematic_frame":
+            b_idx = 6
+        else:
+            b_idx = 4
         self.bg_mode_combo.setCurrentIndex(b_idx)
 
         for c in controls: c.blockSignals(False)
@@ -4932,6 +5846,7 @@ body {{
                 c["style"]["bg_pad_right"] = self.bg_pad_right_slider.value()
                 c["style"]["bg_pad_top"] = self.bg_pad_top_slider.value()
                 c["style"]["bg_pad_bottom"] = self.bg_pad_bottom_slider.value()
+                c["style"]["bg_auto_resolution"] = self.chk_bg_auto_resolution.isChecked()
                 
                 c["style"]["hl_bg_alpha"] = self.hl_alpha_slider.value()
                 c["style"]["hl_bg_radius"] = self.hl_radius_slider.value()
@@ -5051,12 +5966,29 @@ body {{
                     c["style"]["text_texture"] = "none"
                 hl_motion_idx = self.hl_motion_combo.currentIndex()
                 c["style"]["hl_motion"] = "push" if hl_motion_idx == 2 else "pop" if hl_motion_idx == 1 else "stable"
+                hl_style_txt = self.hl_style_combo.currentText()
+                if "文字红框" in hl_style_txt:
+                    c["style"]["hl_style"] = "outline"
+                elif "背景色块" in hl_style_txt:
+                    c["style"]["hl_style"] = "box"
+                elif "下划线" in hl_style_txt:
+                    c["style"]["hl_style"] = "underline"
+                elif "发光描边" in hl_style_txt:
+                    c["style"]["hl_style"] = "glow"
+                elif "胶囊描边" in hl_style_txt:
+                    c["style"]["hl_style"] = "capsule"
+                elif "Canva" in hl_style_txt:
+                    c["style"]["hl_style"] = "canva_frame"
+                else:
+                    c["style"]["hl_style"] = "text"
                 
                 b_txt = self.bg_mode_combo.currentText()
                 if "无底框" in b_txt:
                     c["style"]["bg_mode"] = "none"
                 elif "单点" in b_txt:
                     c["style"]["bg_mode"] = "tape"
+                elif "Canva" in b_txt or "贴合" in b_txt or "è´´åˆ" in b_txt:
+                    c["style"]["bg_mode"] = "canva_fit"
                 elif "渐变" in b_txt:
                     c["style"]["bg_mode"] = "sweep"
                 elif "全部框架" in b_txt:
@@ -5378,7 +6310,163 @@ body {{
     def _apply_waveform(self, img_path, attr_name): 
         setattr(self, attr_name, QPixmap(img_path)); self.timeline_widget.sync_from_controller()
 
-    def set_audio_path_from_file(self, file_path):
+    def _ensure_clip_import_metadata(self, clip):
+        if not isinstance(clip, dict):
+            return clip
+        path = clip.get("path", "")
+        if not path or not os.path.exists(path):
+            return clip
+        has_size = int(float(clip.get("width", 0) or 0)) > 0 and int(float(clip.get("height", 0) or 0)) > 0
+        has_duration = float(clip.get("dur", 0.0) or 0.0) > 0
+        if has_size and has_duration:
+            return clip
+        try:
+            meta = get_video_import_metadata(path)
+            if not has_duration and float(meta.get("duration", 0.0) or 0.0) > 0:
+                clip["dur"] = float(meta.get("duration", 0.0) or 0.0)
+            if not has_size:
+                clip["width"] = int(meta.get("width", 0) or 0)
+                clip["height"] = int(meta.get("height", 0) or 0)
+            clip.setdefault("duration_probe", meta.get("duration_info", {}))
+        except Exception:
+            pass
+        return clip
+
+    def _clip_needs_preview_proxy(self, clip):
+        clip = self._ensure_clip_import_metadata(clip)
+        return bool(
+            getattr(self, "preview_proxy_auto_generate", False)
+            and isinstance(clip, dict)
+            and clip_should_auto_proxy(clip)
+        )
+
+    def _should_defer_original_preview(self, clip):
+        if not self._clip_needs_preview_proxy(clip):
+            return False
+        if preview_proxy_is_ready(clip):
+            return False
+        return clip.get("preview_proxy_status") in {PROXY_STATUS_PENDING, PROXY_STATUS_GENERATING}
+
+    def _clip_dimensions_from_state(self, media_path):
+        media_path = os.path.abspath(media_path or "")
+        for clip in self.state.get("video_clips", []) or []:
+            if os.path.abspath(clip.get("path", "") or "") != media_path:
+                continue
+            width = int(float(clip.get("width", 0) or 0))
+            height = int(float(clip.get("height", 0) or 0))
+            if width > 0 and height > 0:
+                return width, height
+        return get_video_dimensions(media_path)
+
+    def _preview_media_path_for_clip(self, clip):
+        if self._should_defer_original_preview(clip):
+            return ""
+        path = preview_source_for_clip(clip)
+        if path and os.path.exists(path):
+            return path
+        return clip.get("path", "") if isinstance(clip, dict) else ""
+
+    def _prime_video_preview_source(self, clip, announce=False):
+        if not isinstance(clip, dict):
+            return False
+        self.last_video_image = None
+        self._preview_scaled_pixmap_key = None
+        self._preview_scaled_pixmap = None
+        self._preview_frame_retry_count = 0
+        path = self._preview_media_path_for_clip(clip)
+        if path:
+            self.player.setSource(QUrl.fromLocalFile(path))
+            self.player.setLoops(QMediaPlayer.Loops.Infinite)
+            return True
+        if self._should_defer_original_preview(clip):
+            self.player.setSource(QUrl())
+            if announce and hasattr(self, "status_lbl"):
+                self.status_lbl.setText("4K/高码率素材已加入；正在后台生成流畅预览代理，期间界面可继续操作。")
+        return False
+
+    def _prepare_preview_proxies_for_clips(self, clips, announce=False):
+        for idx, clip in enumerate(clips or []):
+            self._queue_preview_proxy_for_clip(clip, announce=announce and idx == 0)
+
+    def _queue_preview_proxy_for_clip(self, clip, announce=False):
+        if not getattr(self, "preview_proxy_auto_generate", False):
+            return
+        clip = self._ensure_clip_import_metadata(clip)
+        if not clip_should_auto_proxy(clip):
+            return
+        proxy_path, fingerprint, needs_generation = prepare_clip_for_preview_proxy(clip)
+        if not proxy_path or not needs_generation:
+            return
+        job_key = os.path.abspath(proxy_path)
+        if job_key in self._preview_proxy_jobs:
+            return
+        self._preview_proxy_jobs.add(job_key)
+        clip["preview_proxy_status"] = PROXY_STATUS_GENERATING
+        clip["preview_proxy_error"] = ""
+        if announce and hasattr(self, "status_lbl"):
+            self.status_lbl.setText("正在后台生成流畅预览代理，生成后会自动切换预览源...")
+        self.auto_save_cache()
+        threading.Thread(
+            target=self._generate_preview_proxy_task,
+            args=(clip.get("path", ""), proxy_path, fingerprint),
+            daemon=True,
+        ).start()
+
+    def _generate_preview_proxy_task(self, source_path, proxy_path, fingerprint):
+        tmp_path = proxy_path + ".tmp.mp4"
+        try:
+            if not source_path or not os.path.exists(source_path):
+                raise FileNotFoundError(source_path or "empty source video")
+            os.makedirs(os.path.dirname(proxy_path), exist_ok=True)
+            if not os.path.exists(proxy_path) or os.path.getsize(proxy_path) <= 1024:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                cmd = build_preview_proxy_command(get_ffmpeg_cmd(), source_path, tmp_path)
+                flags = 0x08000000 if os.name == 'nt' else 0
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags, check=True)
+                if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) <= 1024:
+                    raise RuntimeError("Preview proxy file was not created.")
+                os.replace(tmp_path, proxy_path)
+            QTimer.singleShot(0, lambda sp=source_path, pp=proxy_path, fp=fingerprint: self._finish_preview_proxy_job(sp, pp, fp, True, ""))
+        except Exception as exc:
+            error = str(exc)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            QTimer.singleShot(0, lambda sp=source_path, pp=proxy_path, fp=fingerprint, err=error: self._finish_preview_proxy_job(sp, pp, fp, False, err))
+
+    def _finish_preview_proxy_job(self, source_path, proxy_path, fingerprint, success, error):
+        self._preview_proxy_jobs.discard(os.path.abspath(proxy_path))
+        matched_active_clip = False
+        for clip in self.state.get("video_clips", []) or []:
+            if clip.get("path") != source_path or clip.get("preview_proxy_fingerprint") != fingerprint:
+                continue
+            if success:
+                clip["preview_proxy_path"] = proxy_path
+                clip["preview_proxy_status"] = PROXY_STATUS_READY
+                clip["preview_proxy_error"] = ""
+            else:
+                clip["preview_proxy_status"] = PROXY_STATUS_FAILED
+                clip["preview_proxy_error"] = error[:300]
+            _, active_clip = self._video_clip_for_time(self.current_play_time)
+            matched_active_clip = matched_active_clip or active_clip is clip
+        if success:
+            if hasattr(self, "status_lbl"):
+                self.status_lbl.setText("流畅预览代理已生成，预览已切换到轻量素材。")
+            if matched_active_clip:
+                self.last_video_image = None
+                self._preview_frame_retry_count = 0
+                self._sync_video_playback_to_time(self.current_play_time, force_seek=True)
+        elif hasattr(self, "status_lbl"):
+            self.status_lbl.setText("流畅预览代理生成失败，已继续使用原素材预览。")
+        self.auto_save_cache()
+
+    def set_audio_path_from_file(self, file_path, record_history=True):
         if not file_path or not os.path.exists(file_path):
             return False
         file_path = self.cloud_import_media_if_needed(file_path)
@@ -5395,15 +6483,33 @@ body {{
         if self.edit_mode:
             self.switch_inspector("audio")
         self.status_lbl.setText("🎵 音频素材已加入配音轨。")
+        self.refresh_media_pool()
+        if record_history:
+            self.push_history()
         return True
 
     def add_video_clip_from_path(self, file_path, start_t=None):
         if not file_path or not os.path.exists(file_path):
             return False
         file_path = self.cloud_import_media_if_needed(file_path)
-        dur = get_exact_duration(file_path)
+        try:
+            media_meta = get_video_import_metadata(file_path)
+            dur = float(media_meta.get("duration", 0.0) or 0.0)
+            duration_info = media_meta.get("duration_info", {})
+        except Exception:
+            media_meta = {}
+            dur, duration_info = 0.0, {}
+        if dur <= 0:
+            dur = get_video_stream_duration(file_path) or get_exact_duration(file_path)
         if dur <= 0:
             dur = 5.0
+        try:
+            video_w = int(media_meta.get("width", 0) or 0)
+            video_h = int(media_meta.get("height", 0) or 0)
+            if video_w <= 0 or video_h <= 0:
+                video_w, video_h = get_video_dimensions(file_path)
+        except Exception:
+            video_w, video_h = 0, 0
         clips = self.state.get("video_clips", [])
         if start_t is None:
             start_t = clips[-1]["end"] if clips else 0.0
@@ -5414,6 +6520,9 @@ body {{
             "start": start_t,
             "end": start_t + dur,
             "dur": dur,
+            "width": int(video_w or 0),
+            "height": int(video_h or 0),
+            "duration_probe": duration_info,
             "source_in": 0.0,
             "source_out": dur,
             "transition": {"type": "cut", "duration": 0.0}
@@ -5424,9 +6533,9 @@ body {{
         self.btn_v.setText("✅ 已导原素材")
         self.current_v_idx = clips.index(new_clip)
         self.current_selected_idx = -1
+        self._queue_preview_proxy_for_clip(new_clip, announce=True)
         if len(clips) == 1 or not self.player.source().isValid():
-            self.player.setSource(QUrl.fromLocalFile(file_path))
-            self.player.setLoops(QMediaPlayer.Loops.Infinite)
+            self._prime_video_preview_source(new_clip, announce=True)
             self.on_resolution_changed(self.res_combo.currentText())
             self.generate_waveform(file_path, "v_wave_pixmap")
             threading.Thread(target=self._gen_thumbs_cache, daemon=True).start()
@@ -5435,7 +6544,11 @@ body {{
         if self.edit_mode:
             self.switch_inspector("video")
             self.sync_player_to_time(start_t)
+        QTimer.singleShot(0, self._request_preview_video_refresh)
+        QTimer.singleShot(280, self._request_preview_video_refresh)
         self.status_lbl.setText("🎞️ 视频素材已加入时间线。")
+        self.refresh_media_pool()
+        self.push_history()
         return True
 
     def load_audio(self):
@@ -5465,6 +6578,8 @@ body {{
         self.auto_save_cache()
         self._update_workspace_status()
         self.status_lbl.setText("🎼 配乐已加入；导出时会自动循环/裁切匹配工程时长。")
+        self.refresh_media_pool()
+        self.push_history()
         return True
 
     def load_music(self):
@@ -5488,6 +6603,8 @@ body {{
         if a_dur <= 0: return
         compound_clip = clips[0]; compound_clip["start"] = 0.0; compound_clip["end"] = a_dur
         self.state["video_clips"] = [compound_clip]; self._recalc_duration(); self.auto_save_cache(); self.timeline_widget.sync_from_controller()
+        self.refresh_media_pool()
+        self.push_history()
         QMessageBox.information(self, "铺满成功", f"🚀 已将视频转换为复合片段！\n内部自动循环并紧密匹配音频时长 ({a_dur:.1f}s)。")
             
     def remove_last_video_clip(self):
@@ -5497,7 +6614,7 @@ body {{
         if clips:
             clips.pop(); self.state["video_clips"] = clips
             if not clips: self.btn_v.setText("➕ 导入第一段画面 (MP4)"); self.player.stop(); self.v_wave_pixmap = None
-            self._recalc_duration(); self.auto_save_cache()
+            self._recalc_duration(); self.auto_save_cache(); self.update_timeline_size(); self.refresh_media_pool(); self.push_history()
             
     def remove_audio(self):
         if self.state.get("audio_path"):
@@ -5509,6 +6626,8 @@ body {{
             self.update_timeline_size()
             self.auto_save_cache()
             self.status_lbl.setText("🗑️ 配音已清除")
+            self.refresh_media_pool()
+            self.push_history()
 
     def remove_music(self):
         if self.state.get("music_path"):
@@ -5526,6 +6645,8 @@ body {{
             self.auto_save_cache()
             self._update_workspace_status()
             self.status_lbl.setText("配乐已清除")
+            self.refresh_media_pool()
+            self.push_history()
 
     def match_music_to_audio(self, show_message=True):
         music_path = self.state.get("music_path", "")
@@ -5582,8 +6703,43 @@ body {{
                 durations.append(music_target)
 
         content_dur = max(durations) if durations else 0.0
+        self.state["content_duration"] = max(0.0, content_dur)
         render_dur = content_dur + render_tail_padding_seconds() if content_dur > 0 else 1.0
         self.state["duration"] = max(1.0, render_dur); self.update_timeline_size()
+
+    def _content_duration(self):
+        durations = []
+        for clip in self.state.get("video_clips", []) or []:
+            durations.append(float(clip.get("end", 0.0) or 0.0))
+
+        a_path = self.state.get("audio_path", "")
+        if a_path:
+            a_trim = self.state.get("a_trim") or []
+            if len(a_trim) >= 2:
+                try:
+                    durations.append(max(0.0, float(a_trim[1]) - float(a_trim[0])))
+                except Exception:
+                    pass
+            else:
+                durations.append(float(get_exact_duration(a_path) or 0.0))
+
+        durations.extend(float(s.get("end", 0.0) or 0.0) for s in self.state.get("subs_data", []) or [])
+
+        if self.state.get("music_path"):
+            music_target = float(self.state.get("music_match_duration", 0.0) or 0.0)
+            if music_target <= 0:
+                music_target = float(self.state.get("music_dur", 0.0) or 0.0)
+            if music_target > 0:
+                durations.append(music_target)
+
+        content_dur = max(durations) if durations else float(self.state.get("content_duration", 0.0) or 0.0)
+        return max(0.0, content_dur)
+
+    def _preview_playback_duration(self):
+        content_dur = self._content_duration()
+        if content_dur > 0:
+            return max(0.001, content_dur)
+        return max(0.001, float(self.state.get("duration", 0.0) or 0.0))
 
     @pyqtSlot(QVideoFrame)
     def on_video_frame(self, frame):
@@ -5592,65 +6748,112 @@ body {{
             if image.isNull():
                 return
             self.last_video_image = image
+            self._preview_frame_retry_pending = False
+            self._preview_frame_retry_count = 0
             self.redraw_video_preview()
 
     def redraw_video_preview(self):
         if not self.last_video_image or self.last_video_image.isNull():
+            if self.state.get("video_clips") and not getattr(self, "_preview_frame_retry_pending", False) and getattr(self, "_preview_frame_retry_count", 0) < 3:
+                self._preview_frame_retry_pending = True
+                self._preview_frame_retry_count = getattr(self, "_preview_frame_retry_count", 0) + 1
+                self._sync_video_playback_to_time(self.current_play_time, force_seek=True)
+                QTimer.singleShot(260, lambda: setattr(self, "_preview_frame_retry_pending", False))
             return
         img = self.last_video_image
         w, h = self.video_label.width(), self.video_label.height()
         if w > 0 and h > 0:
-            scaled_pix = QPixmap.fromImage(img).scaled(int(w * self.state["v_scale"] / 100.0), int(h * self.state["v_scale"] / 100.0), Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            preview_scale = max(0.01, float(self.state.get("v_scale", 100) or 100) / 100.0)
+            source_w = max(1, int(img.width() or self.proj_width or 1))
+            source_h = max(1, int(img.height() or self.proj_height or 1))
+            layer_rect = canvas_layer_rect(
+                w, h,
+                source_w,
+                source_h,
+                scale=preview_scale,
+                pos_x=self.state.get("v_pos_x", 0.0),
+                pos_y=self.state.get("v_pos_y", 0.0),
+            )
+            target_w = max(1, min(8192, layer_rect.width))
+            target_h = max(1, min(8192, layer_rect.height))
+            frame_key = int(img.cacheKey()) if hasattr(img, "cacheKey") else id(img)
+            scale_key = (frame_key, target_w, target_h)
+            if getattr(self, "_preview_scaled_pixmap_key", None) == scale_key and getattr(self, "_preview_scaled_pixmap", None) is not None:
+                scaled_pix = self._preview_scaled_pixmap
+            else:
+                scaled_pix = QPixmap.fromImage(img).scaled(target_w, target_h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                self._preview_scaled_pixmap_key = scale_key
+                self._preview_scaled_pixmap = scaled_pix
             result_pix = QPixmap(w, h)
             result_pix.fill(Qt.GlobalColor.black)
             painter = QPainter(result_pix)
-            painter.drawPixmap((w - scaled_pix.width()) // 2, (h - scaled_pix.height()) // 2, scaled_pix)
+            painter.drawPixmap(layer_rect.x, layer_rect.y, scaled_pix)
             painter.end()
             if hasattr(self, "preview_workspace"):
                 self.video_label.setPixmap(result_pix)
             else:
                 self.video_label.setPixmap(self._apply_preview_transform_to_pixmap(result_pix))
+            if not getattr(self, "_preview_overlay_has_content", False) and hasattr(self, "video_label"):
+                self.video_label.raise_()
     
     def toggle_play(self):
         self.is_playing = not self.is_playing; self.btn_play.setText("⏸️ 暂停" if self.is_playing else "▶️ 播放")
         if self.is_playing: 
-            duration = max(0.001, float(self.state.get("duration", 0.0) or 0.0))
+            if hasattr(self, "timeline_widget"):
+                self.timeline_widget.is_scrubbing = False
+            duration = self._preview_playback_duration()
             if self.current_play_time >= duration - 0.03:
                 self.current_play_time = 0.0
             self._play_clock_ref = time.monotonic()
             self._play_time_ref = self.current_play_time
             self._sync_video_playback_to_time(self.current_play_time, force_seek=True)
+            self._sync_audio_playback_to_time(self.current_play_time, force_seek=True)
             self._sync_music_playback_to_time(self.current_play_time, force_seek=True)
-            self.player.play(); self.audio_player.play() if self.state.get("audio_path") else None
+            self.player.play(); self.audio_player.play() if self._has_audio_track() else None
             self.music_player.play() if self._has_music_track() else None
-            self.play_timer = QTimer(self); self.play_timer.timeout.connect(self.play_tick); self.play_timer.start(30)
+            if not hasattr(self, "play_timer"):
+                self.play_timer = QTimer(self)
+                self.play_timer.setTimerType(Qt.TimerType.PreciseTimer)
+                self.play_timer.timeout.connect(self.play_tick)
+            self.play_timer.start(30)
         else: 
-            self.player.pause(); self.audio_player.pause() if self.state.get("audio_path") else None
+            self.player.pause(); self.audio_player.pause() if self._has_audio_track() else None
             self.music_player.pause() if self._has_music_track() else None
             if hasattr(self, 'play_timer'): self.play_timer.stop()
             
     def _on_video_media_status_changed(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia and self.is_playing:
             if self._playback_loop_enabled():
-                self.player.setPosition(0)
+                duration = self._preview_playback_duration()
+                if self.current_play_time >= duration - 0.12:
+                    self._restart_loop_playback()
+                else:
+                    self._sync_video_playback_to_time(self.current_play_time, force_seek=True)
                 self.player.play()
             else:
                 self._stop_playback_at_end()
 
     def _on_audio_media_status_changed(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia and self.is_playing:
+            duration = self._preview_playback_duration()
+            if self.current_play_time < duration - 0.12:
+                self.audio_player.pause()
+                return
             if self._playback_loop_enabled():
-                self.sync_player_to_time(0.0)
-                self.player.play()
-                if self.state.get("audio_path"):
-                    self.audio_player.play()
-                if self._has_music_track():
-                    self.music_player.play()
+                self._restart_loop_playback()
             else:
                 self._stop_playback_at_end()
 
     def _on_music_media_status_changed(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia and self.is_playing:
+            duration = self._preview_playback_duration()
+            if self.current_play_time < duration - 0.12:
+                if bool(self.state.get("music_loop", True)):
+                    self._sync_music_playback_to_time(self.current_play_time, force_seek=True)
+                    self.music_player.play()
+                else:
+                    self.music_player.pause()
+                return
             if self._playback_loop_enabled():
                 self._sync_music_playback_to_time(self.current_play_time, force_seek=True)
                 self.music_player.play()
@@ -5660,12 +6863,32 @@ body {{
     def _playback_loop_enabled(self):
         return not hasattr(self, "chk_loop_playback") or self.chk_loop_playback.isChecked()
 
+    def _restart_loop_playback(self):
+        self.current_play_time = 0.0
+        self._play_clock_ref = time.monotonic()
+        self._play_time_ref = 0.0
+        self._sync_video_playback_to_time(0.0, force_seek=True)
+        if self.is_playing:
+            self.player.play()
+        if self._has_audio_track():
+            self.audio_player.setPosition(0)
+            if self.is_playing:
+                self.audio_player.play()
+        if self._has_music_track():
+            self._sync_music_playback_to_time(0.0, force_seek=True)
+            if self.is_playing:
+                self.music_player.play()
+        self._update_time_label()
+        self.timeline_widget.update_playhead(0.0)
+        self.update_floating_subtitle()
+        self._update_workspace_status()
+
     def _stop_playback_at_end(self):
         self.is_playing = False
-        self.current_play_time = max(0.0, float(self.state.get("duration", 0.0) or 0.0))
+        self.current_play_time = self._preview_playback_duration()
         self.btn_play.setText("â–¶ï¸ æ’­æ”¾")
         self.player.pause()
-        if self.state.get("audio_path"):
+        if self._has_audio_track():
             self.audio_player.pause()
         if self._has_music_track():
             self.music_player.pause()
@@ -5702,17 +6925,22 @@ body {{
         idx, clip = self._video_clip_for_time(float(time_sec or 0.0))
         if not clip:
             return
-        path = clip.get("path", "")
+        if not self.is_playing:
+            self._queue_preview_proxy_for_clip(clip)
+        path = self._preview_media_path_for_clip(clip)
         if not path:
             return
         current_path = self.player.source().toLocalFile()
         source_changed = current_path != path
         if source_changed:
+            self.last_video_image = None
+            self._preview_frame_retry_count = 0
             self.player.setSource(QUrl.fromLocalFile(path))
             self.player.setLoops(QMediaPlayer.Loops.Infinite)
         local_time = self._video_local_time(clip, time_sec)
         player_time = self.player.position() / 1000.0
-        if force_seek or source_changed or abs(player_time - local_time) > 0.28:
+        drift_limit = 0.75 if self.is_playing else 0.28
+        if force_seek or source_changed or abs(player_time - local_time) > drift_limit:
             self.player.setPosition(int(local_time * 1000))
         if self.is_playing and source_changed:
             self.player.play()
@@ -5721,6 +6949,25 @@ body {{
     def _has_music_track(self):
         path = self.state.get("music_path", "")
         return bool(path and os.path.exists(path) and hasattr(self, "music_player"))
+
+    def _has_audio_track(self):
+        path = self.state.get("audio_path", "")
+        return bool(path and os.path.exists(path) and hasattr(self, "audio_player"))
+
+    def _sync_audio_playback_to_time(self, time_sec, force_seek=False):
+        if not self._has_audio_track():
+            return
+        path = self.state.get("audio_path", "")
+        current_path = self.audio_player.source().toLocalFile()
+        source_changed = current_path != path
+        if source_changed:
+            self.audio_player.setSource(QUrl.fromLocalFile(path))
+        local_time = max(0.0, float(time_sec or 0.0))
+        player_time = self.audio_player.position() / 1000.0
+        if force_seek or source_changed or abs(player_time - local_time) > 0.35:
+            self.audio_player.setPosition(int(local_time * 1000))
+        if self.is_playing and source_changed:
+            self.audio_player.play()
 
     def _music_source_duration(self):
         path = self.state.get("music_path", "")
@@ -5759,35 +7006,39 @@ body {{
             self.music_player.play()
 
     def play_tick(self):
-        if self.timeline_widget.is_scrubbing: return 
-        if self.state.get("audio_path"):
-            real_time = self.audio_player.position() / 1000.0
-        else:
-            ref_clock = getattr(self, "_play_clock_ref", time.monotonic())
-            ref_time = getattr(self, "_play_time_ref", self.current_play_time)
-            real_time = ref_time + max(0.0, time.monotonic() - ref_clock)
-        duration = max(0.001, float(self.state.get("duration", 0.0) or 0.0))
+        if getattr(self.timeline_widget, "is_scrubbing", False):
+            try:
+                if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+                    return
+                self.timeline_widget.is_scrubbing = False
+            except Exception:
+                return
+        ref_clock = getattr(self, "_play_clock_ref", time.monotonic())
+        ref_time = getattr(self, "_play_time_ref", self.current_play_time)
+        real_time = ref_time + max(0.0, time.monotonic() - ref_clock)
+        duration = self._preview_playback_duration()
         if real_time >= duration - 0.02:
             if self._playback_loop_enabled():
+                self._restart_loop_playback()
                 real_time = 0.0
-                self._play_clock_ref = time.monotonic()
-                self._play_time_ref = 0.0
-                if self.state.get("audio_path"):
-                    self.audio_player.setPosition(0)
-                    if self.is_playing:
-                        self.audio_player.play()
-                if self._has_music_track():
-                    self._sync_music_playback_to_time(0.0, force_seek=True)
-                    if self.is_playing:
-                        self.music_player.play()
             else:
                 self._stop_playback_at_end()
                 return
         self.current_play_time = real_time
         self._sync_video_playback_to_time(real_time, force_seek=False)
+        self._sync_audio_playback_to_time(real_time, force_seek=False)
         self._sync_music_playback_to_time(real_time, force_seek=False)
+        now = time.monotonic()
+        if self.state.get("video_clips") and self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            if now - getattr(self, "_last_video_play_retry_at", 0.0) >= 0.5:
+                self._last_video_play_retry_at = now
+                self.player.play()
         self._update_time_label()
-        self.timeline_widget.update_playhead(real_time); self.update_floating_subtitle(); self._update_workspace_status()
+        self.timeline_widget.update_playhead(real_time)
+        self.update_floating_subtitle()
+        if now - getattr(self, "_last_play_status_update_at", 0.0) >= 0.25:
+            self._last_play_status_update_at = now
+            self._update_workspace_status()
         
     def sync_player_to_time(self, time_sec): 
         self.current_play_time = time_sec
@@ -5798,7 +7049,7 @@ body {{
             self._sync_video_playback_to_time(time_sec, force_seek=True)
         else:
             self.player.setPosition(int(time_sec * 1000))
-        if self.state.get("audio_path"): self.audio_player.setPosition(int(time_sec * 1000))
+        self._sync_audio_playback_to_time(time_sec, force_seek=True)
         self._sync_music_playback_to_time(time_sec, force_seek=True)
         self._update_time_label()
         self.timeline_widget.update_playhead(time_sec); self.update_floating_subtitle(); self._update_workspace_status()
@@ -5807,7 +7058,7 @@ body {{
         active_subs = []
         for i, s in enumerate(self.state["subs_data"]):
             if float(s.get('start', 0)) <= self.current_play_time <= float(s.get('end', 1)):
-                htmlText = render_subtitle_html(s, self.current_play_time, self.proj_width)
+                htmlText = render_subtitle_html(s, self.current_play_time, self.proj_width, self.proj_height)
                 active_subs.append({
                     "idx": i, "htmlText": htmlText, "isNew": (i not in self.active_subs_cache), 
                     "pos_x": s.get("pos_x", 0.0), "pos_y": s.get("pos_y", 25.0), 
@@ -5820,15 +7071,22 @@ body {{
             project_data = self.project_data if isinstance(self.project_data, dict) else {}
         design_state = project_data.get("room_state", {}).get("design_room", {}) if isinstance(project_data, dict) else {}
         design_html = render_design_html(design_state, self.current_play_time, self.proj_width, self.proj_height)
-        signature_html = render_signature_html(self.state.get("signature"), self.current_play_time, self.proj_width)
+        signature_html = render_signature_html(self.state.get("signature"), self.current_play_time, self.proj_width, self.proj_height)
+        overlay_has_content = bool(active_subs or design_html.strip() or signature_html.strip())
         current_hash = hash(json.dumps({"subs": active_subs, "signature": signature_html, "design": design_html}, sort_keys=True))
         if current_hash != getattr(self, 'last_render_hash', None): 
             json_str = json.dumps(active_subs)
             safe_json = json_str.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$')
             safe_sig = signature_html.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$')
             safe_design = design_html.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$')
+            if overlay_has_content:
+                self._set_preview_overlay_visible(True)
             self.browser.page().runJavaScript(f"if(typeof syncDesign === 'function') syncDesign(`{safe_design}`); if(typeof syncSubs === 'function') syncSubs(`{safe_json}`); if(typeof syncSignature === 'function') syncSignature(`{safe_sig}`);")
+            if not overlay_has_content:
+                QTimer.singleShot(0, lambda: self._set_preview_overlay_visible(False))
             self.last_render_hash = current_hash; self.active_subs_cache = set([sub["idx"] for sub in active_subs])
+        elif overlay_has_content != getattr(self, "_preview_overlay_has_content", False) or (not overlay_has_content and hasattr(self, "browser") and self.browser.isVisible()):
+            self._set_preview_overlay_visible(overlay_has_content)
 
     def sanitize_subs_data(self, data):
         def_x = self.state.get("default_pos_x", 0.0)
@@ -5910,14 +7168,19 @@ body {{
                 cleaned_sentences.append(s[0].upper() + s[1:])
             else:
                 cleaned_sentences.append(s)
-        return "".join(cleaned_sentences).strip()
+        return normalize_scripture_quote_text("".join(cleaned_sentences).strip())
 
     def _tokenize_user_text_for_alignment(self, raw_text):
         return tokenize_display_text(raw_text)
 
     # 👑 智能对齐引擎：将 AI 时间戳与手工文案强行绑定
-    def _align_user_text_to_ai_words(self, ai_words, raw_text):
-        return align_reference_text_to_timestamps(ai_words, raw_text)
+    def _align_user_text_to_ai_words(self, ai_words, raw_text, fallback_start=None, fallback_end=None):
+        return align_reference_text_to_timestamps(
+            ai_words,
+            raw_text,
+            fallback_start=fallback_start,
+            fallback_end=fallback_end,
+        )
 
     def start_extract(self):
         try:
@@ -5965,6 +7228,9 @@ body {{
                 raise Exception("音频抽取失败！可能素材无声音或格式不支持。")
 
             # 读取极限压缩后的文件，此时 30秒的音频绝对只有不到 100KB！
+            media_duration = get_exact_duration(target_path)
+            fallback_end = media_duration if media_duration > 0 else None
+
             with open(target_path, 'rb') as f: data = f.read()
             
             res_json = None; last_err = ""
@@ -5983,13 +7249,18 @@ body {{
                 {"word": re.sub(r'(?i)stereo_[^\s]+', '', w["word"]).replace(".mp3", "").replace(".wav", "").strip(), "start": w["start"], "end": w["end"]}
                 for w in res_json["result"]["words"]
                 if re.sub(r'(?i)stereo_[^\s]+', '', w["word"]).strip()
-            ])
+            ], fallback_start=0.0, fallback_end=fallback_end)
             
             # 👑 如果用户输入了手工文案，触发清洗和强行对齐
             if custom_text:
                 self.sig_ai_progress.emit("⏳ 正在用 NLP 算法清洗并对齐您的手工文案...")
                 cleaned_text = self._clean_and_format_user_text(custom_text)
-                clean_words = self._align_user_text_to_ai_words(clean_words, cleaned_text)
+                clean_words = self._align_user_text_to_ai_words(
+                    clean_words,
+                    cleaned_text,
+                    fallback_start=0.0,
+                    fallback_end=fallback_end,
+                )
             
             generated_subs = self.sanitize_subs_data(self.process_words(clean_words, c_mode, timing_mode))
             self.state["subs_data"], _ = rebalance_subtitle_layout(
@@ -6040,11 +7311,12 @@ body {{
             
             is_break = False
             
-            tiktok_smart = "智能听译" in mode or "4-6词" in mode or "4-6" in mode
+            narrative_block = is_reference_narrative_chunk_mode(mode)
+            tiktok_smart = "智能听译" in mode or "4-7词" in mode or "4-7" in mode
             smart_short = "智能重点" in mode or "3-4词为主" in mode
             natural_short = "自然短句" in mode or "1-4" in mode
             fixed_count = 0
-            if not natural_short and not smart_short and not tiktok_smart:
+            if not natural_short and not smart_short and not tiktok_smart and not narrative_block:
                 if "短句快速" in mode or "1-3" in mode:
                     fixed_count = 3
                 elif "双词" in mode or "2词" in mode:
@@ -6069,6 +7341,17 @@ body {{
                 is_break = True
             elif fixed_count:
                 is_break = w_len >= fixed_count or force_break
+            elif narrative_block:
+                if force_break and w_len >= 6:
+                    is_break = True
+                elif has_punct and w_len >= 8:
+                    is_break = True
+                elif silence_gap > 0.42 and w_len >= 8:
+                    is_break = True
+                elif is_key_word and w_len >= 10 and (silence_gap > 0.16 or curr_dur > 2.6):
+                    is_break = True
+                elif w_len >= 12:
+                    is_break = True
             elif tiktok_smart:
                 if force_break:
                     is_break = True
@@ -6150,6 +7433,16 @@ body {{
                 # 规则 3：如果当前词本身以冒号结尾 (例如 "31:")，绝不断开！
                 if w["word"].endswith(":"):
                     is_break = False
+
+                if is_break and should_defer_subtitle_break_for_readability(
+                    w.get("word", ""),
+                    next_word,
+                    segment_word_count=w_len,
+                    silence_gap=silence_gap,
+                    has_punct=has_punct,
+                    is_last_word=(i == len(words) - 1),
+                ):
+                    is_break = False
                     
             if is_break:
                 if ("双行" in mode or sound_aligned) and w_len >= 6:
@@ -6157,7 +7450,7 @@ body {{
                     curr["words"][mid]["text"] = "\n" + curr["words"][mid]["text"].lstrip()
                     
                 raw_text = " ".join([x["text"] for x in curr["words"]])
-                curr["text"] = raw_text.replace(" \n", "\n").replace("\n ", "\n")
+                curr["text"] = format_subtitle_text_spacing(raw_text)
                 
                 subs.append(curr)
                 curr = {"words": [], "track": 1}
@@ -6167,9 +7460,12 @@ body {{
                 mid = len(curr["words"]) // 2
                 curr["words"][mid]["text"] = "\n" + curr["words"][mid]["text"].lstrip()
             raw_text = " ".join([x["text"] for x in curr["words"]])
-            curr["text"] = raw_text.replace(" \n", "\n").replace("\n ", "\n")
+            curr["text"] = format_subtitle_text_spacing(raw_text)
             subs.append(curr)
-            
+
+        if narrative_block or "双行" in mode or "长句" in mode or "约10" in mode:
+            subs = merge_single_word_subtitle_segments(subs, max_merged_words=14)
+
         subs = self._apply_timing_mode(subs, timing_mode)
         if self.state.get("fill_subtitle_gaps", True):
             subs = self._fill_subtitle_gaps(subs)
@@ -6300,7 +7596,7 @@ body {{
             if parent and hasattr(parent, "is_auto_save_enabled") and not parent.is_auto_save_enabled():
                 return
 
-            json.dump(self.state, open(CACHE_FILE, 'w', encoding='utf-8'), ensure_ascii=False)
+            write_json_file(CACHE_FILE, self.state, indent=2)
             if hasattr(self, "project_autosave_timer"):
                 self.project_autosave_timer.start(1200)
         except Exception as e: 
@@ -6373,8 +7669,8 @@ body {{
                 clips = self.state.get("video_clips", [])
                 if clips:
                     self.btn_v.setText("✅ 已导原素材")
-                    self.player.setSource(QUrl.fromLocalFile(clips[0]["path"]))
-                    self.player.setLoops(QMediaPlayer.Loops.Infinite)
+                    self._prepare_preview_proxies_for_clips(clips, announce=True)
+                    self._prime_video_preview_source(clips[0], announce=True)
                     self.on_resolution_changed(self.state.get("resolution", get_output_resolution()))
                     self.generate_waveform(clips[0]["path"], "v_wave_pixmap")
                     threading.Thread(target=self._gen_thumbs_cache, daemon=True).start()
@@ -6387,6 +7683,7 @@ body {{
                     self.music_player.setSource(QUrl.fromLocalFile(self.state.get("music_path")))
                     self.music_player.setLoops(QMediaPlayer.Loops.Infinite)
                 self.render_ui_list()
+                self.refresh_media_pool()
                 self.switch_inspector("empty")
                 self.push_history() # 初始化历史栈
                 QTimer.singleShot(500, self._sync_duration_after_cache)
@@ -6398,7 +7695,10 @@ body {{
     def load_cache_on_boot(self):
         if not os.path.exists(CACHE_FILE): return
         try:
-            cached = json.load(open(CACHE_FILE, 'r', encoding='utf-8')); cached["subs_data"] = self.sanitize_subs_data(cached.get("subs_data", []))
+            cached = read_json_file(CACHE_FILE, default={})
+            if not isinstance(cached, dict):
+                return
+            cached["subs_data"] = self.sanitize_subs_data(cached.get("subs_data", []))
             merged_default_style = copy.deepcopy(self.default_style)
             if isinstance(cached.get("default_style"), dict):
                 merged_default_style.update(cached.get("default_style", {}))
@@ -6423,14 +7723,19 @@ body {{
             self.text_editor.blockSignals(False)
             clips = self.state.get("video_clips", [])
             if clips: 
-                self.btn_v.setText("✅ 已导原素材"); self.player.setSource(QUrl.fromLocalFile(clips[0]["path"])); self.player.setLoops(QMediaPlayer.Loops.Infinite); self.on_resolution_changed(self.state.get("resolution", get_output_resolution())); self.generate_waveform(clips[0]["path"], "v_wave_pixmap"); threading.Thread(target=self._gen_thumbs_cache, daemon=True).start()
+                self.btn_v.setText("✅ 已导原素材")
+                self._prepare_preview_proxies_for_clips(clips, announce=True)
+                self._prime_video_preview_source(clips[0], announce=True)
+                self.on_resolution_changed(self.state.get("resolution", get_output_resolution()))
+                self.generate_waveform(clips[0]["path"], "v_wave_pixmap")
+                threading.Thread(target=self._gen_thumbs_cache, daemon=True).start()
             if self.state.get("audio_path") and os.path.exists(self.state.get("audio_path")): 
                 self.btn_a.setText("✅ " + os.path.basename(self.state.get("audio_path"))[:15]); self.audio_player.setSource(QUrl.fromLocalFile(self.state.get("audio_path"))); self.generate_waveform(self.state.get("audio_path"), "a_wave_pixmap")
             if self.state.get("music_path") and os.path.exists(self.state.get("music_path")) and hasattr(self, "btn_music"):
                 self.btn_music.setText("✅ " + os.path.basename(self.state.get("music_path"))[:15])
                 self.music_player.setSource(QUrl.fromLocalFile(self.state.get("music_path")))
                 self.music_player.setLoops(QMediaPlayer.Loops.Infinite)
-            self.render_ui_list(); self.switch_inspector("empty"); 
+            self.render_ui_list(); self.refresh_media_pool(); self.switch_inspector("empty");
             self.push_history() # 初始化历史栈
             QTimer.singleShot(500, self._sync_duration_after_cache)
         except: pass
@@ -6438,7 +7743,7 @@ body {{
     def on_resolution_changed(self, text): 
         clips = self.state.get("video_clips", [])
         media_path = clips[0]["path"] if clips else ""
-        self.proj_width, self.proj_height = resolution_to_size(text or get_output_resolution(), media_path, get_video_dimensions)
+        self.proj_width, self.proj_height = resolution_to_size(text or get_output_resolution(), media_path, self._clip_dimensions_from_state)
         self.aspect_container.set_ratio(self.proj_width, self.proj_height); self.state["resolution"] = text
         self.browser.page().runJavaScript(f"if(typeof setResolution === 'function') setResolution({self.proj_width}, {self.proj_height});")
         self._sync_preview_overlay_transform()
@@ -6450,10 +7755,25 @@ body {{
         clips = self.state.get("video_clips", [])
         if not clips: return
         try:
-            tdir = os.path.join(tempfile.gettempdir(), "sh_v8_thumbs")
-            if not os.path.exists(tdir) or len(os.listdir(tdir)) == 0:
-                if os.path.exists(tdir): shutil.rmtree(tdir)
-                os.makedirs(tdir); subprocess.run([get_ffmpeg_cmd(), "-y", "-i", clips[0]["path"], "-vf", "fps=1", "-s", "80x45", os.path.join(tdir, "t_%04d.jpg")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000 if os.name == 'nt' else 0)
+            clip_path = clips[0].get("path", "")
+            if not clip_path or not os.path.exists(clip_path):
+                return
+            stat = os.stat(clip_path)
+            cache_sig = f"{os.path.abspath(clip_path)}|{stat.st_mtime_ns}|{stat.st_size}"
+            cache_key = hashlib.sha1(cache_sig.encode("utf-8", "replace")).hexdigest()[:18]
+            tdir = os.path.join(tempfile.gettempdir(), f"sh_v8_thumbs_{cache_key}")
+            os.makedirs(tdir, exist_ok=True)
+            if len([f for f in os.listdir(tdir) if f.endswith('.jpg')]) == 0:
+                heavy_clip = clip_should_auto_proxy(self._ensure_clip_import_metadata(clips[0]))
+                thumb_seconds = "60" if heavy_clip else "180"
+                thumb_fps = "0.25" if heavy_clip else "0.5"
+                thumb_filter = f"fps={thumb_fps},scale=80:45:force_original_aspect_ratio=decrease,pad=80:45:(ow-iw)/2:(oh-ih)/2"
+                subprocess.run(
+                    [get_ffmpeg_cmd(), "-y", "-i", clip_path, "-an", "-t", thumb_seconds, "-vf", thumb_filter, "-threads", "1", os.path.join(tdir, "t_%04d.jpg")],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=0x08000000 if os.name == 'nt' else 0,
+                )
             files = sorted([os.path.join(tdir, f) for f in os.listdir(tdir) if f.endswith('.jpg')]); QTimer.singleShot(0, lambda: self._load_thumbs_ui(files))
         except: pass
 

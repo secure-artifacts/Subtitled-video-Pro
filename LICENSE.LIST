@@ -1,6 +1,6 @@
 # Dependency License List
 
-> Generated: 2026-05-30
+> Generated: 2026-06-04
 > Audit guide: https://tpscsm-docs.pages.dev/license-audit/
 > Scope: Direct runtime dependencies only. Development/build-only tools and bundled assets are listed separately.
 
@@ -10,9 +10,9 @@
 | --- | ---: | --- |
 | GPL-3.0-only | 2 | High attention: strong copyleft, requires GPL-compatible project distribution unless commercial PyQt/PyQt-WebEngine license is held |
 | Apache-2.0 | 2 | Low: permissive, keep license and notices |
-| MIT | 1 | Low: permissive, keep license and notices |
+| MIT | 0 | None |
 
-Total direct runtime dependencies: 5
+Total direct runtime dependencies: 4
 
 ## Direct Dependency Details
 
@@ -22,7 +22,6 @@ Total direct runtime dependencies: 5
 | 2 | PyQt6-WebEngine | 6.11.0 | PyPI | GPL-3.0-only or Riverbank commercial license | https://pypi.org/project/PyQt6-WebEngine/ | Confirmed | Open source under GPL; commercial alternative available | High attention | Riverbank states PyQt-WebEngine is not available under LGPL |
 | 3 | requests | 2.34.2 | PyPI | Apache-2.0 | https://pypi.org/project/requests/ | Confirmed | Open source | Low | Keep Apache-2.0 attribution and notices |
 | 4 | playwright | 1.59.0 | PyPI | Apache-2.0 | https://pypi.org/project/playwright/ | Confirmed | Open source | Low | Keep Apache-2.0 attribution and notices |
-| 5 | konva | 10.3.0 | npm | MIT | https://www.npmjs.com/package/konva | Confirmed | Open source | Low | Canvas engine for the Design Room page/layer editor |
 
 ## Publication-Relevant Components Outside Direct Runtime Dependency Scope
 

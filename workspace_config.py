@@ -1,8 +1,8 @@
 import json
 import os
 
+from app_config import CONFIG_FILE, load_app_config, save_app_config
 
-CONFIG_FILE = os.path.join(os.getcwd(), "settings.json")
 WORKSPACE_MODE_LOCAL = "local"
 WORKSPACE_MODE_CLOUD = "cloud"
 CLOUD_LINK_MODE_COLLAB = "collaborate"
@@ -15,19 +15,12 @@ def default_local_workspace():
 
 
 def _load_settings():
-    if not os.path.exists(CONFIG_FILE):
-        return {}
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    return load_app_config()
 
 
 def _save_settings(data):
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        save_app_config(data)
     except Exception:
         pass
 
