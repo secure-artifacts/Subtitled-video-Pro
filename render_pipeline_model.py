@@ -134,10 +134,96 @@ def ffmpeg_layer_scale_filter(scale=1.0, canvas_w=None, canvas_h=None, fit="cove
         target_h = max(1, int(round(canvas_h * scale)))
         fit = str(fit or "cover").lower()
         aspect_mode = "decrease" if fit == "contain" else "increase"
-        return f"scale={target_w}:{target_h}:force_original_aspect_ratio={aspect_mode}:flags=lanczos"
+        return f"scale={target_w}:{target_h}:force_original_aspect_ratio={aspect_mode}:flags=lanczos,setsar=1"
     if abs(scale - 1.0) < 0.000001:
         return "scale=iw:ih:flags=lanczos"
     return f"scale=iw*{scale:.6f}:ih*{scale:.6f}:flags=lanczos"
+
+
+def even_dimension(value, default=2) -> int:
+    try:
+        value = int(round(float(value)))
+    except Exception:
+        value = int(default or 2)
+    value = max(2, value)
+    return value if value % 2 == 0 else value + 1
+
+
+def ffmpeg_exact_layer_filter(scale=1.0, canvas_w=1080, canvas_h=1920) -> str:
+    try:
+        scale = max(0.01, float(scale or 1.0))
+    except Exception:
+        scale = 1.0
+    target_w = even_dimension(float(canvas_w or 1080) * scale, canvas_w or 1080)
+    target_h = even_dimension(float(canvas_h or 1920) * scale, canvas_h or 1920)
+    return (
+        f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={target_w}:{target_h},fps=30,setsar=1,format=rgba"
+    )
+
+
+def build_looped_assembly_segments(
+    path,
+    timeline_duration,
+    source_in=0.0,
+    source_out=None,
+    source_offset=0.0,
+    speed=1.0,
+    is_image=False,
+):
+    try:
+        timeline_duration = max(0.001, float(timeline_duration or 0.0))
+    except Exception:
+        timeline_duration = 0.001
+    try:
+        speed = max(0.05, float(speed or 1.0))
+    except Exception:
+        speed = 1.0
+    try:
+        source_in = max(0.0, float(source_in or 0.0))
+    except Exception:
+        source_in = 0.0
+    try:
+        source_out = float(source_out) if source_out is not None else source_in + timeline_duration * speed
+    except Exception:
+        source_out = source_in + timeline_duration * speed
+    source_out = max(source_in + 0.001, source_out)
+
+    if is_image:
+        return [{
+            "path": path,
+            "ss": source_in,
+            "source_dur": timeline_duration,
+            "timeline_dur": timeline_duration,
+            "speed": 1.0,
+            "is_image": True,
+        }]
+
+    source_len = max(0.001, source_out - source_in)
+    try:
+        source_offset = max(0.0, float(source_offset or 0.0))
+    except Exception:
+        source_offset = 0.0
+    cursor = source_in + ((source_offset * speed) % source_len)
+    remaining = timeline_duration
+    segments = []
+    guard = 0
+    while remaining > 0.001 and guard < 10000:
+        guard += 1
+        source_available = max(0.001, source_out - cursor)
+        source_dur = min(max(0.001, remaining * speed), source_available)
+        timeline_part = min(remaining, source_dur / speed if speed > 0 else source_dur)
+        segments.append({
+            "path": path,
+            "ss": cursor,
+            "source_dur": source_dur,
+            "timeline_dur": timeline_part,
+            "speed": speed,
+            "is_image": False,
+        })
+        remaining -= timeline_part
+        cursor = source_in
+    return segments
 
 
 def ffmpeg_layer_overlay_xy(pos_x=0.0, pos_y=0.0) -> tuple[str, str]:

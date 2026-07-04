@@ -1,4 +1,8 @@
-from PyQt6.QtCore import Qt, pyqtSignal
+import os
+import subprocess
+
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QFrame,
@@ -6,8 +10,11 @@ from PyQt6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
+    QApplication,
 )
 
 
@@ -41,6 +48,8 @@ class MediaPoolPanel(QFrame):
         self.list_widget = QListWidget()
         self.list_widget.setFixedHeight(122)
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self._show_context_menu)
         self.list_widget.currentItemChanged.connect(self._emit_selection)
         self.list_widget.itemDoubleClicked.connect(lambda *_: self.addRequested.emit())
         root.addWidget(self.list_widget)
@@ -85,6 +94,9 @@ class MediaPoolPanel(QFrame):
         for label, payload in items:
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, payload)
+            path = str((payload or {}).get("path", "") or "") if isinstance(payload, dict) else ""
+            if path:
+                item.setToolTip(path)
             self.list_widget.addItem(item)
 
         count = len(items)
@@ -114,3 +126,68 @@ class MediaPoolPanel(QFrame):
     def _emit_selection(self, current, _previous):
         payload = current.data(Qt.ItemDataRole.UserRole) if current else {}
         self.selectionChangedPayload.emit(payload if isinstance(payload, dict) else {})
+
+    def _payload_path(self, payload):
+        if not isinstance(payload, dict):
+            return ""
+        return str(payload.get("path") or payload.get("source_path") or payload.get("original_path") or "").strip()
+
+    def _open_path_folder(self, path):
+        path = str(path or "").strip()
+        if not path:
+            return
+        folder = os.path.dirname(path) if os.path.splitext(path)[1] else path
+        target = path if os.path.exists(path) else folder
+        if os.name == "nt":
+            try:
+                if os.path.exists(path) and os.path.isfile(path):
+                    subprocess.Popen(["explorer", f"/select,{os.path.normpath(path)}"])
+                elif folder and os.path.isdir(folder):
+                    os.startfile(folder)
+                else:
+                    QMessageBox.warning(self, "找不到文件夹", f"路径不存在：\n{path}")
+                return
+            except Exception:
+                pass
+        if target and os.path.exists(target):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(target if os.path.isdir(target) else os.path.dirname(target)))
+        else:
+            QMessageBox.warning(self, "找不到文件夹", f"路径不存在：\n{path}")
+
+    def _open_file(self, path):
+        path = str(path or "").strip()
+        if not path or not os.path.exists(path):
+            return QMessageBox.warning(self, "找不到素材", f"素材文件不存在：\n{path}")
+        if os.name == "nt":
+            try:
+                os.startfile(path)
+                return
+            except Exception:
+                pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _show_context_menu(self, pos):
+        item = self.list_widget.itemAt(pos)
+        if item is None:
+            return
+        self.list_widget.setCurrentItem(item)
+        payload = item.data(Qt.ItemDataRole.UserRole)
+        path = self._payload_path(payload)
+        if not path:
+            return
+        menu = QMenu(self)
+        show_action = menu.addAction("显示完整路径")
+        copy_action = menu.addAction("复制素材路径")
+        folder_action = menu.addAction("打开所在文件夹")
+        file_action = menu.addAction("打开素材文件")
+        if not os.path.exists(path):
+            file_action.setEnabled(False)
+        chosen = menu.exec(self.list_widget.viewport().mapToGlobal(pos))
+        if chosen == show_action:
+            QMessageBox.information(self, "素材完整路径", path)
+        elif chosen == copy_action:
+            QApplication.clipboard().setText(path)
+        elif chosen == folder_action:
+            self._open_path_folder(path)
+        elif chosen == file_action:
+            self._open_file(path)

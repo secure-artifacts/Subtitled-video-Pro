@@ -34,3 +34,23 @@ ffprobe.exe
 Thumbs.db
 .idea/
 .vscode/
+# Local automation, caches, and private backups
+.codex/
+.agents/
+_backup*/
+.pytest_cache/
+.mypy_cache/
+
+# User media and generated project assets
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.srt
+*.ass

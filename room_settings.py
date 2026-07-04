@@ -24,6 +24,16 @@ from render_config import (
     peek_render_profile,
 )
 from font_registry import FONT_REGISTRY_FILE, STATUS_NONCOMMERCIAL, load_font_registry, reset_to_open_font_policy, upsert_approved_fonts
+from ai_transcription import DEFAULT_GROQ_MODEL, parse_transcription_provider_order
+from canva_connect import (
+    DEFAULT_CANVA_REDIRECT_URI,
+    DEFAULT_CANVA_SCOPES,
+    build_authorization_url,
+    exchange_authorization_code,
+    generate_pkce_pair,
+    generate_state,
+    store_token_response,
+)
 from app_config import (
     CONFIG_FILE,
     DEFAULT_SHORTCUTS,
@@ -468,6 +478,152 @@ class SettingsView(QWidget):
         self.font_section = self._add_section(font_tab_layout, "字体版权登记", font_frame, "#f9e2af", expanded=True)
 
         # 👑 账号池大框架
+        ai_transcription_frame = QFrame()
+        ai_transcription_frame.setStyleSheet("background-color: #181825; border-radius: 10px; border: 1px solid #a6e3a1;")
+        ai_transcription_layout = QVBoxLayout(ai_transcription_frame)
+        ai_transcription_layout.setContentsMargins(25, 18, 25, 18)
+        ai_transcription_layout.setSpacing(10)
+
+        lbl_ai_transcription_title = QLabel("AI \u542c\u8bd1\u670d\u52a1\u4e0e\u4f18\u5148\u7ea7")
+        lbl_ai_transcription_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #a6e3a1; border: none;")
+        ai_transcription_layout.addWidget(lbl_ai_transcription_title)
+
+        lbl_ai_transcription_desc = QLabel("\u9ed8\u8ba4 Groq \u4f18\u5148\uff0cGroq \u5931\u8d25\u3001\u8d85\u989d\u6216\u8fd4\u56de\u5f02\u5e38\u65f6\u81ea\u52a8\u5207\u5230 Cloudflare\u3002\u540e\u7eed\u65b0\u589e API \u53ea\u9700\u6269\u5c55\u8fd9\u4e2a\u961f\u5217\u3002")
+        lbl_ai_transcription_desc.setWordWrap(True)
+        lbl_ai_transcription_desc.setStyleSheet("color: #a6adc8; font-size: 13px; border: none;")
+        ai_transcription_layout.addWidget(lbl_ai_transcription_desc)
+
+        priority_row = QHBoxLayout()
+        priority_row.addWidget(QLabel("\u542c\u8bd1\u4f18\u5148\u7ea7:", styleSheet="color:#cdd6f4; font-weight: bold; border:none;"))
+        self.ai_transcription_priority_combo = QComboBox()
+        self.ai_transcription_priority_combo.addItem("\u81ea\u52a8\uff1aGroq \u2192 Cloudflare", ["groq", "cloudflare"])
+        self.ai_transcription_priority_combo.addItem("\u81ea\u52a8\uff1aCloudflare \u2192 Groq", ["cloudflare", "groq"])
+        self.ai_transcription_priority_combo.addItem("\u4ec5 Groq", ["groq"])
+        self.ai_transcription_priority_combo.addItem("\u4ec5 Cloudflare", ["cloudflare"])
+        self.ai_transcription_priority_combo.setStyleSheet("background-color:#11111b; color:#cdd6f4; border:1px solid #45475a; border-radius:6px; padding:8px; font-weight:bold;")
+        priority_row.addWidget(self.ai_transcription_priority_combo, stretch=1)
+        ai_transcription_layout.addLayout(priority_row)
+
+        groq_key_label = QLabel("Groq API Key \u6c60\uff08\u6bcf\u884c\u4e00\u4e2a\uff09")
+        groq_key_label.setStyleSheet("color:#f9e2af; font-weight:bold; border:none;")
+        ai_transcription_layout.addWidget(groq_key_label)
+        self.txt_groq_keys = QTextEdit()
+        self.txt_groq_keys.setFixedHeight(94)
+        self.txt_groq_keys.setPlaceholderText("gsk_...\n\u53ef\u4ee5\u586b\u591a\u4e2a\uff0c\u5931\u8d25\u65f6\u4f1a\u81ea\u52a8\u6362\u4e0b\u4e00\u4e2a")
+        self.txt_groq_keys.setStyleSheet("QTextEdit { background-color:#11111b; color:#a6e3a1; font-family:Consolas; font-size:13px; border:1px solid #45475a; border-radius:6px; padding:10px; }")
+        ai_transcription_layout.addWidget(self.txt_groq_keys)
+
+        groq_option_row = QHBoxLayout()
+        groq_option_row.addWidget(QLabel("Groq \u6a21\u578b:", styleSheet="color:#cdd6f4; border:none;"))
+        self.groq_model_combo = QComboBox()
+        self.groq_model_combo.addItems(["whisper-large-v3-turbo", "whisper-large-v3"])
+        self.groq_model_combo.setStyleSheet("background-color:#11111b; color:#cdd6f4; border:1px solid #45475a; border-radius:6px; padding:8px;")
+        groq_option_row.addWidget(self.groq_model_combo, stretch=1)
+        groq_option_row.addWidget(QLabel("\u8bed\u8a00:", styleSheet="color:#cdd6f4; border:none;"))
+        self.txt_groq_language = QLineEdit()
+        self.txt_groq_language.setPlaceholderText("en / auto")
+        self.txt_groq_language.setFixedWidth(110)
+        self.txt_groq_language.setStyleSheet("background-color:#11111b; color:#cdd6f4; border:1px solid #45475a; border-radius:6px; padding:8px;")
+        groq_option_row.addWidget(self.txt_groq_language)
+        ai_transcription_layout.addLayout(groq_option_row)
+
+        btn_save_ai_transcription = QPushButton("\u4fdd\u5b58 AI \u542c\u8bd1\u914d\u7f6e")
+        btn_save_ai_transcription.setFixedHeight(38)
+        btn_save_ai_transcription.setStyleSheet("background-color:#a6e3a1; color:#11111b; font-weight:bold; border-radius:6px; padding:0 16px; border:none;")
+        btn_save_ai_transcription.clicked.connect(self.save_config)
+        ai_transcription_layout.addWidget(btn_save_ai_transcription)
+
+        self.ai_transcription_section = self._add_section(cloud_tab_layout, "AI \u542c\u8bd1\u670d\u52a1\u4f18\u5148\u7ea7", ai_transcription_frame, "#a6e3a1", expanded=True)
+
+
+        canva_frame = QFrame()
+        canva_frame.setStyleSheet("background-color: #181825; border-radius: 10px; border: 1px solid #f9e2af;")
+        canva_layout = QVBoxLayout(canva_frame)
+        canva_layout.setContentsMargins(25, 18, 25, 18)
+        canva_layout.setSpacing(10)
+
+        lbl_canva_title = QLabel("Canva 联动授权")
+        lbl_canva_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #f9e2af; border: none;")
+        canva_layout.addWidget(lbl_canva_title)
+
+        lbl_canva_desc = QLabel("用于透明 WebM 字幕层导出后的 Canva 素材库上传。官方 Connect API 需要 OAuth 2.0 + PKCE；回调地址必须和 Canva 开发者后台一致。")
+        lbl_canva_desc.setWordWrap(True)
+        lbl_canva_desc.setStyleSheet("color: #a6adc8; font-size: 13px; border: none;")
+        canva_layout.addWidget(lbl_canva_desc)
+
+        canva_client_row = QHBoxLayout()
+        canva_client_row.addWidget(QLabel("Client ID:", styleSheet="color:#cdd6f4; font-weight:bold; border:none;"))
+        self.txt_canva_client_id = QLineEdit()
+        self.txt_canva_client_id.setPlaceholderText("Canva OAuth Client ID")
+        self.txt_canva_client_id.setStyleSheet("background-color:#11111b; color:#cdd6f4; border:1px solid #45475a; border-radius:6px; padding:8px;")
+        canva_client_row.addWidget(self.txt_canva_client_id, stretch=1)
+        canva_layout.addLayout(canva_client_row)
+
+        canva_secret_row = QHBoxLayout()
+        canva_secret_row.addWidget(QLabel("Client Secret:", styleSheet="color:#cdd6f4; font-weight:bold; border:none;"))
+        self.txt_canva_client_secret = QLineEdit()
+        self.txt_canva_client_secret.setEchoMode(QLineEdit.EchoMode.Password)
+        self.txt_canva_client_secret.setPlaceholderText("Canva OAuth Client Secret")
+        self.txt_canva_client_secret.setStyleSheet("background-color:#11111b; color:#cdd6f4; border:1px solid #45475a; border-radius:6px; padding:8px;")
+        canva_secret_row.addWidget(self.txt_canva_client_secret, stretch=1)
+        canva_layout.addLayout(canva_secret_row)
+
+        canva_redirect_row = QHBoxLayout()
+        canva_redirect_row.addWidget(QLabel("回调地址:", styleSheet="color:#cdd6f4; font-weight:bold; border:none;"))
+        self.txt_canva_redirect_uri = QLineEdit()
+        self.txt_canva_redirect_uri.setPlaceholderText(DEFAULT_CANVA_REDIRECT_URI)
+        self.txt_canva_redirect_uri.setStyleSheet("background-color:#11111b; color:#cdd6f4; border:1px solid #45475a; border-radius:6px; padding:8px;")
+        canva_redirect_row.addWidget(self.txt_canva_redirect_uri, stretch=1)
+        canva_layout.addLayout(canva_redirect_row)
+
+        canva_scope_row = QHBoxLayout()
+        canva_scope_row.addWidget(QLabel("授权范围:", styleSheet="color:#cdd6f4; font-weight:bold; border:none;"))
+        self.txt_canva_scopes = QLineEdit()
+        self.txt_canva_scopes.setPlaceholderText(DEFAULT_CANVA_SCOPES)
+        self.txt_canva_scopes.setStyleSheet("background-color:#11111b; color:#cdd6f4; border:1px solid #45475a; border-radius:6px; padding:8px;")
+        canva_scope_row.addWidget(self.txt_canva_scopes, stretch=1)
+        canva_layout.addLayout(canva_scope_row)
+
+        self.chk_canva_auto_upload = QCheckBox("导出 Canva 透明 WebM 后自动上传到 Canva 素材库")
+        self.chk_canva_auto_upload.setStyleSheet("color:#cdd6f4; font-weight:700; border:none;")
+        canva_layout.addWidget(self.chk_canva_auto_upload)
+
+        canva_code_row = QHBoxLayout()
+        canva_code_row.addWidget(QLabel("授权回调 code:", styleSheet="color:#cdd6f4; font-weight:bold; border:none;"))
+        self.txt_canva_auth_code = QLineEdit()
+        self.txt_canva_auth_code.setPlaceholderText("授权后粘贴完整回调地址，或只粘贴 code= 后面的值")
+        self.txt_canva_auth_code.setStyleSheet("background-color:#11111b; color:#cdd6f4; border:1px solid #45475a; border-radius:6px; padding:8px;")
+        canva_code_row.addWidget(self.txt_canva_auth_code, stretch=1)
+        canva_layout.addLayout(canva_code_row)
+
+        canva_button_row = QHBoxLayout()
+        self.btn_canva_open_dev = QPushButton("打开 Canva 开发者后台")
+        self.btn_canva_start_auth = QPushButton("开始授权")
+        self.btn_canva_exchange_code = QPushButton("兑换授权")
+        self.btn_save_canva = QPushButton("保存 Canva 配置")
+        for btn in (self.btn_canva_open_dev, self.btn_canva_start_auth, self.btn_canva_exchange_code, self.btn_save_canva):
+            btn.setFixedHeight(36)
+            btn.setStyleSheet("background-color:#313244; color:#cdd6f4; font-weight:bold; border-radius:6px; padding:0 12px; border:none;")
+        self.btn_canva_start_auth.setStyleSheet("background-color:#f9e2af; color:#11111b; font-weight:bold; border-radius:6px; padding:0 12px; border:none;")
+        self.btn_canva_exchange_code.setStyleSheet("background-color:#a6e3a1; color:#11111b; font-weight:bold; border-radius:6px; padding:0 12px; border:none;")
+        self.btn_canva_open_dev.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://www.canva.dev/developers/")))
+        self.btn_canva_start_auth.clicked.connect(self.start_canva_authorization_ui)
+        self.btn_canva_exchange_code.clicked.connect(self.exchange_canva_authorization_code_ui)
+        self.btn_save_canva.clicked.connect(self.save_config)
+        canva_button_row.addWidget(self.btn_canva_open_dev)
+        canva_button_row.addWidget(self.btn_canva_start_auth)
+        canva_button_row.addWidget(self.btn_canva_exchange_code)
+        canva_button_row.addWidget(self.btn_save_canva)
+        canva_button_row.addStretch()
+        canva_layout.addLayout(canva_button_row)
+
+        self.lbl_canva_status = QLabel("未授权：先在 Canva 开发者后台创建 App，并填写 Client ID / Secret。")
+        self.lbl_canva_status.setWordWrap(True)
+        self.lbl_canva_status.setStyleSheet("color:#f9e2af; font-size:12px; border:none;")
+        canva_layout.addWidget(self.lbl_canva_status)
+
+        self.canva_section = self._add_section(cloud_tab_layout, "Canva 联动授权", canva_frame, "#f9e2af", expanded=False)
+
         pool_frame = QFrame()
         pool_frame.setStyleSheet("background-color: #181825; border-radius: 10px; border: 1px solid #313244;")
         pool_layout = QVBoxLayout(pool_frame)
@@ -490,12 +646,12 @@ class SettingsView(QWidget):
         self.txt_accounts.setPlaceholderText("粘贴您的账号阵列，例如:\nf48b2db71fc565c2abfc..., abcdefg1234567890...\n1234567890abcdef..., xyz0987654321...")
         self.txt_accounts.setStyleSheet("""
             QTextEdit {
-                background-color: #11111b; 
-                color: #a6e3a1; 
-                font-family: Consolas; 
-                font-size: 14px; 
-                border: 1px solid #45475a; 
-                border-radius: 6px; 
+                background-color: #11111b;
+                color: #a6e3a1;
+                font-family: Consolas;
+                font-size: 14px;
+                border: 1px solid #45475a;
+                border-radius: 6px;
                 padding: 10px;
             }
         """)
@@ -506,10 +662,10 @@ class SettingsView(QWidget):
         btn_save.setFixedHeight(45)
         btn_save.setStyleSheet("""
             QPushButton {
-                background-color: #f59e0b; 
-                color: #11111b; 
-                font-size: 16px; 
-                font-weight: bold; 
+                background-color: #f59e0b;
+                color: #11111b;
+                font-size: 16px;
+                font-weight: bold;
                 border-radius: 6px;
                 border: none;
             }
@@ -640,6 +796,148 @@ class SettingsView(QWidget):
         self.preview_fullscreen_shortcut_edit.setKeySequence(QKeySequence(default))
         self.save_shortcuts_ui()
 
+    def _parse_groq_keys_from_ui(self):
+        if not hasattr(self, "txt_groq_keys"):
+            return []
+        raw = self.txt_groq_keys.toPlainText().replace(",", "\n")
+        keys = []
+        for line in raw.splitlines():
+            key = line.strip()
+            if key and key not in keys:
+                keys.append(key)
+        return keys
+
+    def _current_transcription_priority_order(self):
+        combo = getattr(self, "ai_transcription_priority_combo", None)
+        if combo is None:
+            return ["groq", "cloudflare"]
+        return parse_transcription_provider_order(combo.currentData())
+
+    def _set_transcription_priority_order(self, order):
+        combo = getattr(self, "ai_transcription_priority_combo", None)
+        if combo is None:
+            return
+        parsed = parse_transcription_provider_order(order)
+        for index in range(combo.count()):
+            if parse_transcription_provider_order(combo.itemData(index)) == parsed:
+                combo.setCurrentIndex(index)
+                return
+        combo.setCurrentIndex(0)
+
+
+    def _current_canva_config_from_ui(self):
+        return {
+            "canva_client_id": self.txt_canva_client_id.text().strip() if hasattr(self, "txt_canva_client_id") else "",
+            "canva_client_secret": self.txt_canva_client_secret.text().strip() if hasattr(self, "txt_canva_client_secret") else "",
+            "canva_redirect_uri": self.txt_canva_redirect_uri.text().strip() if hasattr(self, "txt_canva_redirect_uri") else DEFAULT_CANVA_REDIRECT_URI,
+            "canva_scopes": self.txt_canva_scopes.text().strip() if hasattr(self, "txt_canva_scopes") else DEFAULT_CANVA_SCOPES,
+            "canva_auto_upload": bool(self.chk_canva_auto_upload.isChecked()) if hasattr(self, "chk_canva_auto_upload") else False,
+        }
+
+    def _merge_canva_config(self, base=None):
+        cfg = dict(base if isinstance(base, dict) else load_app_config())
+        cfg.update(self._current_canva_config_from_ui())
+        save_app_config(cfg)
+        return cfg
+
+    def load_canva_ui(self, config=None):
+        if not hasattr(self, "txt_canva_client_id"):
+            return
+        config = config if isinstance(config, dict) else load_app_config()
+        self.txt_canva_client_id.setText(str(config.get("canva_client_id") or ""))
+        self.txt_canva_client_secret.setText(str(config.get("canva_client_secret") or ""))
+        self.txt_canva_redirect_uri.setText(str(config.get("canva_redirect_uri") or DEFAULT_CANVA_REDIRECT_URI))
+        self.txt_canva_scopes.setText(str(config.get("canva_scopes") or DEFAULT_CANVA_SCOPES))
+        self.chk_canva_auto_upload.setChecked(bool(config.get("canva_auto_upload", False)))
+        token_ok = bool(config.get("canva_access_token") or config.get("canva_refresh_token"))
+        if token_ok:
+            self.lbl_canva_status.setText("已保存 Canva 授权 Token。透明 WebM 导出后可按开关自动上传到 Canva 素材库。")
+            self.lbl_canva_status.setStyleSheet("color:#a6e3a1; font-size:12px; border:none;")
+        else:
+            self.lbl_canva_status.setText("未授权：填写 Canva App 的 Client ID / Secret 后，点击开始授权，再粘贴回调 code 兑换。")
+            self.lbl_canva_status.setStyleSheet("color:#f9e2af; font-size:12px; border:none;")
+
+    def start_canva_authorization_ui(self):
+        cfg = self._merge_canva_config()
+        client_id = str(cfg.get("canva_client_id") or "").strip()
+        if not client_id:
+            QMessageBox.warning(self, "Canva 授权", "请先填写 Canva OAuth Client ID。")
+            return
+        verifier, challenge = generate_pkce_pair()
+        state = generate_state()
+        cfg["canva_oauth_code_verifier"] = verifier
+        cfg["canva_oauth_state"] = state
+        save_app_config(cfg)
+        url = build_authorization_url(client_id, cfg.get("canva_redirect_uri"), cfg.get("canva_scopes"), challenge, state)
+        QDesktopServices.openUrl(QUrl(url))
+        self.lbl_canva_status.setText("已打开 Canva 授权页。完成授权后，把浏览器地址栏里的完整回调地址或 code 粘到下方再点兑换授权。")
+        self.lbl_canva_status.setStyleSheet("color:#89b4fa; font-size:12px; border:none;")
+
+    def _extract_canva_code(self, value):
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        if "code=" in raw:
+            try:
+                from urllib.parse import urlparse, parse_qs
+                parsed = urlparse(raw)
+                code = parse_qs(parsed.query).get("code", [""])[0]
+                return code.strip()
+            except Exception:
+                pass
+            return raw.split("code=", 1)[1].split("&", 1)[0].strip()
+        return raw
+
+    def exchange_canva_authorization_code_ui(self):
+        cfg = self._merge_canva_config()
+        code = self._extract_canva_code(self.txt_canva_auth_code.text() if hasattr(self, "txt_canva_auth_code") else "")
+        if not code:
+            QMessageBox.warning(self, "Canva 授权", "请先粘贴 Canva 回调 code 或完整回调地址。")
+            return
+        verifier = str(cfg.get("canva_oauth_code_verifier") or "").strip()
+        if not verifier:
+            QMessageBox.warning(self, "Canva 授权", "缺少 PKCE verifier，请重新点击“开始授权”。")
+            return
+        try:
+            token_data = exchange_authorization_code(
+                cfg.get("canva_client_id"),
+                cfg.get("canva_client_secret"),
+                code,
+                verifier,
+                cfg.get("canva_redirect_uri"),
+            )
+            cfg = store_token_response(cfg, token_data)
+            cfg.pop("canva_oauth_code_verifier", None)
+            cfg.pop("canva_oauth_state", None)
+            save_app_config(cfg)
+            self.txt_canva_auth_code.clear()
+            self.load_canva_ui(cfg)
+            QMessageBox.information(self, "Canva 授权", "Canva 授权成功，Token 已保存。")
+        except Exception as e:
+            QMessageBox.critical(self, "Canva 授权失败", str(e))
+
+    def load_ai_transcription_ui(self, config=None):
+        if not hasattr(self, "txt_groq_keys"):
+            return
+        config = config if isinstance(config, dict) else load_app_config()
+        keys = config.get("groq_api_keys", [])
+        if isinstance(keys, str):
+            keys = [item.strip() for item in keys.replace(",", "\n").splitlines() if item.strip()]
+        elif not isinstance(keys, list):
+            keys = []
+        legacy_key = str(config.get("groq_api_key") or "").strip()
+        if legacy_key and legacy_key not in keys:
+            keys.insert(0, legacy_key)
+        self.txt_groq_keys.setPlainText("\n".join(str(item).strip() for item in keys if str(item).strip()))
+        model = str(config.get("groq_whisper_model") or DEFAULT_GROQ_MODEL).strip() or DEFAULT_GROQ_MODEL
+        if hasattr(self, "groq_model_combo"):
+            if self.groq_model_combo.findText(model) < 0:
+                self.groq_model_combo.addItem(model)
+            self.groq_model_combo.setCurrentText(model)
+        if hasattr(self, "txt_groq_language"):
+            self.txt_groq_language.setText(str(config.get("groq_transcription_language") or "en").strip() or "en")
+        self._set_transcription_priority_order(config.get("ai_transcription_provider_order", ["groq", "cloudflare"]))
+
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
             try:
@@ -669,6 +967,9 @@ class SettingsView(QWidget):
             self.preview_fullscreen_shortcut_edit.setKeySequence(QKeySequence(shortcut))
             self.preview_fullscreen_shortcut_edit.blockSignals(False)
             self.lbl_shortcuts_status.setText(f"当前预览全屏快捷键：{shortcut}")
+        app_cfg = load_app_config()
+        self.load_ai_transcription_ui(app_cfg)
+        self.load_canva_ui(app_cfg)
         self.load_update_ui()
 
     def load_update_ui(self):
@@ -904,21 +1205,21 @@ class SettingsView(QWidget):
     def save_config(self):
         raw_text = self.txt_accounts.toPlainText().strip()
         lines = raw_text.split('\n')
-        
+
         valid_accounts = []
         for line in lines:
             line = line.strip()
             if not line: continue
-            
+
             # 智能兼容：把中文逗号替换成英文逗号
             line = line.replace('，', ',')
-            
+
             # 智能拆分：逗号或空格隔开的都能识别
             if ',' in line:
                 parts = line.split(',', 1)
             else:
                 parts = line.split(maxsplit=1)
-                
+
             if len(parts) == 2:
                 acc_id = parts[0].strip()
                 acc_token = parts[1].strip()
@@ -935,15 +1236,22 @@ class SettingsView(QWidget):
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     config = json.load(f)
             except: pass
-                
+
         # 写入 cf_accounts 数组，完美对接房间 1 和 2 的负载均衡
         config["cf_accounts"] = valid_accounts
         config["sync_url"] = self.txt_sync_url.text().strip() or DEFAULT_SYNC_URL
-        
+        config["groq_api_keys"] = self._parse_groq_keys_from_ui()
+        config["groq_whisper_model"] = self.groq_model_combo.currentText().strip() if hasattr(self, "groq_model_combo") else DEFAULT_GROQ_MODEL
+        config["groq_transcription_language"] = self.txt_groq_language.text().strip() if hasattr(self, "txt_groq_language") else "en"
+        config["ai_transcription_provider_order"] = self._current_transcription_priority_order()
+        if hasattr(self, "txt_canva_client_id"):
+            config.update(self._current_canva_config_from_ui())
+
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=4, ensure_ascii=False)
-            QMessageBox.information(self, "保存成功", f"✅ 成功入库 {len(valid_accounts)} 个 AI 账号！\n底层引擎现已火力全开，无缝负载均衡机制已激活！")
+            canva_state = "，Canva 已授权" if config.get("canva_access_token") or config.get("canva_refresh_token") else "，Canva 未授权"
+            QMessageBox.information(self, "\u4fdd\u5b58\u6210\u529f", f"\u2705 Cloudflare {len(valid_accounts)} \u4e2a\uff0cGroq {len(config.get('groq_api_keys', []))} \u4e2a{canva_state}\u3002\nAI \u542c\u8bd1\u4f1a\u6309\u4f60\u8bbe\u7f6e\u7684\u4f18\u5148\u7ea7\u81ea\u52a8\u5c1d\u8bd5\u3002")
         except Exception as e:
             QMessageBox.critical(self, "保存失败", f"无法保存配置文件：\n{str(e)}")
 
@@ -1021,4 +1329,3 @@ class SettingsView(QWidget):
         else:
             self.lbl_sync_status.setText("同步失败")
             QMessageBox.critical(self, "同步失败", message)
- 

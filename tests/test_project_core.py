@@ -221,8 +221,8 @@ class ChunkModeConfigTests(unittest.TestCase):
         self.assertTrue(caption_presets.is_reference_narrative_chunk_mode(caption_presets.REFERENCE_NARRATIVE_CHUNK_MODE))
         self.assertEqual(style["layout_mode"], "narrative_block")
         self.assertEqual(style["caption_build_mode"], "cumulative_block")
-        self.assertEqual(style["caption_block_min_words"], 8)
-        self.assertEqual(style["caption_block_max_words"], 12)
+        self.assertEqual(style["caption_block_min_words"], 14)
+        self.assertEqual(style["caption_block_max_words"], 18)
 
     def test_edit_timeline_controller_interfaces_are_present(self):
         root_dir = os.path.dirname(os.path.dirname(__file__))
@@ -343,7 +343,7 @@ class RenderCanvasLayerTests(unittest.TestCase):
         self.assertEqual(render_pipeline_model.ffmpeg_layer_scale_filter(1.25), "scale=iw*1.250000:ih*1.250000:flags=lanczos")
         self.assertEqual(
             render_pipeline_model.ffmpeg_layer_scale_filter(1.0, 1080, 1920),
-            "scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos",
+            "scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,setsar=1",
         )
         self.assertEqual(
             render_pipeline_model.ffmpeg_layer_overlay_xy(10, -5),

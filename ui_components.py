@@ -112,6 +112,7 @@ def default_signature_style(base_style=None, scale_from_subtitle=True):
         "shadow_color": "#000000",
         "shadow_alpha": 55,
         "line_height": 1.0,
+        "layout_row_gap": 100,
         "text_transform": "normal",
         "text_align": "right",
         "letter_spacing": 0,
@@ -832,7 +833,7 @@ def subtitle_layout_capacity(style, proj_w=1080):
     if width_pct <= 0:
         width_pct = 74.0
     width_pct = max(28.0, min(92.0, width_pct))
-    max_lines = max(1, min(4, int(style.get("max_lines", 2) or 2)))
+    max_lines = max(1, min(5, int(style.get("max_lines", 2) or 2)))
     line_capacity = max(3.5, (float(proj_w) * width_pct / 100.0) / size * 0.92)
     layout_mode = style.get("layout_mode", "standard")
     if layout_mode == "contrast":
@@ -841,7 +842,7 @@ def subtitle_layout_capacity(style, proj_w=1080):
         except Exception:
             emphasis_scale = 1.45
         try:
-            small_scale = max(0.78, min(1.0, float(style.get("contrast_small_scale", 0.74) or 0.74)))
+            small_scale = max(0.58, min(1.0, float(style.get("contrast_small_scale", 0.74) or 0.74)))
         except Exception:
             small_scale = 0.74
         contrast_guard = 1.0 + max(0.0, emphasis_scale - 1.0) * 0.42 + max(0.0, 1.0 - small_scale) * 0.16
@@ -1029,7 +1030,7 @@ class WebBridge(QObject):
     def __init__(self, parent_controller):
         super().__init__()
         self.controller = parent_controller
-        
+
     @pyqtSlot(int, float, float)
     def update_coordinates(self, idx, x, y):
         if 0 <= idx < len(self.controller.state["subs_data"]):
@@ -1041,20 +1042,20 @@ class WebBridge(QObject):
 
             for c in target_clips:
                 c["pos_x"] = x; c["pos_y"] = y
-            
+
             if self.controller.current_selected_idx == idx:
                 self.controller.pos_x_spin.blockSignals(True); self.controller.pos_x_slider.blockSignals(True)
                 self.controller.pos_y_spin.blockSignals(True); self.controller.pos_y_slider.blockSignals(True)
-                
+
                 self.controller.pos_x_spin.setValue(float(x)); self.controller.pos_x_slider.setValue(int(float(x) * 100))
                 self.controller.pos_y_spin.setValue(float(y)); self.controller.pos_y_slider.setValue(int(float(y) * 100))
-                
+
                 self.controller.pos_x_spin.blockSignals(False); self.controller.pos_x_slider.blockSignals(False)
                 self.controller.pos_y_spin.blockSignals(False); self.controller.pos_y_slider.blockSignals(False)
-            
+
             self.controller.update_floating_subtitle()
-            self.controller.auto_save_cache() 
-            
+            self.controller.auto_save_cache()
+
     @pyqtSlot(int, float)
     def update_box_width(self, idx, width):
         if 0 <= idx < len(self.controller.state["subs_data"]):
@@ -1067,40 +1068,40 @@ class WebBridge(QObject):
             for c in target_clips:
                 if "style" not in c: c["style"] = self.controller.default_style.copy()
                 c["style"]["box_width"] = width
-            
+
             if self.controller.current_selected_idx == idx:
                 self.controller.box_width_spin.blockSignals(True); self.controller.box_width_slider.blockSignals(True)
                 self.controller.box_width_spin.setValue(float(width)); self.controller.box_width_slider.setValue(int(float(width) * 100))
                 self.controller.box_width_spin.blockSignals(False); self.controller.box_width_slider.blockSignals(False)
-            
+
             self.controller.update_floating_subtitle()
             self.controller.auto_save_cache()
 
     @pyqtSlot(int)
-    def notify_selected(self, idx): 
+    def notify_selected(self, idx):
         self.controller.current_selected_idx = idx
         self.controller.switch_inspector("sub")
-        
+
     @pyqtSlot(int, str)
     def update_text_from_screen(self, idx, new_text):
         pass
-            
+
     @pyqtSlot(int, int)
     def adjust_font_size(self, idx, delta):
         if 0 <= idx < len(self.controller.state["subs_data"]):
             current_clip = self.controller.state["subs_data"][idx]
             st = current_clip.get("style", current_clip)
             new_size = max(10, min(300, st.get("size", 100) + delta))
-            
+
             scope = self.controller.style_scope_combo.currentIndex()
             if scope == 0: target_clips = self.controller.state["subs_data"]
             elif scope == 1: target_clips = [c for c in self.controller.state["subs_data"] if c.get("track") == current_clip.get("track")]
             else: target_clips = [current_clip]
-            
-            for c in target_clips: 
+
+            for c in target_clips:
                 if "style" not in c: c["style"] = {}
                 c["style"]["size"] = new_size
-            if self.controller.current_selected_idx == idx: 
+            if self.controller.current_selected_idx == idx:
                 self.controller.size_slider.blockSignals(True); self.controller.size_spin.blockSignals(True)
                 self.controller.size_slider.setValue(new_size); self.controller.size_spin.setValue(new_size)
                 self.controller.size_slider.blockSignals(False); self.controller.size_spin.blockSignals(False)
@@ -1150,8 +1151,12 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
     hl_pad_right = style.get("hl_pad_right", hl_pad)
     hl_pad_top = style.get("hl_pad_top", max(0, hl_pad / 3))
     hl_pad_bottom = style.get("hl_pad_bottom", max(0, hl_pad / 3))
+    hl_bg_skew = max(-35.0, min(35.0, float(style.get("hl_bg_skew", 0) or 0)))
+    hl_trail_words = max(1, min(8, int(style.get("hl_trail_words", 1) or 1)))
+    hl_trail_min_alpha = max(0.0, min(1.0, float(style.get("hl_trail_min_alpha", 35) or 0) / 100.0))
 
     lh = style.get("line_height", 1.1)
+    layout_row_gap = max(0.6, min(2.2, _safe_float(style.get("layout_row_gap", 100), 100) / 100.0))
     rot = style.get("rotation", 0)
 
     stroke_w = style.get("stroke_width", 4)
@@ -1171,14 +1176,35 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
     word_spacing = style.get("word_spacing", 0)
     layout_mode = style.get("layout_mode", "standard")
     layout_variant = style.get("layout_variant", "auto")
+    layout_pattern_raw = str(style.get("layout_pattern", "auto") or "auto")
+    layout_layer_pattern_raw = str(style.get("layout_layer_pattern", "auto") or "auto")
+    layout_layer_words_raw = str(style.get("layout_layer_words", "auto") or "auto")
+    layout_layer_count = max(0, min(5, int(style.get("layout_layer_count", 0) or 0)))
+    axis_spread = max(0.0, min(2.0, float(style.get("axis_spread", 100) or 100) / 100.0))
+    axis_gap = max(0.5, min(1.8, float(style.get("axis_gap", 100) or 100) / 100.0))
     emphasis_scale = max(100, int(style.get("emphasis_scale", 145)))
-    contrast_small_scale = max(0.78, min(1.0, float(style.get("contrast_small_scale", 0.74) or 0.74)))
+    contrast_small_scale = max(0.58, min(1.0, float(style.get("contrast_small_scale", 0.74) or 0.74)))
     box_layout = style.get("box_layout", "auto")
     use_hl = style.get("use_hl", True)
     hl_style = str(style.get("hl_style", "text") or "text").lower()
     hl_glow = style.get("hl_glow", False)
     glow_size = int(style.get("glow_size", 20))
+    global_glow_enable = bool(style.get("global_glow_enable", False))
+    global_glow_mode = str(style.get("global_glow_mode", "soft") or "soft")
+    global_glow_motion = str(style.get("global_glow_motion", "stable") or "stable")
+    global_glow_color = style.get("global_glow_color", "#FFFFFF")
+    global_glow_size = max(0, int(style.get("global_glow_size", 18) or 0))
+    global_glow_blur = max(0, int(style.get("global_glow_blur", 24) or 0))
+    global_glow_alpha = max(0.0, min(1.0, float(style.get("global_glow_alpha", 35) or 0) / 100.0))
+    global_glow_x = float(style.get("global_glow_x", 0) or 0)
+    global_glow_y = float(style.get("global_glow_y", 0) or 0)
+    global_glow_z = max(0.0, float(style.get("global_glow_z", 0) or 0))
     text_texture = style.get("text_texture", "none")
+    text_3d_enable = bool(style.get("text_3d_enable", False))
+    text_3d_depth = max(0, min(120, int(style.get("text_3d_depth", 0) or 0)))
+    text_3d_x = float(style.get("text_3d_x", 2) or 0)
+    text_3d_y = float(style.get("text_3d_y", 3) or 0)
+    text_3d_color = style.get("text_3d_color", "#6F3A05")
 
     anim_type = style.get("anim_type", "pop")
     font_motion = style.get("font_motion", "none")
@@ -1234,6 +1260,12 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
     words = sub.get("words", [])
     if not words:
         words = [{"text": sub.get("text", ""), "start": sub.get("start", 0), "end": sub.get("end", 1)}]
+
+    if layout_mode == "standard" and box_width > 0 and max_lines > 1 and not typewriter_motion:
+        has_manual_breaks = any("\n" in str(w.get("text") or w.get("word") or "") for w in words)
+        if not has_manual_breaks:
+            line_capacity, line_limit, _ = subtitle_layout_capacity(style, proj_w)
+            words = _apply_balanced_breaks(words, line_capacity, line_limit, style)
 
     clip_start = float(sub.get("start", 0))
     clip_end = float(sub.get("end", 1))
@@ -1344,14 +1376,33 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         mix_seed_text = "".join(_clean_word_text(words[i]) for i in content_indices)
         mix_seed = int(clip_start * 1000) + sum(ord(ch) for ch in mix_seed_text)
         count = len(content_indices)
-        if count >= 5:
-            layout_mode = "quote_stack"
-        elif count <= 2:
-            layout_mode = "side_steps" if mix_seed % 2 else "axis_stack"
-        elif count == 3:
-            layout_mode = ("axis_stack", "reel_stack", "random_focus")[mix_seed % 3]
-        elif count == 4:
-            layout_mode = ("side_steps", "random_focus", "reel_stack")[mix_seed % 3]
+        raw_pool = str(style.get("smart_layout_pool", "contrast,narrative_block,reel_stack,random_focus,axis_stack") or "")
+        pool = [item.strip() for item in raw_pool.split(",") if item.strip()]
+        pool = [item for item in pool if item in {"standard", "contrast", "narrative_block", "reel_stack", "random_focus", "side_steps", "axis_stack", "triple"}]
+        if not pool:
+            pool = ["standard"]
+        if len(pool) == 1:
+            layout_mode = pool[0]
+        else:
+            preferred = []
+            if count >= 12:
+                preferred = ["narrative_block", "reel_stack", "contrast", "axis_stack", "random_focus"]
+            elif count >= 7:
+                preferred = ["narrative_block", "contrast", "reel_stack", "random_focus", "axis_stack"]
+            elif count >= 4:
+                preferred = ["contrast", "random_focus", "reel_stack", "axis_stack", "side_steps"]
+            else:
+                preferred = ["axis_stack", "side_steps", "contrast", "reel_stack", "random_focus"]
+            candidates = [item for item in preferred if item in pool] or pool
+            layout_mode = candidates[mix_seed % len(candidates)]
+    if layout_mode == "axis_stack" and layout_variant in ("axis-random", "axis_random", "random-axis"):
+        axis_seed_text = "|".join(_clean_word_text(words[i]).lower() for i in content_indices) if content_indices else str(sub.get("text", ""))
+        axis_seed = int(clip_start * 1000) + sum((pos + 1) * ord(ch) for pos, ch in enumerate(axis_seed_text))
+        axis_choices = ("axis-123", "axis-split-tail", "axis-diagonal")
+        layout_variant = axis_choices[axis_seed % len(axis_choices)]
+        axis_spread = max(0.0, min(2.0, axis_spread * (0.86 + ((axis_seed // 3) % 5) * 0.07)))
+        axis_gap = max(0.5, min(1.8, axis_gap * (0.92 + ((axis_seed // 17) % 4) * 0.05)))
+
     layout_content_indices = content_indices
     if dynamic_reflow_motion and content_indices:
         layout_content_indices = [i for i in content_indices if current_time >= _typewriter_reveal_start_for(i)]
@@ -1360,14 +1411,33 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
     emphasis_idx = set()
     small_idx = set()
     current_word_idx = None
-    if use_hl and hl_motion in ("pop", "push"):
+    if use_hl and hl_style != "none":
+        active_candidates = []
         for i in content_indices:
             ww = words[i]
             w_start = float(ww.get("start", clip_start))
             w_end = float(ww.get("end", w_start + 0.5))
-            if w_start <= current_time <= w_end:
-                current_word_idx = i
-                break
+            if w_end <= w_start:
+                w_end = w_start + 0.05
+            if w_start <= current_time < w_end:
+                active_candidates.append((w_start, i))
+        if active_candidates:
+            current_word_idx = max(active_candidates, key=lambda item: (item[0], item[1]))[1]
+
+    hl_trail_alpha_by_idx = {}
+    if current_word_idx is not None:
+        hl_trail_alpha_by_idx[current_word_idx] = 1.0
+        if hl_trail_words > 1:
+            try:
+                current_order = content_indices.index(current_word_idx)
+            except ValueError:
+                current_order = -1
+            if current_order > 0:
+                tail_indices = content_indices[max(0, current_order - (hl_trail_words - 1)):current_order]
+                tail_total = len(tail_indices)
+                for rank, word_idx in enumerate(reversed(tail_indices), start=1):
+                    fade = 1.0 - (1.0 - hl_trail_min_alpha) * (rank / max(1, tail_total))
+                    hl_trail_alpha_by_idx[word_idx] = max(0.0, min(1.0, fade))
 
     def _token_score(token):
         t = re.sub(r"[^A-Za-z0-9一-鿿]", "", token or "")
@@ -1390,6 +1460,57 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
             score += 1.5
         return score
 
+    def _layout_pattern_slots(raw):
+        raw_text = str(raw or "").strip().lower()
+        if not raw_text or raw_text == "auto":
+            return []
+        slots = []
+        for ch in raw_text:
+            if ch in "大lbh":
+                slots.append("large")
+            elif ch in "中m":
+                slots.append("mid")
+            elif ch in "小s":
+                slots.append("small")
+        return slots
+
+    def _scale_from_slot(slot, small_base, mid_base, large_base):
+        if slot == "large":
+            return large_base
+        if slot == "mid":
+            return mid_base
+        return small_base
+
+    def _split_rows_even(items, row_count):
+        row_count = max(1, min(len(items), int(row_count or 1)))
+        rows = []
+        start = 0
+        for row_i in range(row_count):
+            remaining_items = len(items) - start
+            remaining_rows = row_count - row_i
+            take = max(1, int(math.ceil(remaining_items / remaining_rows)))
+            rows.append(items[start:start + take])
+            start += take
+        return [row for row in rows if row]
+
+    def _split_rows_from_spec(items, spec):
+        spec_text = str(spec or "").strip().lower()
+        if not spec_text or spec_text == "auto":
+            return []
+        counts = [int(n) for n in re.findall(r"\d+", spec_text) if int(n) > 0]
+        if not counts:
+            return []
+        rows = []
+        start = 0
+        for count_value in counts:
+            if start >= len(items):
+                break
+            rows.append(items[start:min(len(items), start + count_value)])
+            start += count_value
+        if start < len(items):
+            rows.append(items[start:])
+        return [row for row in rows if row]
+
     if layout_mode in ("contrast", "triple", "reel_stack", "random_focus", "axis_stack", "quote_stack", "prayer_reflow", "narrative_block") and layout_content_indices:
         variant = layout_variant
         if variant == "auto":
@@ -1403,22 +1524,41 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         )
 
         if layout_mode == "contrast":
-            focus_count = 1 if len(content_indices) <= 4 else 2
-            emphasis_idx.update(sorted(ranked[:focus_count]))
-            if not emphasis_idx:
-                emphasis_idx.add(content_indices[max(0, len(content_indices) // 2)])
-            small_idx.update([i for i in content_indices if i not in emphasis_idx])
+            pattern_slots = _layout_pattern_slots(layout_pattern_raw)
+            if pattern_slots:
+                for order, word_idx in enumerate(layout_content_indices):
+                    slot = pattern_slots[order % len(pattern_slots)]
+                    if slot == "large":
+                        emphasis_idx.add(word_idx)
+                    elif slot == "small":
+                        small_idx.add(word_idx)
+            else:
+                focus_count = 1 if len(content_indices) <= 4 else 2
+                emphasis_idx.update(sorted(ranked[:focus_count]))
+                if not emphasis_idx:
+                    emphasis_idx.add(content_indices[max(0, len(content_indices) // 2)])
+                small_idx.update([i for i in content_indices if i not in emphasis_idx])
         elif layout_mode == "triple":
-            if variant == "small-big-small":
+            pattern_slots = _layout_pattern_slots(layout_pattern_raw)
+            if pattern_slots:
+                for order, word_idx in enumerate(layout_content_indices):
+                    slot = pattern_slots[order % len(pattern_slots)]
+                    if slot == "large":
+                        emphasis_idx.add(word_idx)
+                    elif slot == "small":
+                        small_idx.add(word_idx)
+            elif variant == "small-big-small":
                 emphasis_idx.update(ranked[:1] or [content_indices[min(1, len(content_indices) - 1)]])
+                small_idx.update([i for i in content_indices if i not in emphasis_idx])
             elif variant == "big-small-mix":
                 emphasis_idx.update(ranked[:2] if len(content_indices) > 4 else ranked[:1])
+                small_idx.update([i for i in content_indices if i not in emphasis_idx])
             else:
                 focus = ranked[:1] or [content_indices[min(len(content_indices) // 2, len(content_indices) - 1)]]
                 emphasis_idx.update(focus)
                 if len(content_indices) > 5:
                     emphasis_idx.add(content_indices[0])
-            small_idx.update([i for i in content_indices if i not in emphasis_idx])
+                small_idx.update([i for i in content_indices if i not in emphasis_idx])
         elif layout_mode == "reel_stack":
             if head_large_variant:
                 emphasis_idx.add(content_indices[0])
@@ -1445,12 +1585,7 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
                 emphasis_idx.add(layout_content_indices[-1])
             small_idx.update([i for i in layout_content_indices if i not in emphasis_idx])
         elif layout_mode == "narrative_block":
-            emphasis_idx.add(layout_content_indices[0])
-            if len(layout_content_indices) >= 7:
-                emphasis_idx.add(layout_content_indices[-1])
-            ranked_focus = [idx for idx in ranked[:2] if _token_score(_clean_word_text(words[idx])) >= 6.0]
-            emphasis_idx.update(ranked_focus[:1])
-            small_idx.update([i for i in layout_content_indices if i not in emphasis_idx])
+            pass
         elif layout_mode == "prayer_reflow":
             stop_anchor = {"is", "am", "are", "the", "this", "that", "with", "for", "your", "my", "in", "to"}
             rows_probe = []
@@ -1485,13 +1620,24 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         if not items or layout_mode not in ("reel_stack", "random_focus", "side_steps", "axis_stack", "quote_stack", "prayer_reflow", "narrative_block"):
             return []
         if layout_mode == "narrative_block":
+            spec_rows = _split_rows_from_spec(items, layout_layer_words_raw)
+            if spec_rows:
+                return spec_rows
+            if layout_layer_count > 0 and n > layout_layer_count:
+                return _split_rows_even(items, layout_layer_count)
             if n <= 4:
                 return [items]
             if n <= 7:
-                return [items[:3], items[3:]]
-            if n <= 10:
-                return [items[:3], items[3:7], items[7:]]
-            return [items[:3], items[3:7], items[7:10], items[10:]]
+                return [items[:4], items[4:]]
+            if n <= 11:
+                return [items[:4], items[4:7], items[7:]]
+            first_count = 4 if n <= 14 else 5
+            second_count = 3
+            third_count = 4 if n <= 15 else 5
+            first_end = min(n, first_count)
+            second_end = min(n, first_end + second_count)
+            third_end = min(n, second_end + third_count)
+            return [items[:first_end], items[first_end:second_end], items[second_end:third_end], items[third_end:]]
         if layout_mode == "prayer_reflow":
             if n <= 4:
                 return [[item] for item in items]
@@ -1517,6 +1663,10 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         if layout_mode == "side_steps":
             return [[item] for item in items]
         if layout_mode == "axis_stack":
+            if layout_variant == "axis-diagonal" and n >= 3:
+                first_end = max(1, n // 3)
+                second_end = max(first_end + 1, min(n - 1, first_end + max(1, n // 3)))
+                return [items[:first_end], items[first_end:second_end], items[second_end:]]
             if layout_variant == "axis-123" or n <= 3:
                 return [[item] for item in items]
             if n == 4:
@@ -1642,7 +1792,9 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
             word_started = current_time >= w_start
             t = current_time - w_start
         is_active = word_started
-        is_current = use_hl and (w_start <= current_time <= w_end)
+        hl_trail_alpha = hl_trail_alpha_by_idx.get(idx, 0.0)
+        is_current = use_hl and hl_style != "none" and idx == current_word_idx
+        is_hl_marked = use_hl and hl_style != "none" and hl_trail_alpha > 0.0
 
         current_scale = 1.0
         current_opacity = inactive_alpha
@@ -1765,6 +1917,23 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         if sh_x != 0 or sh_y != 0 or sh_blur != 0:
             sr, sg, sb = hex_to_rgb(sh_c)
             shadows.append(f"{vw(sh_x)} {vw(sh_y)} {vw(sh_blur)} rgba({sr}, {sg}, {sb}, {sh_a})")
+        if global_glow_enable and global_glow_alpha > 0:
+            gr, gg, gb = hex_to_rgb(global_glow_color)
+            glow_phase = 1.0
+            sweep_offset = 0.0
+            if global_glow_motion == "breath":
+                glow_phase = 0.72 + 0.28 * math.sin(current_time * 2.0 + idx * 0.07)
+            elif global_glow_motion == "sweep" or global_glow_mode == "sweep":
+                sweep_offset = math.sin(current_time * 2.7 + layout_row_i * 0.8) * (10.0 + global_glow_z * 0.08)
+                glow_phase = 0.70 + 0.30 * abs(math.sin(current_time * 2.7 + idx * 0.15))
+            depth_boost = 1.0 + global_glow_z / 100.0
+            core_blur = max(global_glow_blur, global_glow_size) * depth_boost
+            aura_blur = max(global_glow_blur * 1.55, global_glow_size * 1.85) * depth_boost
+            alpha = max(0.0, min(1.0, global_glow_alpha * glow_phase))
+            shadows.append(f"{vw(global_glow_x + sweep_offset)} {vw(global_glow_y)} {vw(core_blur)} rgba({gr}, {gg}, {gb}, {alpha:.3f})")
+            shadows.append(f"{vw(global_glow_x * 0.5 + sweep_offset * 1.35)} {vw(global_glow_y * 0.5)} {vw(aura_blur)} rgba({gr}, {gg}, {gb}, {alpha * 0.45:.3f})")
+            if global_glow_mode == "neon":
+                shadows.append(f"0 0 {vw(max(global_glow_size * 2.6, global_glow_blur * 2.0))} rgba({gr}, {gg}, {gb}, {alpha * 0.32:.3f})")
         if is_current and hl_glow:
             shadows.extend([f"0 0 {vw(glow_size)} {c_hl}", f"0 0 {vw(glow_size*1.5)} {c_hl}", f"0 0 {vw(glow_size*2)} {c_hl}"])
         if anim_type == "holy_breath" and is_holy_final_word and current_opacity > 0.02:
@@ -1777,7 +1946,7 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
             ])
 
         text_shadow_css = f"text-shadow: {', '.join(shadows)};" if shadows else "text-shadow: none;"
-        
+
         # Keep a crisp inner outline and feather the outside through text-shadow.
         hard_stroke_w = stroke_w * (1.0 - 0.42 * (stroke_softness / 100.0))
         stroke_css = f"-webkit-text-stroke: {vw(max(0.0, hard_stroke_w))} {stroke_c}; paint-order: stroke fill; stroke-linejoin: round; stroke-linecap: round;" if stroke_w > 0 else ""
@@ -1823,20 +1992,32 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         elif layout_mode == "side_steps":
             side = -1 if layout_row_i % 2 == 0 else 1
             layout_font_scale = max(emphasis_scale / 100.0, 1.32)
-            current_translate_x_em += side * (1.10 + (0.10 if layout_row_i % 3 == 0 else 0.0))
-            per_word_translate = -0.02
+            current_translate_x_em += side * axis_spread * (1.10 + (0.10 if layout_row_i % 3 == 0 else 0.0))
+            per_word_translate = -0.02 * axis_gap
             word_margin_right = vw(max(0, word_spacing * 0.20 + 0.4))
         elif layout_mode == "axis_stack":
-            if layout_row_len == 2:
-                current_translate_x_em += (-0.72 if layout_pos_i == 0 else 0.72)
+            if layout_variant == "axis-diagonal":
+                center_row = (max(1, len(layout_rows)) - 1) / 2.0
+                row_offset = layout_row_i - center_row
+                current_translate_x_em += row_offset * axis_spread * 0.92
+                per_word_translate += row_offset * (axis_gap - 1.0) * 0.08
+                if abs(row_offset) < 0.4:
+                    layout_font_scale = max(emphasis_scale / 100.0, 1.42)
+                else:
+                    layout_font_scale = max(0.62, min(0.88, contrast_small_scale + 0.06))
+                word_margin_right = vw(max(0, word_spacing * 0.22 + 0.7))
+            elif layout_row_len == 2:
+                current_translate_x_em += (-0.72 if layout_pos_i == 0 else 0.72) * axis_spread
                 layout_font_scale = max(emphasis_scale / 100.0, 1.18)
+                per_word_translate += (layout_row_i - (max(1, len(layout_rows)) - 1) / 2.0) * (axis_gap - 1.0) * 0.06
                 word_margin_right = vw(max(0, word_spacing * 0.35 + 1.2))
             elif idx in emphasis_idx:
                 layout_font_scale = max(emphasis_scale / 100.0, 1.34)
-                per_word_translate = -0.035
+                per_word_translate = -0.035 + (layout_row_i - (max(1, len(layout_rows)) - 1) / 2.0) * (axis_gap - 1.0) * 0.06
                 word_margin_right = vw(max(0, word_spacing * 0.25 + 0.8))
             else:
                 layout_font_scale = 0.88
+                per_word_translate += (layout_row_i - (max(1, len(layout_rows)) - 1) / 2.0) * (axis_gap - 1.0) * 0.06
                 word_margin_right = vw(max(0, word_spacing * 0.18 + 0.55))
         elif layout_mode == "quote_stack":
             if idx in emphasis_idx:
@@ -1848,17 +2029,25 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
                 per_word_translate = 0.025
                 word_margin_right = vw(max(0, word_spacing * 0.18 + 0.52))
         elif layout_mode == "narrative_block":
-            row_scales = (1.28, 0.88, 1.08, 0.76)
+            small_base = max(0.58, min(0.82, contrast_small_scale))
+            large_base = max(emphasis_scale / 100.0, 1.50)
+            mid_base = max(0.86, min(1.18, (small_base + large_base) * 0.50))
+            visible_rows = max(1, len(layout_rows))
+            pattern_slots = _layout_pattern_slots(layout_layer_pattern_raw)
+            if pattern_slots:
+                row_scales = tuple(_scale_from_slot(pattern_slots[i % len(pattern_slots)], small_base, mid_base, large_base) for i in range(visible_rows))
+            elif visible_rows <= 1:
+                row_scales = (max(1.08, min(1.28, large_base - 0.34)),)
+            elif visible_rows == 2:
+                row_scales = (large_base, small_base) if len(layout_content_indices) <= 5 else (small_base, large_base)
+            elif visible_rows == 3:
+                row_scales = (small_base, large_base, min(0.86, small_base + 0.12))
+            else:
+                row_scales = (small_base, large_base, min(0.84, small_base + 0.10), max(1.34, large_base - 0.16), small_base)
             layout_font_scale = row_scales[min(layout_row_i, len(row_scales) - 1)]
-            if idx in emphasis_idx:
-                layout_font_scale = max(layout_font_scale, emphasis_scale / 100.0)
-                per_word_translate = -0.035
-            elif idx in small_idx:
-                layout_font_scale = min(layout_font_scale, contrast_small_scale)
-                per_word_translate = 0.018
             if layout_row_i >= 1:
-                current_translate_x_em += 0.10 if layout_row_i % 2 else 0.0
-            word_margin_right = vw(max(0, word_spacing * 0.20 + 0.62))
+                current_translate_x_em += 0.12 if layout_row_i % 2 else 0.02
+            word_margin_right = vw(max(0, word_spacing * 0.20 + (0.46 if layout_font_scale < 1.0 else 0.74)))
         elif layout_mode == "prayer_reflow":
             row_shift_patterns = {
                 1: [0.0],
@@ -1945,9 +2134,11 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
             if anim_type == "pop":
                 current_scale = min(current_scale, 1.025)
 
+        skewable_highlight = hl_style in ("box", "outline", "glow", "capsule", "canva_frame")
+        hl_skew_transform = f" skewX({hl_bg_skew:.3f}deg)" if is_current and skewable_highlight and abs(hl_bg_skew) > 0.01 else ""
         word_base = (
             f"font-size: {layout_font_scale:.3f}em; "
-            f"transform: perspective(720px) translate({current_translate_x_em:.3f}em, {current_translate_em:.3f}em) scale({current_scale:.3f}) rotateY({current_rotate_y_deg:.3f}deg) rotateX({current_rotate_x_deg:.3f}deg); "
+            f"transform: perspective(720px) translate({current_translate_x_em:.3f}em, {current_translate_em:.3f}em) scale({current_scale:.3f}) rotateY({current_rotate_y_deg:.3f}deg) rotateX({current_rotate_x_deg:.3f}deg){hl_skew_transform}; "
             f"transform-origin: center center; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); "
             f"letter-spacing: calc({ls_vw} + {vw(current_letter_extra)}); "
             f"margin-right: {word_margin_right}; white-space: nowrap; overflow-wrap: normal; word-break: keep-all; "
@@ -1956,7 +2147,14 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
             f"{current_filter_css} {current_clip_css}"
         )
 
-        fill_color = c_hl if is_current else c_txt
+        if is_hl_marked:
+            if hl_trail_alpha >= 0.999:
+                fill_color = c_hl
+            else:
+                chr_, chg, chb = hex_to_rgb(c_hl)
+                fill_color = f"rgba({chr_}, {chg}, {chb}, {hl_trail_alpha:.3f})"
+        else:
+            fill_color = c_txt
         if anim_type == "holy_breath" and is_holy_final_word and use_hl:
             fill_color = c_hl
         texture_css = ""
@@ -1967,7 +2165,28 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
             "distressed": (0.86, 0.72, "0.052em", "0.032em", "0.46em 0.34em", "0.62em 0.48em", 0.38),
             "stacked_distress": (0.92, 0.78, "0.060em", "0.038em", "0.42em 0.31em", "0.58em 0.44em", 0.44),
         }
-        if text_texture in texture_profiles:
+        if text_texture == "gold_metal":
+            pos_a = f"{(idx * 17) % 31}% {(idx * 23) % 37}%"
+            pos_b = f"{(idx * 29 + 11) % 43}% {(idx * 13 + 7) % 41}%"
+            pos_c = f"{(idx * 19 + 5) % 47}% {(idx * 31 + 9) % 53}%"
+            sweep_pos = ((float(current_time or 0) * 18.0 + idx * 11.0) % 190.0) - 45.0
+            gold_layers = [
+                ("linear-gradient(105deg, transparent 0 42%, rgba(255,255,255,0.58) 48%, rgba(255,244,183,0.28) 53%, transparent 62%)", "230% 100%", f"{sweep_pos:.2f}% 0"),
+                ("repeating-linear-gradient(0deg, rgba(255,255,255,0.18) 0 0.020em, transparent 0.034em 0.145em)", "100% 0.34em", pos_a),
+                ("repeating-linear-gradient(103deg, transparent 0 0.18em, rgba(95,49,4,0.26) 0.205em 0.222em, transparent 0.245em 0.42em)", "0.72em 0.58em", pos_b),
+                ("radial-gradient(circle at 34% 42%, rgba(90,47,5,0.32) 0 0.012em, transparent 0.020em)", "0.22em 0.19em", pos_c),
+                ("linear-gradient(180deg, #FFF9DA 0%, #FFE88D 12%, #D89A22 29%, #FFF0A6 45%, #B96A0C 62%, #F4BF47 80%, #7E4306 100%)", "100% 100%", "0 0"),
+            ]
+            texture_css = (
+                f"-webkit-text-fill-color: transparent; "
+                f"background-color: #F6C14A; "
+                f"background-image: {', '.join(layer[0] for layer in gold_layers)}; "
+                f"background-size: {', '.join(layer[1] for layer in gold_layers)}; "
+                f"background-position: {', '.join(layer[2] for layer in gold_layers)}; "
+                f"background-repeat: repeat; "
+                f"-webkit-background-clip: text; background-clip: text; "
+            )
+        elif text_texture in texture_profiles:
             alpha_a, alpha_b, dot_a, dot_b, size_a, size_b, scratch_alpha = texture_profiles[text_texture]
             pos_a = f"{(idx * 17) % 31}% {(idx * 23) % 37}%"
             pos_b = f"{(idx * 29 + 11) % 43}% {(idx * 13 + 7) % 41}%"
@@ -1994,29 +2213,63 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
                 f"-webkit-background-clip: text; background-clip: text; "
             )
 
-        word_css_fg = f"display: inline-block; color: {fill_color}; opacity: {current_opacity:.3f}; {text_shadow_css} {stroke_css} {texture_css} {word_base}"
-        word_css_bg = f"display: inline-block; color: transparent; -webkit-text-fill-color: transparent; text-shadow: none; -webkit-text-stroke: transparent; opacity: {current_opacity:.3f}; {word_base}"
+        back_layer_shadows = []
+        if text_texture == "gold_metal" or (text_3d_enable and text_3d_depth > 0):
+            if text_shadow_css.startswith("text-shadow: ") and text_shadow_css != "text-shadow: none;":
+                back_layer_shadows.append(text_shadow_css[len("text-shadow: "):-1])
+        if text_3d_enable and text_3d_depth > 0:
+            tr, tg, tb = hex_to_rgb(text_3d_color)
+            steps = max(2, min(24, int(text_3d_depth / 4) + 1))
+            depth_scale = max(0.05, text_3d_depth / 100.0)
+            base_x = text_3d_x if abs(text_3d_x) > 0.01 else 1.0
+            base_y = text_3d_y if abs(text_3d_y) > 0.01 else 1.0
+            extrude = []
+            for step in range(steps, 0, -1):
+                ratio = step / max(1, steps)
+                sx = base_x * step * depth_scale
+                sy = base_y * step * depth_scale
+                alpha = 0.42 + 0.42 * ratio
+                extrude.append(f"{vw(sx)} {vw(sy)} 0 rgba({tr}, {tg}, {tb}, {alpha:.3f})")
+            extrude.append(f"{vw(base_x * steps * depth_scale * 1.10)} {vw(base_y * steps * depth_scale * 1.15)} {vw(max(2.0, text_3d_depth * 0.18))} rgba(0, 0, 0, 0.42)")
+            back_layer_shadows = extrude + back_layer_shadows
+        layered_text = bool(back_layer_shadows)
+        front_text_shadow_css = "text-shadow: none;" if layered_text else text_shadow_css
+        back_text_shadow_css = f"text-shadow: {', '.join(back_layer_shadows)};" if back_layer_shadows else "text-shadow: none;"
 
+        word_css_fg = f"display: inline-block; color: {fill_color}; opacity: {current_opacity:.3f}; {front_text_shadow_css} {stroke_css} {texture_css} {word_base}"
+        word_css_bg = f"display: inline-block; color: transparent; -webkit-text-fill-color: transparent; text-shadow: none; -webkit-text-stroke: transparent; opacity: {current_opacity:.3f}; {word_base}"
+        layered_shell_css = f"display: inline-block; position: relative; opacity: {current_opacity:.3f}; {word_base}"
+        layered_front_css = f"display: inline-block; position: relative; z-index: 2; color: {fill_color}; {front_text_shadow_css} {stroke_css} {texture_css}"
+        br, bgc, bb = hex_to_rgb(text_3d_color)
+        layered_back_css = f"position: absolute; left: 0; top: 0; z-index: 1; pointer-events: none; color: rgba({br}, {bgc}, {bb}, 0.01); -webkit-text-fill-color: rgba({br}, {bgc}, {bb}, 0.01); -webkit-text-stroke: transparent; {back_text_shadow_css}"
+
+        effective_hl_bg_a = max(0.0, min(1.0, hl_bg_a * hl_trail_alpha))
         if bg_mode == "tape":
-            if is_current and hl_bg_a > 0:
-                hl_css = f" background-color: rgba({hl_r}, {hl_g}, {hl_b}, {hl_bg_a}); border-radius: {hl_rad_vw}; box-shadow: 0 0 0 {hl_spread_vw} rgba({hl_r}, {hl_g}, {hl_b}, {hl_bg_a}), 0 {vw(3)} {vw(10)} rgba({hl_r}, {hl_g}, {hl_b}, 0.25);"
+            if is_hl_marked and effective_hl_bg_a > 0:
+                tape_shadow_a = max(0.0, min(0.25, 0.25 * hl_trail_alpha))
+                hl_css = f" background-color: rgba({hl_r}, {hl_g}, {hl_b}, {effective_hl_bg_a:.3f}); border-radius: {hl_rad_vw}; box-shadow: 0 0 0 {hl_spread_vw} rgba({hl_r}, {hl_g}, {hl_b}, {effective_hl_bg_a:.3f}), 0 {vw(3)} {vw(10)} rgba({hl_r}, {hl_g}, {hl_b}, {tape_shadow_a:.3f});"
                 word_css_fg += hl_css
                 word_css_bg += f" background-color: transparent; border-radius: {hl_rad_vw};"
-        elif bg_mode == "block" and is_current and hl_bg_a > 0:
-            word_css_fg += f" background-color: rgba({hl_r}, {hl_g}, {hl_b}, {hl_bg_a}); border-radius: {hl_rad_vw}; box-shadow: 0 0 0 {hl_spread_vw} rgba({hl_r}, {hl_g}, {hl_b}, {hl_bg_a});"
-        if is_current and bg_mode != "tape":
-            outline_a = max(0.72, min(1.0, hl_bg_a))
+        elif bg_mode == "block" and is_hl_marked and effective_hl_bg_a > 0:
+            word_css_fg += f" background-color: rgba({hl_r}, {hl_g}, {hl_b}, {effective_hl_bg_a:.3f}); border-radius: {hl_rad_vw}; box-shadow: 0 0 0 {hl_spread_vw} rgba({hl_r}, {hl_g}, {hl_b}, {effective_hl_bg_a:.3f});"
+        if is_hl_marked and bg_mode != "tape":
+            outline_a = max(0.0, min(1.0, max(0.72, min(1.0, hl_bg_a)) * hl_trail_alpha))
+            box_a = max(0.0, min(1.0, max(0.18, hl_bg_a) * hl_trail_alpha))
             outline_spread = bg_vw(max(2, min(10, hl_pad or 4)))
             underline_h = bg_vw(max(2, min(10, hl_pad_bottom or hl_pad or 4)))
             underline_offset = bg_vw(max(4, min(18, hl_pad_bottom + 4)))
             if hl_style == "box":
-                word_css_fg += f" background-color: rgba({hl_r}, {hl_g}, {hl_b}, {max(0.18, hl_bg_a):.3f}); border-radius: {hl_rad_vw}; padding: {hl_pad_top_vw} {hl_pad_right_vw} {hl_pad_bottom_vw} {hl_pad_left_vw};"
+                word_css_fg += f" background-color: rgba({hl_r}, {hl_g}, {hl_b}, {box_a:.3f}); border-radius: {hl_rad_vw}; box-shadow: 0 0 0 {hl_spread_vw} rgba({hl_r}, {hl_g}, {hl_b}, {box_a:.3f});"
             elif hl_style == "underline":
                 word_css_fg += f" background-image: linear-gradient(rgba({hl_r}, {hl_g}, {hl_b}, {outline_a:.3f}), rgba({hl_r}, {hl_g}, {hl_b}, {outline_a:.3f})); background-repeat: no-repeat; background-size: 100% {underline_h}; background-position: 0 calc(100% + {underline_offset});"
             elif hl_style == "glow":
-                word_css_fg += f" filter: drop-shadow(0 0 {bg_vw(max(8, glow_size))} rgba({hl_r}, {hl_g}, {hl_b}, 0.72)) drop-shadow(0 0 {bg_vw(max(16, glow_size * 1.7))} rgba({hl_r}, {hl_g}, {hl_b}, 0.42)); -webkit-text-stroke: {bg_vw(max(1.0, hl_pad * 0.18))} rgba({hl_r}, {hl_g}, {hl_b}, 0.82);"
+                glow_a1 = max(0.0, min(1.0, 0.72 * hl_trail_alpha))
+                glow_a2 = max(0.0, min(1.0, 0.42 * hl_trail_alpha))
+                stroke_a = max(0.0, min(1.0, 0.82 * hl_trail_alpha))
+                word_css_fg += f" filter: drop-shadow(0 0 {bg_vw(max(8, glow_size))} rgba({hl_r}, {hl_g}, {hl_b}, {glow_a1:.3f})) drop-shadow(0 0 {bg_vw(max(16, glow_size * 1.7))} rgba({hl_r}, {hl_g}, {hl_b}, {glow_a2:.3f})); -webkit-text-stroke: {bg_vw(max(1.0, hl_pad * 0.18))} rgba({hl_r}, {hl_g}, {hl_b}, {stroke_a:.3f});"
             elif hl_style == "capsule":
-                word_css_fg += f" border-radius: 999px; padding: {hl_pad_top_vw} {hl_pad_right_vw} {hl_pad_bottom_vw} {hl_pad_left_vw}; box-shadow: inset 0 0 0 {bg_vw(max(1.2, hl_pad * 0.18))} rgba({hl_r}, {hl_g}, {hl_b}, {outline_a:.3f}), 0 0 {bg_vw(max(8, hl_pad * 1.2))} rgba({hl_r}, {hl_g}, {hl_b}, 0.25);"
+                halo_a = max(0.0, min(1.0, 0.25 * hl_trail_alpha))
+                word_css_fg += f" background-color: rgba({hl_r}, {hl_g}, {hl_b}, {box_a:.3f}); border-radius: 999px; box-shadow: 0 0 0 {hl_spread_vw} rgba({hl_r}, {hl_g}, {hl_b}, {box_a:.3f}), inset 0 0 0 {bg_vw(max(1.2, hl_pad * 0.18))} rgba({hl_r}, {hl_g}, {hl_b}, {outline_a:.3f}), 0 0 {bg_vw(max(8, hl_pad * 1.2))} rgba({hl_r}, {hl_g}, {hl_b}, {halo_a:.3f});"
             elif hl_style in ("outline", "canva_frame"):
                 word_css_fg += f" border-radius: {hl_rad_vw}; box-shadow: 0 0 0 {outline_spread} rgba({hl_r}, {hl_g}, {hl_b}, {outline_a:.3f});"
 
@@ -2035,7 +2288,15 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
                     f"{html_text(clean_txt[initial_pos + 1:])}"
                 )
                 safe_txt_bg = safe_txt
-        html_words_fg.append(f"<span style='{word_css_fg}'>{safe_txt}</span>")
+        if layered_text:
+            html_words_fg.append(
+                f"<span style='{layered_shell_css}'>"
+                f"<span aria-hidden='true' style='{layered_back_css}'>{safe_txt_bg}</span>"
+                f"<span style='{layered_front_css}'>{safe_txt}</span>"
+                f"</span>"
+            )
+        else:
+            html_words_fg.append(f"<span style='{word_css_fg}'>{safe_txt}</span>")
         html_words_bg.append(f"<span style='{word_css_bg}'>{safe_txt_bg}</span>")
 
         if idx < len(words) - 1:
@@ -2125,6 +2386,10 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         inner_transform = f"transform: {' '.join(inner_transform_parts)}; transform-origin: {transform_origin}; {inner_extra_css}"
 
     # 👑 新增平滑边缘及抗锯齿
+    layout_spacing_modes = ("contrast", "triple", "reel_stack", "random_focus", "side_steps", "axis_stack", "quote_stack", "prayer_reflow", "narrative_block")
+    if layout_mode in layout_spacing_modes:
+        lh = max(0.6, min(3.0, _safe_float(lh, 1.1) * layout_row_gap))
+
     base_wrapper_css = f"""
         font-family: {_css_font_stack(f_fam)};
         font-size: {size_vw};

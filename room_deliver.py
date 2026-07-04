@@ -13,17 +13,25 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFrame, QProgressBar, QTextEdit, QFileDialog, QMessageBox, QDoubleSpinBox,
     QDialog, QTreeWidget, QTreeWidgetItem, QScrollArea, QGridLayout, QCheckBox, QSplitter,
-    QTabBar, QInputDialog
+    QTabBar, QInputDialog, QComboBox
 )
 from PyQt6.QtCore import QProcess, QTimer, Qt
 from PyQt6.QtGui import QPixmap, QCursor
-from core import get_ffmpeg_cmd
+from core import get_ffmpeg_cmd, get_ffprobe_cmd
 from app_theme import apply_tinted_styles
 from room_theme_bridge import apply_room_theme_bridge
-from app_config import get_output_resolution, resolution_to_size
+from app_config import get_output_resolution, load_app_config, resolution_to_size, save_app_config
 from app_storage import read_json_file, resolve_user_file, write_json_file
 from render_config import build_video_encoder_args, get_render_profile
-from render_pipeline_model import ffconcat_file_entry, ffconcat_inout_entry, ffmpeg_canvas_source, ffmpeg_layer_overlay_xy, ffmpeg_layer_scale_filter
+from render_pipeline_model import (
+    build_looped_assembly_segments,
+    ffconcat_file_entry,
+    ffconcat_inout_entry,
+    ffmpeg_canvas_source,
+    ffmpeg_exact_layer_filter,
+    ffmpeg_layer_overlay_xy,
+    ffmpeg_layer_scale_filter,
+)
 from render_timing import active_subtitles_for_frame, build_subtitle_frame_schedule, render_tail_padding_seconds, subtitle_supersample
 from playwright.sync_api import sync_playwright
 
@@ -34,11 +42,15 @@ from workspace_config import WORKSPACE_MODE_CLOUD, get_active_workspace, get_wor
 from project_audit import audit_project, format_project_audit_report
 from font_registry import STATUS_NONCOMMERCIAL
 from job_control import CooperativeJobControl
+from canva_connect import upload_asset
 from render_range import normalize_render_range, set_render_range
 
 CACHE_FILE = resolve_user_file("sh_v8_project_cache.json", legacy_root=tempfile.gettempdir(), kind="cache")
 SUBTITLE_SUPERSAMPLE = subtitle_supersample()
 EXPORT_QUEUE_BACKUPS_FILE = resolve_user_file("export_queue_backups.json", legacy_root=os.getcwd(), kind="state")
+EXPORT_FORMAT_MP4 = "mp4"
+EXPORT_FORMAT_MP4_NO_SUBS = "mp4_no_subs"
+EXPORT_FORMAT_CANVA_WEBM = "canva_webm"
 
 
 def safe_export_queue_name(value, fallback="queue"):
@@ -422,6 +434,9 @@ class DeliverView(QWidget):
         self.active_render_design_state = None
         self.active_render_duration = None
         self.active_render_range = None
+        self.active_render_format = None
+        self._cpu_retry_args = []
+        self._cpu_retry_attempted = False
         self.export_job_control = CooperativeJobControl()
         self.init_ui()
 
@@ -480,6 +495,17 @@ class DeliverView(QWidget):
         self.spin_render_start.valueChanged.connect(self._capture_render_range_controls)
         self.spin_render_end.valueChanged.connect(self._capture_render_range_controls)
         left_layout.addLayout(range_row)
+
+        format_row = QHBoxLayout()
+        format_row.addWidget(QLabel("\u5bfc\u51fa\u683c\u5f0f:", styleSheet="color: #a6e3a1; font-weight: bold;"))
+        self.export_format_combo = QComboBox()
+        self.export_format_combo.addItem("MP4 \u6210\u7247\uff08\u89c6\u9891+\u5b57\u5e55+\u97f3\u9891\uff09", EXPORT_FORMAT_MP4)
+        self.export_format_combo.addItem("MP4 \u65e0\u5b57\u5e55\uff08\u89c6\u9891+\u97f3\u9891\uff0c\u53bb\u5176\u4ed6\u8f6f\u4ef6\u52a0\u5b57\u5e55\uff09", EXPORT_FORMAT_MP4_NO_SUBS)
+        self.export_format_combo.addItem("Canva \u900f\u660e\u5b57\u5e55 WebM\uff08\u4ec5\u6587\u5b57/\u8bbe\u8ba1\u5c42\uff09", EXPORT_FORMAT_CANVA_WEBM)
+        self.export_format_combo.setToolTip("MP4 \u65e0\u5b57\u5e55\u53ea\u5bfc\u51fa\u89c6\u9891/\u97f3\u9891\uff1bWebM \u900f\u660e\u5b57\u5e55\u5c42\u53ef\u62d6\u5165 Canva \u4f5c\u4e3a\u900f\u660e\u89c6\u9891\u7d20\u6750\u53e0\u52a0\u3002")
+        self.export_format_combo.setStyleSheet("background: #313244; color: #cdd6f4; padding: 5px; font-size: 13px; border-radius: 3px; font-weight: bold;")
+        format_row.addWidget(self.export_format_combo, stretch=1)
+        left_layout.addLayout(format_row)
 
         left_layout.addWidget(QLabel("✅ 多轨道时间推演 / 混音器 / 画面缩放\n底层核心已全量挂载！", styleSheet="color: #89b4fa; margin-top: 15px;"))
         batch_frame = QFrame()
@@ -676,10 +702,11 @@ class DeliverView(QWidget):
 
         a_path = state.get("audio_path", "")
         if a_path:
-            durations.append(get_exact_duration(a_path))
             a_trim = state.get("a_trim") or []
             if len(a_trim) >= 2:
-                durations.append(max(0.0, self._safe_float(a_trim[1], 0.0) - self._safe_float(a_trim[0], 0.0)))
+                durations.append(max(0.0, self._safe_float(a_trim[1], 0.0)))
+            else:
+                durations.append(get_exact_duration(a_path))
 
         music_path = state.get("music_path", "")
         if music_path:
@@ -715,6 +742,53 @@ class DeliverView(QWidget):
         self.spin_duration.setValue(self._safe_render_duration(dur_value))
         self._sync_render_range_controls()
 
+    def _current_export_format(self):
+        combo = getattr(self, "export_format_combo", None)
+        if combo is None:
+            return EXPORT_FORMAT_MP4
+        value = combo.currentData()
+        return value if value in {EXPORT_FORMAT_MP4, EXPORT_FORMAT_MP4_NO_SUBS, EXPORT_FORMAT_CANVA_WEBM} else EXPORT_FORMAT_MP4
+
+    def _render_export_format(self):
+        return self.active_render_format or self._current_export_format()
+
+    def _is_canva_transparent_export(self, export_format=None):
+        return (export_format or self._render_export_format()) == EXPORT_FORMAT_CANVA_WEBM
+
+    def _is_no_subtitle_export(self, export_format=None):
+        return (export_format or self._render_export_format()) == EXPORT_FORMAT_MP4_NO_SUBS
+
+    def _export_output_ext(self, export_format=None):
+        return ".webm" if self._is_canva_transparent_export(export_format) else ".mp4"
+
+    def _export_save_filter(self, export_format=None):
+        if self._is_canva_transparent_export(export_format):
+            return "Canva Transparent WebM (*.webm)"
+        return "MP4 Files (*.mp4)"
+
+    def _normalize_export_output_path(self, file_path, export_format=None):
+        ext = self._export_output_ext(export_format)
+        root, current_ext = os.path.splitext(file_path or "")
+        if not root:
+            return file_path
+        if current_ext.lower() != ext:
+            return root + ext
+        return file_path
+
+    def _has_overlay_content(self, project_state=None, design_state=None):
+        project_state = project_state if isinstance(project_state, dict) else self.project_state
+        design_state = design_state if isinstance(design_state, dict) else self.design_state
+        if project_state.get("subs_data"):
+            return True
+        signature = project_state.get("signature", {})
+        if isinstance(signature, dict) and signature.get("enabled") and str(signature.get("text", "")).strip():
+            return True
+        if isinstance(design_state, dict):
+            for page in design_state.get("pages", []) or []:
+                if isinstance(page, dict) and page.get("layers"):
+                    return True
+        return False
+
     def _freeze_render_job(self, project_data=None, project_state=None, design_state=None):
         project_data = project_data if isinstance(project_data, dict) else self.project_data
         project_state = project_state if isinstance(project_state, dict) else self.project_state
@@ -729,6 +803,7 @@ class DeliverView(QWidget):
         )
         self.active_render_range = normalize_render_range(self.active_render_project_state, self.active_render_duration)
         self.active_render_duration = self.active_render_range["duration"]
+        self.active_render_format = self._current_export_format()
 
     def _clear_render_job(self):
         self.active_render_project_data = None
@@ -736,6 +811,7 @@ class DeliverView(QWidget):
         self.active_render_design_state = None
         self.active_render_duration = None
         self.active_render_range = None
+        self.active_render_format = None
 
     def _render_project_state(self):
         if isinstance(self.active_render_project_state, dict):
@@ -863,6 +939,25 @@ class DeliverView(QWidget):
     def _log_msg(self, msg, color):
         self.log_console.append(f"<span style='color:{color}'>{msg}</span>")
         self.log_console.verticalScrollBar().setValue(self.log_console.verticalScrollBar().maximum())
+
+    def _cpu_render_profile(self):
+        cpu_count = os.cpu_count() or 4
+        return {
+            "encoder": "libx264",
+            "encoder_label": "CPU x264 安全模式",
+            "cpu_threads": max(1, min(16, cpu_count - 1 if cpu_count > 2 else cpu_count)),
+        }
+
+    def _retry_render_with_cpu(self):
+        if self._cpu_retry_attempted or not self._cpu_retry_args:
+            return False
+        self._cpu_retry_attempted = True
+        self.log_safe("⚠️ 硬件编码失败，已自动切换 CPU x264 安全模式重试一次。", "#f9e2af")
+        self.render_process = QProcess(self)
+        self.render_process.readyReadStandardError.connect(self.on_render_ready_read_error)
+        self.render_process.finished.connect(self.on_render_finished)
+        self.render_process.start(get_ffmpeg_cmd(), self._cpu_retry_args)
+        return True
 
     def update_progress_safe(self, val):
         QTimer.singleShot(0, lambda: self.progress_bar.setValue(int(val)))
@@ -1349,13 +1444,28 @@ class DeliverView(QWidget):
                 f"📦 读取工程: 字幕 {len(self.project_state.get('subs_data', []) or [])} / 视频 {len(self.project_state.get('video_clips', []) or [])}",
                 "#89b4fa",
             )
-            if not self.project_state.get("video_clips") or not self.project_state.get("subs_data"):
+            export_format = self._current_export_format()
+            transparent_export = self._is_canva_transparent_export(export_format)
+            no_subtitle_export = self._is_no_subtitle_export(export_format)
+            if transparent_export:
+                if not self._has_overlay_content(self.project_state, self.design_state):
+                    self.log_safe(f"跳过工程: {os.path.basename(project_path)} | 没有字幕/署名/设计层可导出", "#f38ba8")
+                    self.batch_render_index += 1
+                    QTimer.singleShot(0, self._start_next_batch_render)
+                    return
+            elif no_subtitle_export:
+                if not self.project_state.get("video_clips"):
+                    self.log_safe(f"跳过工程: {os.path.basename(project_path)} | 缺少视频数据", "#f38ba8")
+                    self.batch_render_index += 1
+                    QTimer.singleShot(0, self._start_next_batch_render)
+                    return
+            elif not self.project_state.get("video_clips") or not self.project_state.get("subs_data"):
                 self.log_safe(f"跳过工程: {os.path.basename(project_path)} | 缺少视频或字幕数据", "#f38ba8")
                 self.batch_render_index += 1
                 QTimer.singleShot(0, self._start_next_batch_render)
                 return
             batch_audit = audit_project(project, workspace=self.current_workspace())
-            if any(row.get("status") == STATUS_NONCOMMERCIAL for row in batch_audit.get("fonts", {}).get("fonts", [])):
+            if not no_subtitle_export and any(row.get("status") == STATUS_NONCOMMERCIAL for row in batch_audit.get("fonts", {}).get("fonts", [])):
                 self.log_safe(f"跳过工程: {os.path.basename(project_path)} | 含非商用/禁止商用字体", "#f38ba8")
                 self.batch_render_index += 1
                 QTimer.singleShot(0, self._start_next_batch_render)
@@ -1370,8 +1480,6 @@ class DeliverView(QWidget):
             threading.Thread(target=self.generate_html_frames, daemon=True).start()
         except Exception as e:
             self.log_safe(f"跳过工程: {os.path.basename(project_path)} | {e}", "#f38ba8")
-            self._clear_render_job()
-            self._clear_render_job()
             self._clear_render_job()
             self.batch_render_index += 1
             QTimer.singleShot(0, self._start_next_batch_render)
@@ -1395,10 +1503,18 @@ class DeliverView(QWidget):
     def _unique_batch_output_path(self, project):
         raw_name = project.get("project_name") or os.path.splitext(os.path.basename(project.get("project_path", "output")))[0]
         safe_name = "".join(c for c in raw_name if c not in r'\/:*?"<>|').strip() or "output"
-        candidate = os.path.join(self.batch_output_dir, f"{safe_name}.mp4")
+        export_format = self._current_export_format()
+        ext = self._export_output_ext(export_format)
+        if self._is_canva_transparent_export(export_format):
+            suffix = "_canva_alpha"
+        elif self._is_no_subtitle_export(export_format):
+            suffix = "_no_subtitles"
+        else:
+            suffix = ""
+        candidate = os.path.join(self.batch_output_dir, f"{safe_name}{suffix}{ext}")
         n = 2
         while os.path.exists(candidate):
-            candidate = os.path.join(self.batch_output_dir, f"{safe_name}-{n}.mp4")
+            candidate = os.path.join(self.batch_output_dir, f"{safe_name}{suffix}-{n}{ext}")
             n += 1
         return candidate
 
@@ -1429,16 +1545,29 @@ class DeliverView(QWidget):
         self.log_safe(f"📊 视频数: {len(clips)}", "#89b4fa")
         self.log_safe(f"📊 音频路径: {a_path or '未提供'}", "#89b4fa")
 
-        if (not clips or not subs) and self.batch_project_paths and self.batch_output_dir:
+        export_format = self._current_export_format()
+        transparent_export = self._is_canva_transparent_export(export_format)
+        no_subtitle_export = self._is_no_subtitle_export(export_format)
+        has_overlay = self._has_overlay_content(self.project_state, self.design_state)
+        current_missing = (not has_overlay) if transparent_export else ((not clips) if no_subtitle_export else (not clips or not subs))
+
+        if current_missing and self.batch_project_paths and self.batch_output_dir:
             self.log_safe("⚠️ 当前工程数据为空，已自动切换到已选择的批量导出队列。", "#f9e2af")
             return self.start_batch_render()
 
-        if not clips:
-            return QMessageBox.warning(self, "提示", "请先在 Edit 房间导入至少一个视频片段并保存工程！")
-        if not subs:
-            return QMessageBox.warning(self, "提示", "当前工程没有字幕数据。请先在 Edit 房间生成字幕并点“保存工程”。")
-        if not a_path:
-            self.log_safe("⚠️ 未检测到独立音频，将尝试使用视频原声；若原视频也无音轨，则输出静音视频。", "#f9e2af")
+        if transparent_export:
+            if not has_overlay:
+                return QMessageBox.warning(self, "提示", "当前工程没有可导出的字幕/署名/设计层。")
+            self.log_safe("🎨 Canva 透明 WebM 模式：只导出文字/署名/设计层，不合成底色视频和音频。", "#a6e3a1")
+        else:
+            if not clips:
+                return QMessageBox.warning(self, "提示", "请先在 Edit 房间导入至少一个视频片段并保存工程！")
+            if no_subtitle_export:
+                self.log_safe("🎞️ MP4 无字幕模式：只合成视频和音频，不烧录字幕层。", "#a6e3a1")
+            elif not subs:
+                return QMessageBox.warning(self, "提示", "当前工程没有字幕数据。请先在 Edit 房间生成字幕并点“保存工程”。")
+            if not a_path:
+                self.log_safe("⚠️ 未检测到独立音频，将尝试使用视频原声；若原视频也无音轨，则输出静音视频。", "#f9e2af")
 
         try:
             audit_source = dict(self.project_data or {})
@@ -1456,17 +1585,17 @@ class DeliverView(QWidget):
                     "导出前体检提醒",
                     detail + "\n\n仍然继续导出吗？",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No if preflight.get("missing_media") or has_noncommercial_fonts else QMessageBox.StandardButton.Yes,
+                    QMessageBox.StandardButton.No if ((preflight.get("missing_media") and not transparent_export) or (has_noncommercial_fonts and not no_subtitle_export)) else QMessageBox.StandardButton.Yes,
                 )
                 if reply != QMessageBox.StandardButton.Yes:
                     return
         except Exception as e:
             self.log_safe(f"⚠️ 导出前体检跳过: {e}", "#f9e2af")
 
-        file_path, _ = QFileDialog.getSaveFileName(self, "导出最终视频", "", "MP4 Files (*.mp4)")
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出最终视频", "", self._export_save_filter(export_format))
         if not file_path:
             return
-        self.out_file_path = file_path
+        self.out_file_path = self._normalize_export_output_path(file_path, export_format)
         self._freeze_render_job(self.project_data, self.project_state, self.design_state)
         self.btn_render.setEnabled(False)
         self.log_safe("🚀 [阶段 1/2] 启动全局时间推演引擎 (多轨道同频渲染)...", "#f9e2af")
@@ -1485,6 +1614,12 @@ class DeliverView(QWidget):
             render_range = self._current_render_range(project_state, design_state)
             render_start = float(render_range.get("start", 0.0) or 0.0)
             render_end = render_start + total_dur
+
+            if self._is_no_subtitle_export():
+                self.log_safe("⏭️ MP4 无字幕模式：跳过字幕层截图，直接进入视频/音频压制。", "#a6e3a1")
+                self.update_progress_safe(50)
+                QTimer.singleShot(0, self.start_ffmpeg_qprocess)
+                return
 
             clips = project_state.get("video_clips", [])
             res_text = project_state.get("resolution") or get_output_resolution()
@@ -1555,16 +1690,16 @@ class DeliverView(QWidget):
                         <head>
                             <style>
                                 {bundled_font_css}
-                                html, body {{ 
-                                    margin: 0; padding: 0; width: 100vw; height: 100vh; overflow: hidden; 
-                                    background: transparent; display: flex; justify-content: center; align-items: center; 
-                                    -webkit-text-size-adjust: 100%; text-size-adjust: 100%; 
-                                    -webkit-font-smoothing: antialiased; 
+                                html, body {{
+                                    margin: 0; padding: 0; width: 100vw; height: 100vh; overflow: hidden;
+                                    background: transparent; display: flex; justify-content: center; align-items: center;
+                                    -webkit-text-size-adjust: 100%; text-size-adjust: 100%;
+                                    -webkit-font-smoothing: antialiased;
                                     -moz-osx-font-smoothing: grayscale;
                                     text-rendering: optimizeLegibility;
                                 }}
-                                #scale-wrapper {{ 
-                                    width: 100vw; height: 100vh; position: absolute; left: 0; top: 0; 
+                                #scale-wrapper {{
+                                    width: 100vw; height: 100vh; position: absolute; left: 0; top: 0;
                                     transform-origin: center center;
                                 }}
                             </style>
@@ -1597,10 +1732,18 @@ class DeliverView(QWidget):
         project_state = self._render_project_state()
         design_state = self._render_design_state()
         clips = project_state.get("video_clips", [])
-        a_path = project_state.get("audio_path")
-        music_path = project_state.get("music_path")
+        transparent_export = self._is_canva_transparent_export()
+        no_subtitle_export = self._is_no_subtitle_export()
+        use_subtitle_layer = not no_subtitle_export
+        a_path = "" if transparent_export else project_state.get("audio_path")
+        music_path = "" if transparent_export else project_state.get("music_path")
+        if a_path and not os.path.exists(a_path):
+            self.log_safe(f"⚠️ 配音文件不存在，已跳过: {a_path}", "#f9e2af")
+            a_path = ""
         if music_path and not os.path.exists(music_path):
             music_path = ""
+        self._cpu_retry_args = []
+        self._cpu_retry_attempted = False
         target_dur = self._render_duration(project_state, design_state)
         render_range = self._current_render_range(project_state, design_state)
         render_start = float(render_range.get("start", 0.0) or 0.0)
@@ -1619,8 +1762,12 @@ class DeliverView(QWidget):
         res_text = project_state.get("resolution") or get_output_resolution()
         media_path = clips[0]["path"] if clips else ""
         proj_w, proj_h = resolution_to_size(res_text, media_path, get_video_dimensions)
+        if transparent_export:
+            self.log_safe("🎨 Canva 透明 WebM：跳过视频/音频轨，只编码 RGBA 透明字幕层。", "#a6e3a1")
+            clips = []
 
         video_concat_path = ""
+        assembly_video_plan = []
         has_audio = False
         clip_speeds = [clip_speed_value(clip) for clip in clips or []]
         non_default_speeds = [speed for speed in clip_speeds if abs(speed - 1.0) > 0.001]
@@ -1634,7 +1781,42 @@ class DeliverView(QWidget):
             else:
                 speed_export_supported = False
                 self.log_safe("⚠️ 当前工程包含多种视频速度，本轮导出先按 1.0x 处理；预览和时间线仍按片段速度工作。", "#f9e2af")
-        if clips:
+        use_filter_concat = len(clips or []) > 1 and any(str(clip.get("assembly_mode", "")) in {"batch_random", "audio_matched"} for clip in clips or [])
+        if clips and use_filter_concat:
+            remaining_track_dur = video_track_target
+            for clip in clips:
+                if remaining_track_dur <= 0.001:
+                    break
+                clip_path = clip.get("path", "")
+                if not clip_path or not os.path.exists(clip_path):
+                    continue
+                c_start = float(clip.get("start", 0))
+                c_end = float(clip.get("end", 5.0))
+                overlap_start = max(c_start, render_start)
+                overlap_end = min(c_end, render_end)
+                if overlap_end <= overlap_start:
+                    continue
+                speed = 1.0 if str(clip.get("assembly_mode", "")) in {"batch_random", "audio_matched"} else clip_speed_value(clip)
+                media_dur = get_video_stream_duration(clip_path) or float(clip.get("dur", 0.0) or 0.0) or get_exact_duration(clip_path) or 5.0
+                media_dur = max(0.1, media_dur)
+                source_in = max(0.0, float(clip.get("source_in", 0.0) or 0.0))
+                source_out = float(clip.get("source_out", media_dur) or media_dur)
+                source_offset = max(0.0, overlap_start - c_start)
+                timeline_dur = min(max(0.001, overlap_end - overlap_start), remaining_track_dur)
+                is_image = os.path.splitext(clip_path)[1].lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+                assembly_video_plan.extend(build_looped_assembly_segments(
+                    clip_path,
+                    timeline_dur,
+                    source_in=source_in,
+                    source_out=source_out,
+                    source_offset=source_offset,
+                    speed=speed,
+                    is_image=is_image,
+                ))
+                remaining_track_dur -= timeline_dur
+            if assembly_video_plan:
+                self.log_safe(f"🎬 多素材组接导出: {len(assembly_video_plan)} 段滤镜拼接", "#89b4fa")
+        elif clips:
             try:
                 flags = 0x08000000 if os.name == 'nt' else 0
                 res = subprocess.run([get_ffmpeg_cmd(), "-i", clips[0]["path"]], stderr=subprocess.PIPE, stdout=subprocess.PIPE, creationflags=flags, text=True, encoding='utf-8', errors='ignore')
@@ -1704,9 +1886,22 @@ class DeliverView(QWidget):
             args.extend(["-f", "concat", "-safe", "0", "-i", video_concat_path])
             video_idx = input_idx
             input_idx += 1
-        args.extend(["-f", "concat", "-safe", "0", "-i", self.concat_path])
-        sub_idx = input_idx
-        input_idx += 1
+        for item in assembly_video_plan:
+            if item.get("is_image"):
+                args.extend(["-loop", "1", "-t", f"{float(item.get('source_dur', 0.0)):.3f}", "-i", item.get("path", "")])
+            else:
+                args.extend([
+                    "-ss", f"{float(item.get('ss', 0.0)):.3f}",
+                    "-t", f"{float(item.get('source_dur', 0.0)):.3f}",
+                    "-i", item.get("path", ""),
+                ])
+            item["input_idx"] = input_idx
+            input_idx += 1
+        sub_idx = None
+        if use_subtitle_layer:
+            args.extend(["-f", "concat", "-safe", "0", "-i", self.concat_path])
+            sub_idx = input_idx
+            input_idx += 1
         audio_idx = None
         if a_path:
             args.extend(["-i", a_path])
@@ -1721,21 +1916,67 @@ class DeliverView(QWidget):
         fc_parts = []
         audio_map = None
 
-        if video_concat_path:
+        if assembly_video_plan:
+            vf_scale = ffmpeg_exact_layer_filter(v_scale, proj_w, proj_h)
+            layer_x, layer_y = ffmpeg_layer_overlay_xy(v_pos_x, v_pos_y)
+            segment_labels = []
+            for seg_idx, item in enumerate(assembly_video_plan):
+                input_id = int(item.get("input_idx"))
+                speed = max(0.05, float(item.get("speed", 1.0) or 1.0))
+                timeline_dur = max(0.001, float(item.get("timeline_dur", 0.0) or 0.0))
+                label = f"vseg{seg_idx}"
+                fc_parts.append(
+                    f"[{input_id}:v]setpts=(PTS-STARTPTS)/{speed:.6f},"
+                    f"{vf_scale},tpad=stop_mode=clone:stop_duration={timeline_dur:.3f},"
+                    f"trim=duration={timeline_dur:.3f},setpts=PTS-STARTPTS[{label}]"
+                )
+                segment_labels.append(f"[{label}]")
+            if len(segment_labels) == 1:
+                fc_parts.append(f"{segment_labels[0]}null[vcat]")
+            else:
+                fc_parts.append(f"{''.join(segment_labels)}concat=n={len(segment_labels)}:v=1:a=0[vcat]")
+            video_guard = f"tpad=stop_mode=clone:stop_duration={target_dur:.3f},trim=duration={target_dur:.3f},setpts=PTS-STARTPTS"
+            sub_guard = f"tpad=stop_mode=clone:stop_duration={target_dur:.3f},trim=duration={target_dur:.3f},setpts=PTS-STARTPTS"
+            if no_subtitle_export:
+                fc_parts.append(
+                    f"{ffmpeg_canvas_source(proj_w, proj_h, target_dur)};"
+                    f"[vcat]{video_guard}[fg];"
+                    f"[canvas][fg]overlay=x='{layer_x}':y='{layer_y}':eof_action=pass:format=auto,format=yuv420p[outv]"
+                )
+            else:
+                fc_parts.append(
+                    f"{ffmpeg_canvas_source(proj_w, proj_h, target_dur)};"
+                    f"[vcat]{video_guard}[fg];"
+                    f"[canvas][fg]overlay=x='{layer_x}':y='{layer_y}':eof_action=pass:format=auto[bg];"
+                    f"[{sub_idx}:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos,{sub_guard}[sub];"
+                    f"[bg][sub]overlay=0:0:eof_action=pass:format=auto,format=yuv420p[outv]"
+                )
+        elif video_concat_path:
             vf_scale = ffmpeg_layer_scale_filter(v_scale, proj_w, proj_h, fit="cover")
             layer_x, layer_y = ffmpeg_layer_overlay_xy(v_pos_x, v_pos_y)
             speed_filter = f"setpts=PTS/{uniform_video_speed:.6f}," if abs(uniform_video_speed - 1.0) > 0.001 else ""
             video_guard = f"tpad=stop_mode=clone:stop_duration={target_dur:.3f},trim=duration={target_dur:.3f},setpts=PTS-STARTPTS"
             sub_guard = f"tpad=stop_mode=clone:stop_duration={target_dur:.3f},trim=duration={target_dur:.3f},setpts=PTS-STARTPTS"
-            fc_parts.append(
-                f"{ffmpeg_canvas_source(proj_w, proj_h, target_dur)};"
-                f"[{video_idx}:v]{speed_filter}{vf_scale},format=rgba,{video_guard}[fg];"
-                f"[canvas][fg]overlay=x='{layer_x}':y='{layer_y}':eof_action=pass:format=auto[bg];"
-                f"[{sub_idx}:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos,{sub_guard}[sub];"
-                f"[bg][sub]overlay=0:0:eof_action=pass:format=auto,format=yuv420p[outv]"
-            )
+            if no_subtitle_export:
+                fc_parts.append(
+                    f"{ffmpeg_canvas_source(proj_w, proj_h, target_dur)};"
+                    f"[{video_idx}:v]{speed_filter}{vf_scale},format=rgba,{video_guard}[fg];"
+                    f"[canvas][fg]overlay=x='{layer_x}':y='{layer_y}':eof_action=pass:format=auto,format=yuv420p[outv]"
+                )
+            else:
+                fc_parts.append(
+                    f"{ffmpeg_canvas_source(proj_w, proj_h, target_dur)};"
+                    f"[{video_idx}:v]{speed_filter}{vf_scale},format=rgba,{video_guard}[fg];"
+                    f"[canvas][fg]overlay=x='{layer_x}':y='{layer_y}':eof_action=pass:format=auto[bg];"
+                    f"[{sub_idx}:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos,{sub_guard}[sub];"
+                    f"[bg][sub]overlay=0:0:eof_action=pass:format=auto,format=yuv420p[outv]"
+                )
         else:
-            fc_parts.append(f"[{sub_idx}:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos,tpad=stop_mode=clone:stop_duration={target_dur:.3f},trim=duration={target_dur:.3f},setpts=PTS-STARTPTS,format=yuv420p[outv]")
+            if no_subtitle_export:
+                fc_parts.append(f"{ffmpeg_canvas_source(proj_w, proj_h, target_dur)};[canvas]format=yuv420p[outv]")
+            else:
+                out_pix_fmt = "yuva420p" if transparent_export else "yuv420p"
+                fc_parts.append(f"[{sub_idx}:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos,tpad=stop_mode=clone:stop_duration={target_dur:.3f},trim=duration={target_dur:.3f},setpts=PTS-STARTPTS,format={out_pix_fmt}[outv]")
 
         audio_sources = []
         if video_idx is not None and has_audio:
@@ -1743,11 +1984,33 @@ class DeliverView(QWidget):
             fc_parts.append(f"[{video_idx}:a]volume={v_vol:.3f}{speed_audio},atrim=duration={target_dur:.3f},asetpts=PTS-STARTPTS[va]")
             audio_sources.append("[va]")
         if audio_idx is not None:
-            fc_parts.append(f"[{audio_idx}:a]volume={a_vol:.3f},atrim=start={render_start:.3f}:duration={target_dur:.3f},asetpts=PTS-STARTPTS[aa]")
-            audio_sources.append("[aa]")
+            a_trim = project_state.get("a_trim") or [0.0, target_dur]
+            a_start = self._safe_float(a_trim[0], 0.0) if len(a_trim) >= 1 else 0.0
+            a_end = self._safe_float(a_trim[1], a_start) if len(a_trim) >= 2 else a_start + target_dur
+            overlap_start = max(a_start, render_start)
+            overlap_end = min(a_end, render_end)
+            if overlap_end > overlap_start + 0.001:
+                source_in = max(0.0, self._safe_float(project_state.get("audio_source_in"), 0.0))
+                source_start = source_in + max(0.0, overlap_start - a_start)
+                clip_dur = max(0.001, overlap_end - overlap_start)
+                delay_ms = max(0, int(round((overlap_start - render_start) * 1000)))
+                delay_filter = f",adelay={delay_ms}:all=1" if delay_ms > 0 else ""
+                fc_parts.append(f"[{audio_idx}:a]atrim=start={source_start:.3f}:duration={clip_dur:.3f},asetpts=PTS-STARTPTS,volume={a_vol:.3f}{delay_filter},apad,atrim=duration={target_dur:.3f},asetpts=PTS-STARTPTS[aa]")
+                audio_sources.append("[aa]")
         if music_idx is not None:
-            fc_parts.append(f"[{music_idx}:a]volume={music_vol:.3f},atrim=start={render_start:.3f}:duration={target_dur:.3f},asetpts=PTS-STARTPTS[ma]")
-            audio_sources.append("[ma]")
+            music_end = self._safe_float(project_state.get("music_match_duration"), 0.0)
+            if music_end <= 0:
+                music_end = self._safe_float(project_state.get("music_dur"), 0.0)
+            if music_end <= 0:
+                music_end = target_dur
+            overlap_start = max(0.0, render_start)
+            overlap_end = min(music_end, render_end)
+            if overlap_end > overlap_start + 0.001:
+                clip_dur = max(0.001, overlap_end - overlap_start)
+                delay_ms = max(0, int(round((overlap_start - render_start) * 1000)))
+                delay_filter = f",adelay={delay_ms}:all=1" if delay_ms > 0 else ""
+                fc_parts.append(f"[{music_idx}:a]atrim=start={overlap_start:.3f}:duration={clip_dur:.3f},asetpts=PTS-STARTPTS,volume={music_vol:.3f}{delay_filter},apad,atrim=duration={target_dur:.3f},asetpts=PTS-STARTPTS[ma]")
+                audio_sources.append("[ma]")
         if len(audio_sources) == 1:
             audio_map = audio_sources[0]
         elif len(audio_sources) > 1:
@@ -1764,12 +2027,38 @@ class DeliverView(QWidget):
         else:
             args.append("-an")
 
-        # 👑 极速高压引擎：锁定 30 帧(-r 30)，画质降低冗余(-crf 24)，并开启极速预设(-preset superfast)
-        render_profile = get_render_profile()
-        encoder_label = render_profile.get("encoder_label") or render_profile.get("encoder", "CPU x264")
-        args.extend(build_video_encoder_args(render_profile, quality="deliver"))
-        args.extend(["-r", "30", "-max_muxing_queue_size", "1024", "-t", str(target_dur), self.out_file_path])
-        
+        # 👑 极速高压引擎：MP4 保持原硬件优先；Canva WebM 固定 VP9 alpha，保留透明通道。
+        if transparent_export:
+            args.extend([
+                "-r", "30",
+                "-max_muxing_queue_size", "1024",
+                "-t", str(target_dur),
+                "-c:v", "libvpx-vp9",
+                "-pix_fmt", "yuva420p",
+                "-metadata:s:v:0", "alpha_mode=1",
+                "-auto-alt-ref", "0",
+                "-b:v", "0",
+                "-crf", "24",
+                "-deadline", "good",
+                "-cpu-used", "4",
+                self.out_file_path,
+            ])
+            self._cpu_retry_args = []
+            encoder_label = "VP9 WebM Alpha（Canva 透明层）"
+        else:
+            render_profile = get_render_profile()
+            encoder_label = render_profile.get("encoder_label") or render_profile.get("encoder", "CPU x264")
+            base_args = list(args)
+            final_args = ["-r", "30", "-max_muxing_queue_size", "1024", "-t", str(target_dur), self.out_file_path]
+            args.extend(build_video_encoder_args(render_profile, quality="deliver"))
+            args.extend(final_args)
+            if render_profile.get("encoder") != "libx264":
+                self._cpu_retry_args = (
+                    base_args
+                    + build_video_encoder_args(self._cpu_render_profile(), quality="deliver")
+                    + final_args
+                )
+
         self.log_safe(f"⚙️ 渲染配置: {encoder_label}", "#89b4fa")
         self.log_safe("🧾 FFmpeg 参数已生成，开始压制...", "#89b4fa")
         self.render_process.start(get_ffmpeg_cmd(), args)
@@ -1788,7 +2077,74 @@ class DeliverView(QWidget):
             self.log_console.append(f"<span style='color:#6c7086'>{err_out.strip()}</span>")
             self.log_console.verticalScrollBar().setValue(self.log_console.verticalScrollBar().maximum())
 
+
+    def _probe_canva_alpha_export(self, output_path):
+        if not output_path or not os.path.exists(output_path):
+            return False, "找不到导出文件"
+        try:
+            flags = 0x08000000 if os.name == 'nt' else 0
+            result = subprocess.run(
+                [
+                    get_ffprobe_cmd(),
+                    "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=pix_fmt:stream_tags=alpha_mode",
+                    "-of", "json",
+                    output_path,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                creationflags=flags,
+                timeout=12,
+            )
+            payload = json.loads(result.stdout or "{}")
+            streams = payload.get("streams") or []
+            stream = streams[0] if streams else {}
+            pix_fmt = str(stream.get("pix_fmt") or "")
+            tags = stream.get("tags") or {}
+            alpha_mode = str(tags.get("alpha_mode") or tags.get("ALPHA_MODE") or "")
+            has_alpha = pix_fmt.startswith("yuva") or alpha_mode == "1"
+            detail = f"pix_fmt={pix_fmt or 'unknown'}, alpha_mode={alpha_mode or 'none'}"
+            return has_alpha, detail
+        except Exception as e:
+            return False, f"透明检测失败: {e}"
+
+    def _maybe_upload_canva_transparent_export(self):
+        cfg = load_app_config()
+        if not cfg.get("canva_auto_upload"):
+            return
+        output_path = str(getattr(self, "out_file_path", "") or "")
+        if not output_path or not os.path.exists(output_path):
+            self.log_safe("⚠️ Canva 自动上传跳过：找不到导出的 WebM 文件。", "#f9e2af")
+            return
+        if not (cfg.get("canva_access_token") or cfg.get("canva_refresh_token")):
+            self.log_safe("⚠️ Canva 自动上传跳过：设置里还没有完成 Canva 授权。", "#f9e2af")
+            return
+        self.log_safe("☁️ Canva 自动上传已启动：正在把透明 WebM 传到素材库...", "#89b4fa")
+        threading.Thread(target=self._upload_canva_transparent_export_thread, args=(output_path, cfg), daemon=True).start()
+
+    def _upload_canva_transparent_export_thread(self, output_path, cfg):
+        try:
+            payload, updated_cfg = upload_asset(cfg, output_path, asset_name=os.path.basename(output_path))
+            if updated_cfg != cfg:
+                save_app_config(updated_cfg)
+            asset_hint = ""
+            if isinstance(payload, dict):
+                upload_info = payload.get("asset_upload") or payload.get("job") or payload
+                if isinstance(upload_info, dict):
+                    asset_hint = upload_info.get("id") or upload_info.get("asset_id") or ""
+            msg = "✅ Canva 上传任务已创建。" + (f" ID: {asset_hint}" if asset_hint else "")
+            QTimer.singleShot(0, lambda m=msg: self.log_safe(m, "#a6e3a1"))
+        except Exception as e:
+            QTimer.singleShot(0, lambda err=str(e): self.log_safe(f"⚠️ Canva 自动上传失败：{err}", "#f38ba8"))
+
     def on_render_finished(self, exit_code, exit_status):
+        if exit_code != 0:
+            if self._retry_render_with_cpu():
+                return
         try:
             shutil.rmtree(self.temp_dir)
         except Exception:
@@ -1797,18 +2153,43 @@ class DeliverView(QWidget):
             project_name = os.path.basename(self.current_batch_project_path) if self.current_batch_project_path else "工程"
             if exit_code == 0:
                 self.log_safe(f"✅ 完成: {project_name}", "#a6e3a1")
+                if self._is_canva_transparent_export():
+                    alpha_ok, alpha_detail = self._probe_canva_alpha_export(self.out_file_path)
+                    if alpha_ok:
+                        self.log_safe(f"✅ 透明通道检测通过：{alpha_detail}", "#a6e3a1")
+                    else:
+                        self.log_safe(f"⚠️ 透明通道检测未确认：{alpha_detail}。若 Canva 黑底，请先用 Chrome/Edge 本地打开验证。", "#f9e2af")
+                    self._maybe_upload_canva_transparent_export()
+                elif self._is_no_subtitle_export():
+                    self.log_safe("✅ 无字幕 MP4 已输出：没有烧录字幕层。", "#a6e3a1")
             else:
                 self.log_safe(f"❌ 失败: {project_name}，错误代码 {exit_code}", "#f38ba8")
             self.batch_render_index += 1
             QTimer.singleShot(0, self._start_next_batch_render)
             return
 
+        finished_transparent_export = self._is_canva_transparent_export()
+        finished_no_subtitle_export = self._is_no_subtitle_export()
         self._clear_render_job()
         self.btn_render.setEnabled(True)
         if exit_code == 0:
             self.progress_bar.setValue(100)
-            self.log_safe("🎉 渲染完美收官！视频已成功输出。", "#a6e3a1")
-            QMessageBox.information(self, "出片完成", "字幕、音频、画面已按当前工程成功导出。")
+            if finished_transparent_export:
+                alpha_ok, alpha_detail = self._probe_canva_alpha_export(self.out_file_path)
+                if alpha_ok:
+                    self.log_safe(f"🎉 Canva 透明 WebM 已成功输出，透明通道检测通过：{alpha_detail}", "#a6e3a1")
+                    finish_message = "透明字幕 WebM 已导出，并检测到透明通道。可导入 Canva 作为透明视频层。若已启用 Canva 自动上传，上传会在后台继续。"
+                else:
+                    self.log_safe(f"⚠️ Canva 透明 WebM 已输出，但透明通道检测未确认：{alpha_detail}", "#f9e2af")
+                    finish_message = "透明字幕 WebM 已导出，但本地未确认到透明通道标记。若 Canva 显示黑底，请先用 Chrome/Edge 本地打开验证，再考虑改用绿幕或 PNG 序列方案。"
+                self._maybe_upload_canva_transparent_export()
+                QMessageBox.information(self, "导出完成", finish_message)
+            elif finished_no_subtitle_export:
+                self.log_safe("🎉 无字幕 MP4 已成功输出。", "#a6e3a1")
+                QMessageBox.information(self, "出片完成", "视频、音频已导出；字幕没有烧录，可到其他软件继续添加。")
+            else:
+                self.log_safe("🎉 渲染完美收官！视频已成功输出。", "#a6e3a1")
+                QMessageBox.information(self, "出片完成", "字幕、音频、画面已按当前工程成功导出。")
         else:
             self.log_safe(f"❌ 渲染崩塌，错误代码: {exit_code}", "#f38ba8")
             QMessageBox.critical(self, "失败", "FFmpeg 渲染发生错误，请查看日志！")

@@ -6,11 +6,13 @@ import copy
 import json
 from datetime import datetime
 import shutil
-from app_config import get_output_resolution
+from app_config import get_output_resolution, load_app_config
 
 PROJECT_VERSION = 4
 ASSETS_DIR = "assets"
 PROJECT_DIR_EXCLUDES = {ASSETS_DIR, "fonts", "__pycache__"}
+PROJECT_RECENT_FOLDERS_KEY = "project_hall_recent_folders"
+PROJECT_RECENT_REELS_KEY = "project_hall_recent_reels"
 
 
 def _safe_media_filename(source_path, fallback="media"):
@@ -231,8 +233,8 @@ def sync_project_assets_to_project_dir(project_data):
 def _base_project_data(path, project_type, project_name):
     return {
         "project_name": project_name,
-        "project_path": path,  
-        "project_dir": os.path.dirname(path), 
+        "project_path": path,
+        "project_dir": os.path.dirname(path),
         "project_type": project_type,
         "project_version": PROJECT_VERSION,
         "cover_img": f"{project_name}_cover.jpg", # 每个 Reel 独立的封面图
@@ -242,6 +244,7 @@ def _base_project_data(path, project_type, project_name):
         "room_state": {
             "edit_room": {
                 "video_clips": [], "audio_path": "", "music_path": "", "subs_data": [],
+                "a_trim": [0.0, 0.0], "audio_source_in": 0.0,
                 "duration": 10.0, "resolution": get_output_resolution(),
                 "v_scale": 100, "v_volume": 100, "a_volume": 100, "music_volume": 35,
                 "music_dur": 0.0, "music_match_duration": 0.0, "music_loop": True,
@@ -261,11 +264,11 @@ def ensure_project_schema(data, path=None):
     project_type = data.get("project_type", "edit_room")
     project_path = path or data.get("project_path", "")
     project_name = data.get("project_name", os.path.basename(project_path).replace(".scomp", "") if project_path else "未命名Reel")
-    
+
     base = _base_project_data(project_path, project_type, project_name)
     merged = copy.deepcopy(base)
     merged.update(data)
-    
+
     merged["project_path"] = project_path or merged.get("project_path", "")
     merged["project_dir"] = os.path.dirname(merged["project_path"]) if merged["project_path"] else ""
     merged["project_type"] = project_type
@@ -406,15 +409,47 @@ def update_room_state(project_data, room_name, room_payload):
         project_data = save_project(path, project_data)
     return project_data
 
+
+def _recent_project_folders_for_workspace(workspace, limit=10):
+    try:
+        config = load_app_config()
+    except Exception:
+        config = {}
+    raw = config.get(PROJECT_RECENT_FOLDERS_KEY, [])
+    if not raw:
+        raw = [os.path.dirname(path) for path in config.get(PROJECT_RECENT_REELS_KEY, []) if isinstance(path, str)]
+    results = []
+    seen = set()
+    for folder in raw if isinstance(raw, list) else []:
+        if not isinstance(folder, str) or not folder.strip():
+            continue
+        folder = os.path.abspath(folder)
+        if not os.path.isdir(folder) or not _is_inside_dir(folder, workspace):
+            continue
+        key = os.path.normcase(folder)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(folder)
+        if len(results) >= limit:
+            break
+    return results
 def load_or_create_default_project(workspace=None):
     workspace = workspace or os.path.join(os.getcwd(), "MyWorkspace")
     if not os.path.exists(workspace): os.makedirs(workspace)
+
+    for recent_folder in _recent_project_folders_for_workspace(workspace):
+        reels = get_reels_in_folder(recent_folder, recursive=True)
+        if reels:
+            return load_project(reels[0])
+        return create_reel(recent_folder, "第一条Reel", "edit_room")
+
     folders = get_project_folders(workspace)
     if not folders:
         default_folder = os.path.join(workspace, "默认项目")
         os.makedirs(default_folder)
         return create_reel(default_folder, "第一条Reel", "edit_room")
-    
+
     first_folder = os.path.join(workspace, folders[0])
     reels = get_reels_in_folder(first_folder, recursive=True)
     if reels: return load_project(reels[0])

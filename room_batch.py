@@ -13,9 +13,11 @@ import csv
 import io
 import copy
 import random
+import itertools
+import math
 from datetime import datetime
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                             QLabel, QFrame, QProgressBar, QTextEdit, QFileDialog, 
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, QToolButton, QAbstractItemView, QSplitter,
+                             QLabel, QFrame, QProgressBar, QTextEdit, QFileDialog,
                              QMessageBox, QComboBox, QTabWidget, QScrollArea, QLineEdit, QDialog, QDoubleSpinBox, QTabBar, QInputDialog,
                              QSizePolicy)
 from PyQt6.QtWidgets import QSlider, QSpinBox, QCheckBox
@@ -28,6 +30,7 @@ import media_probe
 from app_theme import apply_tinted_styles
 from room_theme_bridge import apply_room_theme_bridge
 from app_config import get_output_resolution, load_app_config, resolution_to_size
+from ai_transcription import transcribe_audio_words
 from app_storage import read_json_file, resolve_user_file, write_json_file
 from render_config import build_video_encoder_args, get_render_profile
 from render_pipeline_model import ffconcat_file_entry, ffconcat_inout_entry, ffmpeg_canvas_source, ffmpeg_layer_overlay_xy, ffmpeg_layer_scale_filter
@@ -48,9 +51,14 @@ from project_io import create_reel, sync_project_assets_to_project_dir, update_r
 from workspace_config import WORKSPACE_MODE_CLOUD, get_active_workspace, get_workspace_config
 from job_control import CooperativeJobControl
 from caption_presets import (
+    LEGACY_NARRATIVE_CHUNK_MODE,
     REFERENCE_NARRATIVE_CHUNK_MODE,
+    fixed_word_count_for_chunk_mode,
+    is_exact_single_word_chunk_mode,
     is_reference_narrative_chunk_mode,
     merge_built_in_style_presets,
+    narrative_chunk_merge_words,
+    narrative_chunk_word_bounds,
 )
 
 PRESETS_FILE = resolve_user_file("style_presets.json", legacy_root=os.getcwd(), kind="config")
@@ -58,13 +66,22 @@ SIGNATURE_PRESETS_FILE = resolve_user_file("signature_presets.json", legacy_root
 BATCH_QUEUE_BACKUPS_FILE = resolve_user_file("batch_queue_backups.json", legacy_root=os.getcwd(), kind="state")
 STYLE_PRESET_POSITION_KEY = "__position__"
 SUBTITLE_SUPERSAMPLE = subtitle_supersample()
-MEDIA_EXTS = (".mp4", ".mov", ".webm", ".jpg", ".jpeg", ".png")
+IMAGE_EXTS = (".jpg", ".jpeg", ".png")
+VIDEO_EXTS = (".mp4", ".mov", ".webm")
+MEDIA_EXTS = VIDEO_EXTS + IMAGE_EXTS
 AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
 TEXT_EXTS = (".txt", ".md", ".srt", ".vtt", ".ass", ".lrc")
 BATCH_MUSIC_MODES = (
     ("顺序循环", "cycle"),
     ("随机分配", "random"),
     ("固定第一首", "first"),
+)
+BATCH_AUDIO_SORT_MODES = (
+    ("文件名自然排序", "natural"),
+    ("创建/生成时间从早到晚", "created"),
+    ("创建/生成时间从晚到早", "created_desc"),
+    ("修改时间从早到晚", "modified"),
+    ("修改时间从晚到早", "modified_desc"),
 )
 
 
@@ -225,6 +242,25 @@ def natural_sort_key(path_or_name):
     return (1, [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", stem)])
 
 
+def file_time_sort_key(path, mode="natural"):
+    mode_key = str(mode or "natural")
+    descending = mode_key.endswith("_desc")
+    base_mode = mode_key[:-5] if descending else mode_key
+    if base_mode not in {"created", "modified"}:
+        return (0, natural_sort_key(path))
+    try:
+        timestamp = os.path.getctime(path) if base_mode == "created" else os.path.getmtime(path)
+    except Exception:
+        timestamp = 0
+    if descending:
+        timestamp = -timestamp
+    return (timestamp, natural_sort_key(path), os.path.basename(path).casefold())
+
+
+def sort_audio_paths(paths, mode="natural"):
+    return sorted(paths or [], key=lambda path: file_time_sort_key(path, mode))
+
+
 def media_sequence_id(path_or_name):
     stem = os.path.splitext(os.path.basename(path_or_name or ""))[0].strip()
     match = re.match(r"^\s*0*(\d+)(?:[\s_.\-]+|$)", stem)
@@ -238,17 +274,17 @@ def normalize_media_title(path_or_name):
     return stem
 
 
-def build_audio_lookup(input_dir):
-    audio_files = sorted(
-        [f for f in os.listdir(input_dir) if f.lower().endswith(AUDIO_EXTS)],
-        key=natural_sort_key,
+def build_audio_lookup(input_dir, sort_mode="natural"):
+    audio_paths = sort_audio_paths(
+        [os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.lower().endswith(AUDIO_EXTS)],
+        sort_mode,
     )
     by_stem = {}
     by_seq = {}
     by_title = {}
-    for name in audio_files:
+    for full_path in audio_paths:
+        name = os.path.basename(full_path)
         stem = os.path.splitext(name)[0]
-        full_path = os.path.join(input_dir, name)
         by_stem.setdefault(stem.lower(), full_path)
         seq = media_sequence_id(name)
         if seq:
@@ -259,14 +295,11 @@ def build_audio_lookup(input_dir):
     return {"by_stem": by_stem, "by_seq": by_seq, "by_title": by_title}
 
 
-def list_audio_paths(input_dir):
-    return [
-        os.path.join(input_dir, f)
-        for f in sorted(
-            [name for name in os.listdir(input_dir) if name.lower().endswith(AUDIO_EXTS)],
-            key=natural_sort_key,
-        )
-    ]
+def list_audio_paths(input_dir, sort_mode="natural"):
+    return sort_audio_paths(
+        [os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.lower().endswith(AUDIO_EXTS)],
+        sort_mode,
+    )
 
 
 def match_audio_for_media(video_name, audio_lookup):
@@ -287,7 +320,7 @@ def local_get_cf_accounts():
     return load_app_config().get("cf_accounts", [])
 
 def get_browser_path():
-    if os.name == 'nt': 
+    if os.name == 'nt':
         paths = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -325,23 +358,23 @@ class BatchTaskRow(QFrame):
 
     def init_ui(self):
         self.setStyleSheet("QFrame { background-color: #1e1e2e; border: 1px solid #313244; border-radius: 6px; }")
-        self.setFixedHeight(96)
+        self.setMinimumHeight(82)
         row_layout = QHBoxLayout(self)
-        row_layout.setContentsMargins(9, 6, 9, 6)
-        row_layout.setSpacing(8)
+        row_layout.setContentsMargins(8, 5, 8, 5)
+        row_layout.setSpacing(6)
 
         self.btn_vid = QPushButton("➕ 选画面")
-        self.btn_vid.setFixedSize(88, 28)
+        self.btn_vid.setFixedSize(82, 26)
         self.btn_vid.setStyleSheet("background-color: #89b4fa; color: #11111b; font-weight: bold; border-radius: 4px; border: none;")
         self.btn_vid.clicked.connect(self.select_video)
 
         self.btn_aud = QPushButton("🎵 选配音")
-        self.btn_aud.setFixedSize(88, 28)
+        self.btn_aud.setFixedSize(82, 26)
         self.btn_aud.setStyleSheet("background-color: #cba6f7; color: #11111b; font-weight: bold; border-radius: 4px; border: none;")
         self.btn_aud.clicked.connect(self.select_audio)
 
         media_layout = QVBoxLayout()
-        media_layout.setSpacing(5)
+        media_layout.setSpacing(4)
         video_row = QHBoxLayout()
         audio_row = QHBoxLayout()
         self.edit_video = QLineEdit()
@@ -377,31 +410,31 @@ class BatchTaskRow(QFrame):
         self.txt_title = QLineEdit()
         self.txt_title.setPlaceholderText("大标题 (可选)")
         self.txt_title.setStyleSheet("background-color: #11111b; color: #cdd6f4; border: 1px solid #313244; padding: 5px;")
-        self.txt_title.setFixedWidth(112)
+        self.txt_title.setFixedWidth(96)
         row_layout.addWidget(self.txt_title)
 
         self.txt_content = QTextEdit()
         self.txt_content.setPlaceholderText("详细正文文案 (支持多行/不填则盲听)")
         self.txt_content.setStyleSheet("background-color: #11111b; color: #a6adc8; border: 1px solid #313244; padding: 5px;")
-        self.txt_content.setFixedHeight(64)
+        self.txt_content.setFixedHeight(52)
         row_layout.addWidget(self.txt_content, stretch=1)
-        
+
         # 👑 新增：预览按钮
         self.btn_preview = QPushButton("👁️ 预览")
-        self.btn_preview.setFixedSize(68, 36)
+        self.btn_preview.setFixedSize(58, 32)
         self.btn_preview.setStyleSheet("background-color: #f9e2af; color: #11111b; font-weight: bold; border-radius: 4px; border: none;")
         self.btn_preview.clicked.connect(self.preview_frame)
         row_layout.addWidget(self.btn_preview)
 
         self.lbl_status = QLabel("待处理")
-        self.lbl_status.setFixedWidth(60)
+        self.lbl_status.setFixedWidth(54)
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_status.setStyleSheet("color: #a6adc8; border: none;")
         row_layout.addWidget(self.lbl_status)
 
         self.btn_del = QPushButton("X")
         self.btn_del.setToolTip("删除这一行")
-        self.btn_del.setFixedSize(36, 36)
+        self.btn_del.setFixedSize(32, 32)
         self.btn_del.setStyleSheet("background-color: #f36f8e; color: #2b0b12; font-size: 15px; font-weight: 900; border-radius: 6px; border: none;")
         self.btn_del.clicked.connect(self.deleteLater)
         row_layout.addWidget(self.btn_del)
@@ -421,6 +454,10 @@ class BatchTaskRow(QFrame):
         path, _ = QFileDialog.getOpenFileName(self, "选择配音", "", audio_file_filter())
         if path:
             self.set_audio_path(path)
+            if self.parent_view and hasattr(self.parent_view, "_sidecar_text_for_audio") and not self.txt_content.toPlainText().strip():
+                sidecar_text = self.parent_view._sidecar_text_for_audio(path)
+                if sidecar_text:
+                    self.txt_content.setPlainText(sidecar_text)
 
     def set_video_path(self, path):
         self.video_path = (path or "").strip()
@@ -463,10 +500,10 @@ class BatchTaskRow(QFrame):
         self.sync_paths_from_fields()
         if not self.video_path:
             return QMessageBox.warning(self, "提示", "请先选择画面！")
-        
+
         self.btn_preview.setText("加载中..")
         self.btn_preview.setEnabled(False)
-        
+
         try:
             threading.Thread(target=self._generate_preview_thread, daemon=True).start()
         except Exception as e:
@@ -479,12 +516,12 @@ class BatchTaskRow(QFrame):
             temp_dir = tempfile.mkdtemp()
             frame_path = os.path.join(temp_dir, "preview_frame.jpg").replace("\\", "/")
             sub_path = os.path.join(temp_dir, "preview_sub.png").replace("\\", "/")
-            
+
             # 1. 用 FFmpeg 提取中间那一帧
             dur = get_exact_duration(self.video_path)
             mid_time = dur / 2.0 if dur > 0 else 0
             subprocess.run([get_ffmpeg_cmd(), "-y", "-ss", str(mid_time), "-i", self.video_path, "-vframes", "1", "-q:v", "2", frame_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
+
             # 2. 获取预设样式
             preset_style = {}
             preset_pos_x, preset_pos_y = 0.0, self.spin_y.value()
@@ -492,12 +529,12 @@ class BatchTaskRow(QFrame):
                 preset_style = self.parent_view._load_selected_preset_style()
                 preset_pos_x, _ = self.parent_view.selected_preset_position(default_y=self.spin_y.value())
                 preset_pos_y = self.spin_y.value()
-                
+
             # 3. 构造一个假字幕数据
             txt = self.txt_content.toPlainText().strip()
             if not txt: txt = "这是字幕高度位置预览测试"
-            txt = txt.split('\n')[0][:15] 
-            
+            txt = txt.split('\n')[0][:15]
+
             sub_data = {
                 "text": txt,
                 "words": [{"text": txt, "start": 0, "end": 1}],
@@ -505,9 +542,9 @@ class BatchTaskRow(QFrame):
                 "pos_y": preset_pos_y,
                 "style": preset_style
             }
-            
+
             proj_w, proj_h = resolution_to_size(get_output_resolution(), self.video_path, get_video_dimensions)
-            
+
             # 4. 用 Playwright 渲染透明字幕截图（带抗锯齿）
             with sync_playwright() as p:
                 browser = launch_render_browser(p)
@@ -515,28 +552,28 @@ class BatchTaskRow(QFrame):
                 render_w = int(proj_w * render_scale)
                 render_h = int(proj_h * render_scale)
                 page = browser.new_page(viewport={"width": render_w, "height": render_h}, device_scale_factor=1)
-                
+
                 px = sub_data.get("pos_x", 0.0); py = sub_data.get("pos_y", 25.0)
                 base_css = f"position: absolute; left: calc(50% + {px}%); top: calc(50% + {py}%); transform: translate(-50%, -50%); z-index: 10; width: max-content; max-width: 92%;"
                 sub_html = render_subtitle_html(sub_data, 0.5, proj_w, proj_h)
                 html_content = f"<!DOCTYPE html><html><head><style>html, body {{ margin: 0; padding: 0; width: 100vw; height: 100vh; overflow: hidden; background: transparent; display: flex; justify-content: center; align-items: center; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }} #scale-wrapper {{ width: 100vw; height: 100vh; position: absolute; left: 0; top: 0; filter: drop-shadow(0px 0px 0px transparent); }}</style></head><body><div id='scale-wrapper'><div style='{base_css}'>{sub_html}</div></div></body></html>"
-                
+
                 page.set_content(html_content)
                 page.screenshot(path=sub_path, omit_background=True, scale="css")
                 browser.close()
-                
+
             # 5. FFmpeg 合成最终预览图
             out_preview = os.path.join(temp_dir, "final_preview.jpg").replace("\\", "/")
             preview_filter = f"[1:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos[sub];[0:v][sub]overlay=0:0:format=auto"
             subprocess.run([get_ffmpeg_cmd(), "-y", "-i", frame_path, "-i", sub_path, "-filter_complex", preview_filter, "-vframes", "1", out_preview], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
+
             # 6. 通知 UI 线程展示
             QMetaObject.invokeMethod(self, "_show_preview_dialog", Qt.ConnectionType.QueuedConnection, Q_ARG(str, out_preview))
-            
+
         except Exception as e:
             print(f"预览出错: {e}")
             QMetaObject.invokeMethod(self, "_reset_preview_btn", Qt.ConnectionType.QueuedConnection)
-            
+
     @pyqtSlot(str)
     def _show_preview_dialog(self, img_path):
         self.btn_preview.setText("👁️ 预览")
@@ -554,7 +591,7 @@ class BatchTaskRow(QFrame):
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(lbl)
             dlg.exec()
-            
+
     @pyqtSlot()
     def _reset_preview_btn(self):
         self.btn_preview.setText("👁️ 预览")
@@ -565,7 +602,7 @@ class BatchView(QWidget):
     sig_progress = pyqtSignal(int)
     sig_file_done = pyqtSignal()
     sig_all_done = pyqtSignal()
-    sig_table_row_status = pyqtSignal(int, str, str) 
+    sig_table_row_status = pyqtSignal(int, str, str)
     sig_projects_done = pyqtSignal(int, int, str, object)
 
     def __init__(self, parent=None):
@@ -575,6 +612,9 @@ class BatchView(QWidget):
         self.project_output_dir = ""
         self.batch_music_path = ""
         self.batch_music_paths = []
+        self.batch_assembly_paths = []
+        self.smart_queue_groups = []
+        self.multi_project_packages = []
         self.task_queue = []
         self.batch_queues = []
         self.current_queue_index = 0
@@ -583,14 +623,14 @@ class BatchView(QWidget):
         self.is_running = False
         self.batch_job_control = CooperativeJobControl()
         self.batch_run_kind = ""
-        
+
         self.sig_log.connect(self._append_log)
         self.sig_progress.connect(self._update_progress)
         self.sig_file_done.connect(self._on_file_done)
         self.sig_all_done.connect(self._on_all_done)
         self.sig_table_row_status.connect(self._update_table_row_status)
         self.sig_projects_done.connect(self._on_projects_done)
-        
+
         self.init_ui()
 
     def init_ui(self):
@@ -618,7 +658,8 @@ class BatchView(QWidget):
         self.lbl_queue_summary.setStyleSheet("color: #a6e3a1; font-weight: bold; border: none;")
         queue_layout.addWidget(self.lbl_queue_summary)
 
-        btn_new_queue = QPushButton("新增队列")
+        btn_new_queue = QPushButton("新增队列/项目批次")
+        btn_new_queue.setToolTip("多批次统一用队列：队列1放第一组音频/画面/文案，队列2放第二组，最后点全部建工程。")
         btn_delete_queue = QPushButton("删除队列")
         btn_save_queue = QPushButton("保存队列")
         btn_load_queue = QPushButton("调用队列")
@@ -653,7 +694,7 @@ class BatchView(QWidget):
         top_header = QHBoxLayout()
         top_header.addWidget(QLabel("📦 工业级批量生成引擎", styleSheet="font-size: 19px; font-weight: 900; color: #cdd6f4;"))
         top_header.addStretch()
-        
+
         # 👑 音频静音控制区
         top_header.addWidget(QLabel("🎵 音频处理:", styleSheet="color: #cba6f7; font-weight: bold;"))
         self.audio_mode = QComboBox()
@@ -691,7 +732,7 @@ class BatchView(QWidget):
         self.performance_mode.setToolTip("轻量/极速会降低字幕透明层的超采样，减少内存和 CPU 占用；最终字幕锐度会略低。")
         self.performance_mode.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 10px; font-weight: bold; border-radius: 5px;")
         top_header.addWidget(self.performance_mode)
-        
+
         top_header.addWidget(QLabel("🎨 强制应用字幕预设:", styleSheet="color: #a6e3a1; font-weight: bold; margin-left: 15px;"))
         self.preset_combo = QComboBox()
         self.preset_combo.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 10px; font-weight: bold; border-radius: 5px;")
@@ -720,10 +761,10 @@ class BatchView(QWidget):
         self.btn_apply_all_y.setStyleSheet("background-color: #89b4fa; color: #11111b; font-weight: bold; padding: 4px 10px; border-radius: 5px;")
         self.btn_apply_all_y.clicked.connect(self.apply_global_subtitle_y_to_rows)
         top_header.addWidget(self.btn_apply_all_y)
-        
+
         top_header.addWidget(QLabel("✂️ AI断句:", styleSheet="color: #89b4fa; font-weight: bold; margin-left: 15px;"))
         self.chunk_mode = QComboBox()
-        self.chunk_mode.addItems(["单字轰炸 (1字/句)", "智能重点短句 (3-4词为主)", "智能听译 (4-7词，适配双行按词)", REFERENCE_NARRATIVE_CHUNK_MODE, "自然短句 (1-4词)", "双词节奏 (2词/句)", "三词短句 (3词/句)", "四词短句 (4词/句)", "短句快闪 (3-5字)", "长句大段 (约10字)"])
+        self.chunk_mode.addItems(["单字轰炸 (1字/句)", "智能重点短句 (3-4词为主)", "智能听译 (4-7词，适配双行按词)", REFERENCE_NARRATIVE_CHUNK_MODE, LEGACY_NARRATIVE_CHUNK_MODE, "自然短句 (1-4词)", "双词节奏 (2词/句)", "三词短句 (3词/句)", "四词短句 (4词/句)", "短句快闪 (3-5字)", "长句大段 (约10字)"])
         self.chunk_mode.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 10px; font-weight: bold; border-radius: 5px;")
         top_header.addWidget(self.chunk_mode)
 
@@ -732,7 +773,19 @@ class BatchView(QWidget):
         self.timing_mode.addItems(["L Cut (字幕提前进入)", "J Cut (字幕稍后收尾)", "对齐声音 (按停顿)"])
         self.timing_mode.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 10px; font-weight: bold; border-radius: 5px;")
         top_header.addWidget(self.timing_mode)
-        
+
+        top_header.addWidget(QLabel("AI\u542c\u8bd1:", styleSheet="color: #a6e3a1; font-weight: bold; margin-left: 10px;"))
+        self.ai_transcription_provider_combo = QComboBox()
+        self.ai_transcription_provider_combo.addItem("\u81ea\u52a8", None)
+        self.ai_transcription_provider_combo.addItem("Groq \u2192 CF", ["groq", "cloudflare"])
+        self.ai_transcription_provider_combo.addItem("CF \u2192 Groq", ["cloudflare", "groq"])
+        self.ai_transcription_provider_combo.addItem("\u4ec5 Groq", ["groq"])
+        self.ai_transcription_provider_combo.addItem("\u4ec5 CF", ["cloudflare"])
+        self.ai_transcription_provider_combo.setFixedWidth(116)
+        self.ai_transcription_provider_combo.setToolTip("\u5f53\u6b21\u6279\u91cf\u542c\u8bd1\u7684 AI \u670d\u52a1\uff1b\u9009\u81ea\u52a8\u65f6\u6309\u8bbe\u7f6e\u9875\u4f18\u5148\u7ea7\u8fd0\u884c\u3002")
+        self.ai_transcription_provider_combo.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 8px; font-weight: bold; border-radius: 5px;")
+        top_header.addWidget(self.ai_transcription_provider_combo)
+
         self.btn_set_out_dir = QPushButton("💾 设置全局输出目录")
         self.btn_set_out_dir.setStyleSheet("background-color: #f9e2af; color: #11111b; font-weight: bold; padding: 5px 15px; border-radius: 5px; margin-left: 15px;")
         self.btn_set_out_dir.clicked.connect(self.select_output_dir)
@@ -830,7 +883,7 @@ class BatchView(QWidget):
             QTabBar::tab:selected { background: #313244; color: #a6e3a1; }
             QTabWidget::pane { border: 1px solid #313244; border-radius: 8px; background: #181825; }
         """)
-        
+
         self.tab_table = QWidget()
         self.init_table_tab()
         self.tabs.addTab(self.tab_table, "📑 多选排列 / 表格手工批量")
@@ -895,12 +948,22 @@ class BatchView(QWidget):
             "project_output_dir": "",
             "active_tab": 0,
             "audio_mode": self.audio_mode.currentText() if hasattr(self, "audio_mode") else "",
+            "audio_import_sort_mode": self._audio_import_sort_mode() if hasattr(self, "audio_import_sort_combo") else "natural",
             "video_volume": self.video_volume_percent() if hasattr(self, "video_volume_spin") else 20,
             "music_enabled": bool(getattr(self, "chk_batch_music", None) and self.chk_batch_music.isChecked()),
             "music_path": getattr(self, "batch_music_path", ""),
             "music_paths": self._current_batch_music_paths() if hasattr(self, "batch_music_paths") else [],
             "music_mode": self._batch_music_mode() if hasattr(self, "batch_music_mode_combo") else "cycle",
             "music_volume": self.music_volume_percent() if hasattr(self, "batch_music_volume_spin") else 35,
+            "assembly_paths": self._current_batch_assembly_paths() if hasattr(self, "batch_assembly_paths") else [],
+            "assembly_count": int(self.batch_assembly_count_spin.value()) if hasattr(self, "batch_assembly_count_spin") else 3,
+            "assembly_mode": self._batch_assembly_mode() if hasattr(self, "batch_assembly_mode_combo") else "smart",
+            "smart_queue_enabled": bool(getattr(self, "chk_smart_queue", None) and self.chk_smart_queue.isChecked()),
+            "smart_queue_groups": self._current_smart_queue_groups() if hasattr(self, "smart_queue_groups") else [],
+            "smart_queue_mode": self._smart_queue_mode() if hasattr(self, "smart_queue_mode_combo") else "cycle",
+            "smart_queue_cut_mode": self._smart_queue_cut_mode() if hasattr(self, "smart_queue_cut_combo") else "single",
+            "multi_project_enabled": False,
+            "multi_project_packages": [],
             "performance_mode": self.performance_mode.currentText() if hasattr(self, "performance_mode") else "",
             "preset_name": self.preset_combo.currentText() if hasattr(self, "preset_combo") else "",
             "signature_preset_name": self.signature_preset_combo.currentData(Qt.ItemDataRole.UserRole) if hasattr(self, "signature_preset_combo") else "",
@@ -943,12 +1006,22 @@ class BatchView(QWidget):
             "project_output_dir": self.project_output_dir,
             "active_tab": self.tabs.currentIndex() if hasattr(self, "tabs") else 0,
             "audio_mode": self.audio_mode.currentText(),
+            "audio_import_sort_mode": self._audio_import_sort_mode(),
             "video_volume": self.video_volume_percent(),
             "music_enabled": bool(self.chk_batch_music.isChecked()) if hasattr(self, "chk_batch_music") else False,
             "music_path": self.batch_music_path,
             "music_paths": self._current_batch_music_paths(),
             "music_mode": self._batch_music_mode(),
             "music_volume": self.music_volume_percent(),
+            "assembly_paths": self._current_batch_assembly_paths(),
+            "assembly_count": int(self.batch_assembly_count_spin.value()) if hasattr(self, "batch_assembly_count_spin") else 3,
+            "assembly_mode": self._batch_assembly_mode(),
+            "smart_queue_enabled": bool(getattr(self, "chk_smart_queue", None) and self.chk_smart_queue.isChecked()),
+            "smart_queue_groups": self._current_smart_queue_groups(),
+            "smart_queue_mode": self._smart_queue_mode(),
+            "smart_queue_cut_mode": self._smart_queue_cut_mode(),
+            "multi_project_enabled": False,
+            "multi_project_packages": [],
             "performance_mode": self.performance_mode.currentText(),
             "preset_name": self.preset_combo.currentText(),
             "signature_preset_name": self.signature_preset_combo.currentData(Qt.ItemDataRole.UserRole) if hasattr(self, "signature_preset_combo") else "",
@@ -1001,9 +1074,31 @@ class BatchView(QWidget):
                 sig_name = state.get("signature_preset_name", "")
                 sig_idx = self.signature_preset_combo.findData(sig_name, Qt.ItemDataRole.UserRole)
                 self.signature_preset_combo.setCurrentIndex(sig_idx if sig_idx >= 0 else 0)
+            self._set_audio_import_sort_mode(state.get("audio_import_sort_mode", "natural"))
             self._set_video_volume(int(state.get("video_volume", 20)), enabled=True)
             self._set_batch_music_paths(state.get("music_paths") or state.get("music_path", ""))
             self._set_batch_music_mode(state.get("music_mode", "cycle"))
+            self._set_batch_assembly_paths(state.get("assembly_paths", []))
+            self._set_batch_assembly_mode(state.get("assembly_mode", "smart"))
+            if hasattr(self, "batch_assembly_count_spin"):
+                self.batch_assembly_count_spin.blockSignals(True)
+                self.batch_assembly_count_spin.setValue(max(1, int(state.get("assembly_count", 3) or 3)))
+                self.batch_assembly_count_spin.blockSignals(False)
+            self._set_batch_assembly_controls_enabled()
+            self._set_smart_queue_groups(state.get("smart_queue_groups", []))
+            self._set_smart_queue_mode(state.get("smart_queue_mode", "cycle"))
+            self._set_smart_queue_cut_mode(state.get("smart_queue_cut_mode", "single"))
+            if hasattr(self, "chk_smart_queue"):
+                self.chk_smart_queue.blockSignals(True)
+                self.chk_smart_queue.setChecked(bool(state.get("smart_queue_enabled", False)))
+                self.chk_smart_queue.blockSignals(False)
+            self._refresh_smart_queue_controls()
+            self._set_multi_project_packages([])
+            if hasattr(self, "chk_multi_project_batch"):
+                self.chk_multi_project_batch.blockSignals(True)
+                self.chk_multi_project_batch.setChecked(False)
+                self.chk_multi_project_batch.blockSignals(False)
+            self._refresh_multi_project_controls()
             if hasattr(self, "chk_batch_music"):
                 self.chk_batch_music.blockSignals(True)
                 self.chk_batch_music.setChecked(bool(state.get("music_enabled", False)))
@@ -1057,7 +1152,12 @@ class BatchView(QWidget):
                 return len([f for f in os.listdir(state["input_dir"]) if f.lower().endswith(MEDIA_EXTS)])
             except Exception:
                 return 0
-        return sum(1 for row in state.get("table_rows", []) if row.get("video"))
+        has_dynamic_media = self._state_has_dynamic_media(state)
+        return sum(
+            1
+            for row in state.get("table_rows", [])
+            if self._row_has_batch_content(row) and (has_dynamic_media or (row.get("video") or "").strip())
+        )
 
     def _update_queue_stats(self):
         total = sum(self._queue_task_count(state) for state in self.batch_queues)
@@ -1291,6 +1391,988 @@ class BatchView(QWidget):
             return {"enabled": False, "paths": [], "path": "", "mode": mode, "volume": volume}
         return {"enabled": True, "paths": paths, "path": paths[0], "mode": mode, "volume": volume}
 
+    def _normalize_batch_assembly_paths(self, paths):
+        if isinstance(paths, str):
+            paths = [paths]
+        clean = []
+        for raw in paths or []:
+            path = str(raw or "").strip()
+            if path and os.path.exists(path) and looks_media_path(path) and path not in clean:
+                clean.append(path)
+        return clean
+
+    def _set_batch_assembly_paths(self, paths):
+        self.batch_assembly_paths = self._normalize_batch_assembly_paths(paths)
+
+    def _current_batch_assembly_paths(self):
+        self.batch_assembly_paths = self._normalize_batch_assembly_paths(getattr(self, "batch_assembly_paths", []))
+        return list(self.batch_assembly_paths)
+
+    def _batch_assembly_count(self, state=None):
+        if isinstance(state, dict):
+            return max(1, int(state.get("assembly_count", 3) or 3))
+        return max(1, int(self.batch_assembly_count_spin.value()) if hasattr(self, "batch_assembly_count_spin") else 3)
+
+    def _batch_assembly_mode(self, state=None):
+        if isinstance(state, dict):
+            mode = str(state.get("assembly_mode", "smart") or "smart")
+            return mode if mode in {"smart", "fixed"} else "smart"
+        combo = getattr(self, "batch_assembly_mode_combo", None)
+        if combo is None:
+            return "smart"
+        mode = str(combo.currentData(Qt.ItemDataRole.UserRole) or "smart")
+        return mode if mode in {"smart", "fixed"} else "smart"
+
+    def _set_batch_assembly_mode(self, mode):
+        combo = getattr(self, "batch_assembly_mode_combo", None)
+        if combo is None:
+            return
+        mode = mode if mode in {"smart", "fixed"} else "smart"
+        idx = combo.findData(mode, Qt.ItemDataRole.UserRole)
+        combo.blockSignals(True)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _smart_assembly_count(self, paths, audio_path="", fallback_target=0.0):
+        paths = self._normalize_batch_assembly_paths(paths)
+        if not paths:
+            return 0
+        target = 0.0
+        if audio_path and os.path.exists(audio_path):
+            target = float(get_exact_duration(audio_path) or 0.0)
+        if target <= 0:
+            target = float(fallback_target or 0.0)
+        if target <= 0:
+            return min(3, len(paths))
+        min_count = 1
+        max_count = min(len(paths), 12)
+        ideal_by_time = int(round(target / 5.5))
+        if target <= 10:
+            ideal_by_time = min(2, ideal_by_time or 1)
+        elif target <= 18:
+            ideal_by_time = max(2, ideal_by_time)
+        count = max(min_count, min(max_count, ideal_by_time))
+        return max(1, count)
+
+    def _batch_assembly_summary(self, paths, count):
+        paths = self._normalize_batch_assembly_paths(paths)
+        count = max(1, min(int(count or 1), len(paths) if paths else 1))
+        if not paths:
+            return "未选择；选择后会覆盖每行单视频，按配音/工程时长自动拼接"
+        mode = self._batch_assembly_mode()
+        if mode == "smart":
+            return f"{len(paths)} 个素材，智能按音频时长自动决定数量"
+        try:
+            combo_count = math.comb(len(paths), count) if len(paths) >= count else 1
+        except Exception:
+            combo_count = 0
+        suffix = f"，理论组合 {combo_count} 种" if combo_count else ""
+        return f"{len(paths)} 个素材，每条随机抽 {count} 个{suffix}"
+
+    def _set_batch_assembly_controls_enabled(self, *_):
+        paths = self._current_batch_assembly_paths()
+        if hasattr(self, "btn_clear_batch_assembly"):
+            self.btn_clear_batch_assembly.setEnabled(bool(paths))
+        if hasattr(self, "batch_assembly_count_spin"):
+            self.batch_assembly_count_spin.setEnabled(bool(paths) and self._batch_assembly_mode() == "fixed")
+            self.batch_assembly_count_spin.setMaximum(max(1, min(12, len(paths) if paths else 12)))
+            if paths and self.batch_assembly_count_spin.value() > len(paths):
+                self.batch_assembly_count_spin.setValue(len(paths))
+        if hasattr(self, "lbl_batch_assembly"):
+            self.lbl_batch_assembly.setText(self._batch_assembly_summary(paths, self._batch_assembly_count()))
+
+    def select_batch_assembly_pool(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择批量随机拼接素材池", "", media_file_filter())
+        if not paths:
+            return
+        self._set_batch_assembly_paths(paths)
+        self._set_batch_assembly_controls_enabled()
+        self._capture_current_queue_state()
+        self.sig_log.emit(self._batch_assembly_summary(self.batch_assembly_paths, self._batch_assembly_count()), "#a6e3a1")
+
+    def clear_batch_assembly_pool(self):
+        self._set_batch_assembly_paths([])
+        self._set_batch_assembly_controls_enabled()
+        self._capture_current_queue_state()
+
+    def _normalize_smart_queue_groups(self, groups):
+        if isinstance(groups, dict):
+            groups = [{"name": name, "paths": paths} for name, paths in groups.items()]
+        clean = []
+        used_names = set()
+        for idx, group in enumerate(groups or [], start=1):
+            if not isinstance(group, dict):
+                continue
+            name = str(group.get("name") or group.get("label") or f"\u4e3b\u4f53\u7ec4 {idx}").strip() or f"\u4e3b\u4f53\u7ec4 {idx}"
+            paths = self._normalize_batch_assembly_paths(group.get("paths") or group.get("files") or [])
+            base_name = name
+            suffix = 2
+            while name in used_names:
+                name = f"{base_name} {suffix}"
+                suffix += 1
+            used_names.add(name)
+            clean.append({"name": name, "paths": paths, "enabled": bool(group.get("enabled", True))})
+        return clean
+
+    def _set_smart_queue_groups(self, groups):
+        self.smart_queue_groups = self._normalize_smart_queue_groups(groups)
+
+    def _current_smart_queue_groups(self):
+        self.smart_queue_groups = self._normalize_smart_queue_groups(getattr(self, "smart_queue_groups", []))
+        return copy.deepcopy(self.smart_queue_groups)
+
+    def _smart_queue_mode(self, state=None):
+        if isinstance(state, dict):
+            mode = str(state.get("smart_queue_mode", "cycle") or "cycle")
+        else:
+            combo = getattr(self, "smart_queue_mode_combo", None)
+            mode = str(combo.currentData(Qt.ItemDataRole.UserRole) if combo is not None else "cycle")
+        return mode if mode in {"match", "cycle", "random"} else "cycle"
+
+    def _set_smart_queue_mode(self, mode):
+        combo = getattr(self, "smart_queue_mode_combo", None)
+        if combo is None:
+            return
+        mode = mode if mode in {"match", "cycle", "random"} else "cycle"
+        idx = combo.findData(mode, Qt.ItemDataRole.UserRole)
+        combo.blockSignals(True)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _smart_queue_cut_mode(self, state=None):
+        if isinstance(state, dict):
+            mode = str(state.get("smart_queue_cut_mode", "single") or "single")
+        else:
+            combo = getattr(self, "smart_queue_cut_combo", None)
+            mode = str(combo.currentData(Qt.ItemDataRole.UserRole) if combo is not None else "single")
+        return mode if mode in {"auto", "single", "parallel", "cross", "sequence"} else "single"
+
+    def _set_smart_queue_cut_mode(self, mode):
+        combo = getattr(self, "smart_queue_cut_combo", None)
+        if combo is None:
+            return
+        mode = mode if mode in {"auto", "single", "parallel", "cross", "sequence"} else "single"
+        idx = combo.findData(mode, Qt.ItemDataRole.UserRole)
+        combo.blockSignals(True)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _smart_queue_cut_label(self, mode=None, group_count=0):
+        mode = mode or self._smart_queue_cut_mode()
+        if mode == "auto":
+            if group_count >= 3:
+                return "\u81ea\u52a8\u4ea4\u53c9"
+            if group_count == 2:
+                return "\u81ea\u52a8\u5e73\u884c"
+            return "\u5355\u4e3b\u4f53"
+        return {"single": "\u5355\u4e3b\u4f53\u968f\u673a", "parallel": "\u5e73\u884c\u526a\u8f91", "cross": "\u4ea4\u53c9\u526a\u8f91", "sequence": "\u5e73\u7eed\u526a\u8f91"}.get(mode, "\u81ea\u52a8\u526a\u8f91")
+
+    def _smart_queue_enabled(self, state=None):
+        if isinstance(state, dict):
+            return bool(state.get("smart_queue_enabled", False)) and bool(self._active_smart_queue_groups(state.get("smart_queue_groups", [])))
+        return bool(getattr(self, "chk_smart_queue", None) and self.chk_smart_queue.isChecked() and self._active_smart_queue_groups(self._current_smart_queue_groups()))
+
+    def _active_smart_queue_groups(self, groups):
+        return [
+            group for group in self._normalize_smart_queue_groups(groups)
+            if group.get("enabled", True) and self._normalize_batch_assembly_paths(group.get("paths", []))
+        ]
+
+    def _clear_layout_widgets(self, layout):
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+    def _set_smart_queue_group_enabled(self, index, checked):
+        groups = self._current_smart_queue_groups()
+        if 0 <= index < len(groups):
+            groups[index]["enabled"] = bool(checked)
+            self._set_smart_queue_groups(groups)
+            self._refresh_smart_queue_controls()
+            self._capture_current_queue_state()
+
+    def _rebuild_smart_queue_group_options(self, groups):
+        panel = getattr(self, "smart_queue_groups_panel", None)
+        grid = getattr(self, "smart_queue_groups_layout", None)
+        if panel is None or grid is None:
+            return
+        groups = self._normalize_smart_queue_groups(groups)
+        self._clear_layout_widgets(grid)
+        if not groups:
+            panel.setVisible(False)
+            return
+        panel.setVisible(True)
+        title = QLabel("\u4e3b\u4f53\u7ec4\u6e05\u5355\uff08\u53ef\u76f4\u63a5\u6539\u540d/\u6362\u7d20\u6750\uff09")
+        title.setStyleSheet("color:#a6adc8; font-weight:900; border:none;")
+        grid.addWidget(title, 0, 0, 1, 6)
+        for idx, group in enumerate(groups):
+            paths = self._normalize_batch_assembly_paths(group.get("paths", []))
+            row_frame = QFrame()
+            row_frame.setStyleSheet("QFrame { background-color:#181825; border:1px solid #313244; border-radius:6px; }")
+            row_layout = QHBoxLayout(row_frame)
+            row_layout.setContentsMargins(8, 5, 8, 5)
+            row_layout.setSpacing(7)
+
+            chk = QCheckBox()
+            chk.setChecked(bool(group.get("enabled", True)))
+            chk.setToolTip("\u52fe\u9009\u540e\u8fd9\u4e2a\u4e3b\u4f53\u7ec4\u624d\u4f1a\u53c2\u4e0e\u6279\u91cf\u968f\u673a\u3002")
+            chk.setStyleSheet("QCheckBox { border:none; } QCheckBox:checked { color:#a6e3a1; }")
+            chk.stateChanged.connect(lambda state, row_idx=idx: self._set_smart_queue_group_enabled(row_idx, state == Qt.CheckState.Checked.value))
+            row_layout.addWidget(chk)
+
+            name_edit = QLineEdit(str(group.get("name", "")))
+            name_edit.setPlaceholderText("\u4e3b\u4f53\u7ec4\u540d")
+            name_edit.setMinimumWidth(130)
+            name_edit.setStyleSheet("background-color:#11111b; color:#cdd6f4; border:1px solid #45475a; border-radius:5px; padding:4px 7px; font-weight:800;")
+            name_edit.editingFinished.connect(lambda edit=name_edit, row_idx=idx: self._rename_smart_queue_group(row_idx, edit.text()))
+            row_layout.addWidget(name_edit, stretch=1)
+
+            count_label = QLabel(f"{len(paths)} \u4e2a\u7d20\u6750" if paths else "\u672a\u9009\u7d20\u6750")
+            count_label.setStyleSheet("color:#a6adc8; border:none; min-width:72px;")
+            row_layout.addWidget(count_label)
+
+            btn_replace = QPushButton("\u9009\u7d20\u6750" if not paths else "\u6362\u7d20\u6750")
+            btn_append = QPushButton("\u8ffd\u52a0")
+            btn_remove = QPushButton("\u5220\u9664")
+            for btn in (btn_replace, btn_append, btn_remove):
+                btn.setStyleSheet("background-color:#313244; color:#cdd6f4; font-weight:800; padding:4px 9px; border-radius:5px; border:none;")
+            btn_replace.setToolTip("\u4e3a\u8fd9\u4e2a\u4e3b\u4f53\u7ec4\u9009\u62e9\u4e00\u6279\u7d20\u6750\uff0c\u4f1a\u66ff\u6362\u8be5\u7ec4\u73b0\u6709\u7d20\u6750\u3002")
+            btn_append.setToolTip("\u5728\u8fd9\u4e2a\u4e3b\u4f53\u7ec4\u540e\u9762\u8ffd\u52a0\u7d20\u6750\u3002")
+            btn_remove.setToolTip("\u5220\u9664\u8fd9\u4e2a\u53ef\u89c6\u5316\u4e3b\u4f53\u7ec4\u3002")
+            btn_replace.clicked.connect(lambda _=False, row_idx=idx: self._choose_smart_queue_group_files(row_idx, append=False))
+            btn_append.clicked.connect(lambda _=False, row_idx=idx: self._choose_smart_queue_group_files(row_idx, append=True))
+            btn_remove.clicked.connect(lambda _=False, row_idx=idx: self._remove_smart_queue_group(row_idx))
+            row_layout.addWidget(btn_replace)
+            row_layout.addWidget(btn_append)
+            row_layout.addWidget(btn_remove)
+            grid.addWidget(row_frame, idx + 1, 0, 1, 6)
+
+    def _rename_smart_queue_group(self, index, name):
+        groups = self._current_smart_queue_groups()
+        if not (0 <= index < len(groups)):
+            return
+        name = str(name or "").strip() or f"\u4e3b\u4f53\u7ec4 {index + 1}"
+        if groups[index].get("name", "") == name:
+            return
+        groups[index]["name"] = name
+        self._set_smart_queue_groups(groups)
+        self._refresh_smart_queue_controls()
+        self._capture_current_queue_state()
+
+    def _choose_smart_queue_group_files(self, index, append=False):
+        groups = self._current_smart_queue_groups()
+        if not (0 <= index < len(groups)):
+            return
+        title = "\u8ffd\u52a0\u4e3b\u4f53\u7ec4\u7d20\u6750" if append else "\u9009\u62e9\u4e3b\u4f53\u7ec4\u7d20\u6750"
+        paths, _ = QFileDialog.getOpenFileNames(self, title, "", media_file_filter())
+        paths = self._normalize_batch_assembly_paths(paths)
+        if not paths:
+            return
+        if append:
+            combined = list(groups[index].get("paths", []))
+            for path in paths:
+                if path not in combined:
+                    combined.append(path)
+            paths = combined
+        groups[index]["paths"] = paths
+        groups[index]["enabled"] = True
+        self._set_smart_queue_groups(groups)
+        if hasattr(self, "chk_smart_queue") and self._active_smart_queue_groups(groups):
+            self.chk_smart_queue.setChecked(True)
+        if hasattr(self, "smart_queue_toggle"):
+            self.smart_queue_toggle.setChecked(True)
+        self._refresh_smart_queue_controls()
+        self._capture_current_queue_state()
+        self.sig_log.emit(f"\u4e3b\u4f53\u7ec4 {groups[index].get('name', '')} \u5df2\u66f4\u65b0\uff1a{len(paths)} \u4e2a\u7d20\u6750", "#a6e3a1")
+
+    def _remove_smart_queue_group(self, index):
+        groups = self._current_smart_queue_groups()
+        if not (0 <= index < len(groups)):
+            return
+        removed = groups.pop(index)
+        self._set_smart_queue_groups(groups)
+        self._refresh_smart_queue_controls()
+        self._capture_current_queue_state()
+        self.sig_log.emit(f"\u5df2\u5220\u9664\u4e3b\u4f53\u7ec4: {removed.get('name', '')}", "#f38ba8")
+
+    def _smart_queue_summary(self, groups=None):
+        groups = self._normalize_smart_queue_groups(self.smart_queue_groups if groups is None else groups)
+        filled_groups = [group for group in groups if self._normalize_batch_assembly_paths(group.get("paths", []))]
+        active_groups = self._active_smart_queue_groups(groups)
+        if not groups:
+            return "\u672a\u5efa\u4e3b\u4f53\u7ec4\uff1b\u624b\u52a8\u65b0\u589e\u6216\u6309\u6587\u4ef6\u5939\u6210\u7ec4\uff0c\u4e0d\u4f9d\u8d56\u7d20\u6750\u547d\u540d"
+        if not filled_groups:
+            return f"\u5df2\u5efa {len(groups)} \u7ec4\uff0c\u5148\u5728\u7ec4\u5361\u7247\u91cc\u9009\u7d20\u6750"
+        if not active_groups:
+            return f"\u5df2\u5efa {len(groups)} \u7ec4\uff0c{len(filled_groups)} \u7ec4\u6709\u7d20\u6750\uff0c\u8bf7\u52fe\u9009\u8981\u53c2\u4e0e\u7684\u4e3b\u4f53\u7ec4"
+        parts = [f"{g['name']} {len(g['paths'])}\u4e2a" for g in active_groups[:4]]
+        suffix = f" \u7b49 {len(active_groups)} \u7ec4" if len(active_groups) > 4 else ""
+        enabled_hint = f" (\u542f\u7528 {len(active_groups)}/{len(filled_groups)} \u4e2a\u6709\u7d20\u6750\u7ec4)" if len(active_groups) != len(filled_groups) else ""
+        mode = {"cycle": "\u52fe\u9009\u7ec4\u8f6e\u6362", "random": "\u968f\u673a\u4e3b\u4f53", "match": "\u5173\u952e\u8bcd\u5339\u914d"}.get(self._smart_queue_mode(), "\u52fe\u9009\u7ec4\u8f6e\u6362")
+        cut_label = self._smart_queue_cut_label(group_count=len(active_groups))
+        return f"{mode} / {cut_label}: " + " / ".join(parts) + suffix + enabled_hint
+
+    def _refresh_smart_queue_controls(self, *_):
+        groups = self._current_smart_queue_groups() if hasattr(self, "smart_queue_groups") else []
+        active_groups = self._active_smart_queue_groups(groups)
+        self._rebuild_smart_queue_group_options(groups)
+        enabled = bool(getattr(self, "chk_smart_queue", None) and self.chk_smart_queue.isChecked())
+        for widget in (getattr(self, "smart_queue_mode_combo", None), getattr(self, "smart_queue_cut_combo", None), getattr(self, "btn_clear_smart_queue", None)):
+            if widget is not None:
+                widget.setEnabled(bool(groups))
+        for widget in (
+            getattr(self, "btn_add_smart_queue_group", None),
+            getattr(self, "btn_import_smart_queue_folder", None),
+            getattr(self, "btn_import_smart_queue_multi_folder", None),
+        ):
+            if widget is not None:
+                widget.setEnabled(True)
+        if getattr(self, "chk_smart_queue", None) is not None and enabled and not active_groups:
+            self.chk_smart_queue.blockSignals(True)
+            self.chk_smart_queue.setChecked(False)
+            self.chk_smart_queue.blockSignals(False)
+        if hasattr(self, "lbl_smart_queue_summary"):
+            prefix = "\u5df2\u542f\u7528 | " if self._smart_queue_enabled() else ""
+            self.lbl_smart_queue_summary.setText(prefix + self._smart_queue_summary(groups))
+
+    def add_smart_queue_group(self):
+        groups = self._current_smart_queue_groups()
+        base = "\u4e3b\u4f53\u7ec4"
+        used = {str(group.get("name", "")) for group in groups}
+        idx = len(groups) + 1
+        name = f"{base} {idx}"
+        while name in used:
+            idx += 1
+            name = f"{base} {idx}"
+        groups.append({"name": name, "paths": [], "enabled": True})
+        self._set_smart_queue_groups(groups)
+        if hasattr(self, "smart_queue_toggle"):
+            self.smart_queue_toggle.setChecked(True)
+        self._refresh_smart_queue_controls()
+        self._capture_current_queue_state()
+        self.sig_log.emit(f"\u5df2\u65b0\u589e\u53ef\u89c6\u5316\u4e3b\u4f53\u7ec4: {name}\uff0c\u8bf7\u5728\u7ec4\u5361\u7247\u91cc\u9009\u7d20\u6750\u3002", "#a6e3a1")
+
+    def _media_paths_in_folder(self, folder):
+        found = []
+        for root, _, files in os.walk(folder):
+            for filename in sorted(files, key=natural_sort_key):
+                path = os.path.join(root, filename)
+                if looks_media_path(path) and os.path.exists(path) and path not in found:
+                    found.append(path)
+        return found
+
+    def _smart_queue_groups_from_folders(self, folders):
+        new_groups = []
+        seen = set()
+        for folder in folders:
+            if not folder or not os.path.isdir(folder):
+                continue
+            folder_key = os.path.normcase(os.path.abspath(folder))
+            if folder_key in seen:
+                continue
+            seen.add(folder_key)
+            paths = self._media_paths_in_folder(folder)
+            if paths:
+                new_groups.append({
+                    "name": os.path.basename(os.path.normpath(folder)) or "\u4e3b\u4f53\u7ec4",
+                    "paths": paths,
+                    "enabled": True,
+                })
+        return new_groups
+
+    def _append_smart_queue_groups(self, new_groups, source_label):
+        if not new_groups:
+            return QMessageBox.information(
+                self,
+                "\u6ca1\u6709\u7d20\u6750",
+                "\u9009\u4e2d\u7684\u6587\u4ef6\u5939\u91cc\u6ca1\u6709\u627e\u5230\u53ef\u7528\u7684\u89c6\u9891/\u56fe\u7247\u7d20\u6750\u3002",
+            )
+        groups = self._current_smart_queue_groups() + new_groups
+        self._set_smart_queue_groups(groups)
+        if hasattr(self, "chk_smart_queue"):
+            self.chk_smart_queue.setChecked(True)
+        if hasattr(self, "smart_queue_toggle"):
+            self.smart_queue_toggle.setChecked(True)
+        self._refresh_smart_queue_controls()
+        self._capture_current_queue_state()
+        self.sig_log.emit(f"\u5df2\u4ece{source_label}\u751f\u6210 {len(new_groups)} \u4e2a\u4e3b\u4f53\u7ec4\u3002", "#a6e3a1")
+
+    def _select_smart_queue_subject_folders(self):
+        dialog = QFileDialog(self, "\u591a\u9009\u4e3b\u4f53\u6587\u4ef6\u5939")
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        for view in dialog.findChildren(QAbstractItemView):
+            view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return []
+        return [folder for folder in dialog.selectedFiles() if os.path.isdir(folder)]
+
+    def import_smart_queue_groups_from_selected_folders(self):
+        folders = self._select_smart_queue_subject_folders()
+        if not folders:
+            return
+        self._append_smart_queue_groups(
+            self._smart_queue_groups_from_folders(folders),
+            "\u591a\u9009\u6587\u4ef6\u5939",
+        )
+
+    def import_smart_queue_groups_from_folder(self):
+        root = QFileDialog.getExistingDirectory(self, "\u9009\u62e9\u4e3b\u4f53\u5206\u7ec4\u7236\u6587\u4ef6\u5939")
+        if not root:
+            return
+        new_groups = []
+        for name in sorted(os.listdir(root), key=natural_sort_key):
+            folder = os.path.join(root, name)
+            if not os.path.isdir(folder):
+                continue
+            paths = self._media_paths_in_folder(folder)
+            if paths:
+                new_groups.append({"name": name, "paths": paths, "enabled": True})
+        if not new_groups:
+            paths = self._media_paths_in_folder(root)
+            if paths:
+                new_groups.append({"name": os.path.basename(root) or "\u4e3b\u4f53\u7ec4", "paths": paths, "enabled": True})
+        self._append_smart_queue_groups(new_groups, "\u6587\u4ef6\u5939")
+
+    def clear_smart_queue_groups(self):
+        self._set_smart_queue_groups([])
+        if hasattr(self, "chk_smart_queue"):
+            self.chk_smart_queue.setChecked(False)
+        self._refresh_smart_queue_controls()
+        self._capture_current_queue_state()
+
+    def _smart_queue_keywords(self, name):
+        raw = str(name or "").strip().lower()
+        compact = re.sub(r"[\s_\-\|/\\]+", "", raw)
+        candidates = {raw, compact}
+        for token in re.split("[,\\uFF0C;\\uFF1B/|\\s_\\-]+", raw):
+            token = token.strip()
+            if token:
+                candidates.add(token)
+        base = re.sub(r"(\u7d20\u6750|\u89c6\u9891|\u4e3b\u4f53|\u4eba\u7269|\u5206\u7ec4|\u961f\u5217|\u7ec4)$", "", compact)
+        if base:
+            candidates.add(base)
+        return [item for item in candidates if len(item) >= 2]
+
+    def _select_smart_queue_group(self, groups, row, row_index, rng, mode):
+        groups = [group for group in self._normalize_smart_queue_groups(groups) if self._normalize_batch_assembly_paths(group.get("paths", []))]
+        if not groups:
+            return None
+        if len(groups) == 1:
+            return groups[0]
+        mode = mode if mode in {"match", "cycle", "random"} else "cycle"
+        if mode == "random":
+            return rng.choice(groups)
+        haystack_parts = [row.get("title", ""), row.get("text", ""), file_stem(row.get("video", "")), file_stem(row.get("audio", ""))]
+        haystack = " ".join(str(part or "") for part in haystack_parts).lower()
+        haystack_compact = re.sub(r"[\s_\-\|/\\]+", "", haystack)
+        if mode == "match":
+            for group in groups:
+                for keyword in self._smart_queue_keywords(group.get("name", "")):
+                    if keyword and (keyword in haystack or keyword in haystack_compact):
+                        return group
+        return groups[row_index % len(groups)]
+
+    def _smart_queue_group_order(self, groups, row, row_index, rng, mode):
+        groups = [group for group in self._normalize_smart_queue_groups(groups) if self._normalize_batch_assembly_paths(group.get("paths", []))]
+        if not groups:
+            return []
+        selected = self._select_smart_queue_group(groups, row, row_index, rng, mode)
+        if not selected:
+            return groups
+        selected_name = selected.get("name", "")
+        try:
+            start_idx = next(i for i, group in enumerate(groups) if group.get("name", "") == selected_name)
+        except StopIteration:
+            start_idx = 0
+        ordered = groups[start_idx:] + groups[:start_idx]
+        if mode == "random" and len(ordered) > 2:
+            head, rest = ordered[0], ordered[1:]
+            rng.shuffle(rest)
+            ordered = [head] + rest
+        return ordered
+
+    def _smart_queue_groups_for_cut(self, groups, row, row_index, rng, select_mode, cut_mode):
+        ordered = self._smart_queue_group_order(groups, row, row_index, rng, select_mode)
+        if not ordered:
+            return []
+        cut_mode = cut_mode if cut_mode in {"auto", "single", "parallel", "cross", "sequence"} else "auto"
+        if cut_mode == "auto":
+            if len(ordered) >= 3:
+                cut_mode = "cross"
+            elif len(ordered) == 2:
+                cut_mode = "parallel"
+            else:
+                cut_mode = "single"
+        if cut_mode == "single":
+            return ordered[:1]
+        if cut_mode == "parallel":
+            return ordered[:2]
+        if cut_mode in {"cross", "sequence"}:
+            return ordered
+        return ordered[:1]
+
+    def _select_one_smart_queue_clip(self, group, used_clips, rng):
+        paths = self._normalize_batch_assembly_paths(group.get("paths", []))
+        if not paths:
+            return ""
+        key = group.get("name", "__group__")
+        used = used_clips.setdefault(key, set())
+        available = [path for path in paths if path not in used]
+        if not available:
+            used.clear()
+            available = list(paths)
+        choice = rng.choice(available)
+        used.add(choice)
+        return choice
+
+    def _select_smart_queue_clips(self, groups, count, used_clips, rng, cut_mode):
+        groups = [group for group in self._normalize_smart_queue_groups(groups) if self._normalize_batch_assembly_paths(group.get("paths", []))]
+        if not groups:
+            return []
+        if len(groups) == 1:
+            combo_used = used_clips.setdefault(f"combo::{groups[0].get('name', '__group__')}", set())
+            return self._select_assembly_combo(groups[0].get("paths", []), count, combo_used, rng)
+        total_paths = sum(len(self._normalize_batch_assembly_paths(group.get("paths", []))) for group in groups)
+        if total_paths <= 0:
+            return []
+        resolved = cut_mode if cut_mode in {"parallel", "cross", "sequence"} else ("cross" if len(groups) >= 3 else "parallel")
+        count = max(1, min(int(count or 1), total_paths))
+        if resolved == "parallel":
+            count = max(count, min(2, total_paths))
+            active_groups = groups[:2]
+            slots = [active_groups[i % len(active_groups)] for i in range(count)]
+        elif resolved == "sequence":
+            count = max(count, min(len(groups), total_paths))
+            base = count // len(groups)
+            extra = count % len(groups)
+            slots = []
+            for idx, group in enumerate(groups):
+                slots.extend([group] * (base + (1 if idx < extra else 0)))
+        else:
+            count = max(count, min(3, len(groups), total_paths))
+            slots = [groups[i % len(groups)] for i in range(count)]
+        clips = []
+        for group in slots:
+            clip = self._select_one_smart_queue_clip(group, used_clips, rng)
+            if clip:
+                clips.append(clip)
+        return clips
+
+    def _smart_queue_group_names_label(self, groups, cut_mode):
+        groups = self._normalize_smart_queue_groups(groups)
+        if not groups:
+            return ""
+        return f"{self._smart_queue_cut_label(cut_mode, len(groups))}:" + "+".join(group.get("name", "") for group in groups)
+
+    def _normalize_audio_paths(self, paths):
+        if isinstance(paths, str):
+            paths = [paths]
+        clean = []
+        for raw in paths or []:
+            path = str(raw or "").strip()
+            if path and os.path.exists(path) and looks_audio_path(path) and path not in clean:
+                clean.append(path)
+        return sort_audio_paths(clean, self._audio_import_sort_mode())
+
+    def _normalize_multi_project_packages(self, packages):
+        clean = []
+        used_names = set()
+        for idx, package in enumerate(packages or [], start=1):
+            if not isinstance(package, dict):
+                continue
+            name = str(package.get("name") or f"项目 {idx}").strip() or f"项目 {idx}"
+            base_name = name
+            suffix = 2
+            while name in used_names:
+                name = f"{base_name} {suffix}"
+                suffix += 1
+            used_names.add(name)
+            script_source = package.get("script_lines") or package.get("texts") or package.get("scripts") or []
+            if isinstance(script_source, str):
+                script_lines = [line.strip() for line in script_source.splitlines() if line.strip()]
+            else:
+                script_lines = [str(line or "").strip() for line in script_source if str(line or "").strip()]
+            clean.append({
+                "name": name,
+                "enabled": bool(package.get("enabled", True)),
+                "audio_paths": self._normalize_audio_paths(package.get("audio_paths") or package.get("audios") or []),
+                "media_paths": self._normalize_batch_assembly_paths(package.get("media_paths") or package.get("video_paths") or package.get("paths") or []),
+                "script_lines": script_lines,
+            })
+        return clean
+
+    def _set_multi_project_packages(self, packages):
+        self.multi_project_packages = self._normalize_multi_project_packages(packages)
+
+    def _current_multi_project_packages(self):
+        self.multi_project_packages = self._normalize_multi_project_packages(getattr(self, "multi_project_packages", []))
+        return copy.deepcopy(self.multi_project_packages)
+
+    def _active_multi_project_packages(self, packages=None):
+        return [
+            package for package in self._normalize_multi_project_packages(self.multi_project_packages if packages is None else packages)
+            if package.get("enabled", True) and self._normalize_batch_assembly_paths(package.get("media_paths", []))
+        ]
+
+    def _multi_project_enabled(self, state=None):
+        return False
+
+    def _multi_project_summary(self, packages=None):
+        packages = self._normalize_multi_project_packages(self.multi_project_packages if packages is None else packages)
+        active = self._active_multi_project_packages(packages)
+        if not packages:
+            return "未建项目包；每个项目包单独选择音频和素材"
+        if not active:
+            return f"已建 {len(packages)} 个项目包，请给项目包选择素材并勾选启用"
+        task_count = sum(len(package.get("audio_paths", [])) if package.get("audio_paths") else 1 for package in active)
+        parts = [f"{p['name']} 音频{len(p.get('audio_paths', []))} / 文案{len(p.get('script_lines', []))} / 素材{len(p.get('media_paths', []))}" for p in active[:3]]
+        suffix = f" 等 {len(active)} 个项目包" if len(active) > 3 else ""
+        return f"{task_count} 个候选工程：" + " / ".join(parts) + suffix
+
+    def _rebuild_multi_project_package_options(self, packages):
+        panel = getattr(self, "multi_project_panel", None)
+        grid = getattr(self, "multi_project_layout", None)
+        if panel is None or grid is None:
+            return
+        packages = self._normalize_multi_project_packages(packages)
+        self._clear_layout_widgets(grid)
+        if not packages:
+            panel.setVisible(False)
+            return
+        panel.setVisible(True)
+        title = QLabel("项目包列表（每个项目单独绑定音频和素材）")
+        title.setStyleSheet("color:#a6adc8; font-weight:900; border:none;")
+        grid.addWidget(title, 0, 0, 1, 9)
+        for idx, package in enumerate(packages):
+            audio_paths = self._normalize_audio_paths(package.get("audio_paths", []))
+            media_paths = self._normalize_batch_assembly_paths(package.get("media_paths", []))
+            row_frame = QFrame()
+            row_frame.setStyleSheet("QFrame { background-color:#181825; border:1px solid #313244; border-radius:6px; }")
+            row_layout = QHBoxLayout(row_frame)
+            row_layout.setContentsMargins(8, 5, 8, 5)
+            row_layout.setSpacing(7)
+
+            chk = QCheckBox()
+            chk.setChecked(bool(package.get("enabled", True)))
+            chk.setToolTip("勾选后这个项目包才会参与批量建工程。")
+            chk.setStyleSheet("QCheckBox { border:none; } QCheckBox:checked { color:#a6e3a1; }")
+            chk.stateChanged.connect(lambda state, row_idx=idx: self._set_multi_project_package_enabled(row_idx, state == Qt.CheckState.Checked.value))
+            row_layout.addWidget(chk)
+
+            name_edit = QLineEdit(str(package.get("name", "")))
+            name_edit.setPlaceholderText("项目名")
+            name_edit.setMinimumWidth(118)
+            name_edit.setStyleSheet("background-color:#11111b; color:#cdd6f4; border:1px solid #45475a; border-radius:5px; padding:4px 7px; font-weight:800;")
+            name_edit.editingFinished.connect(lambda edit=name_edit, row_idx=idx: self._rename_multi_project_package(row_idx, edit.text()))
+            row_layout.addWidget(name_edit, stretch=1)
+
+            script_lines = package.get("script_lines", []) or []
+            count_label = QLabel(f"音频 {len(audio_paths)} / 文案 {len(script_lines)} / 素材 {len(media_paths)}")
+            count_label.setStyleSheet("color:#a6adc8; border:none; min-width:138px;")
+            row_layout.addWidget(count_label)
+
+            btn_audio = QPushButton("选音频" if not audio_paths else "换音频")
+            btn_audio_append = QPushButton("追加音频")
+            btn_media = QPushButton("选素材" if not media_paths else "换素材")
+            btn_media_append = QPushButton("追加素材")
+            btn_remove = QPushButton("删除")
+            for btn in (btn_audio, btn_audio_append, btn_media, btn_media_append, btn_remove):
+                btn.setStyleSheet("background-color:#313244; color:#cdd6f4; font-weight:800; padding:4px 8px; border-radius:5px; border:none;")
+            btn_audio.clicked.connect(lambda _=False, row_idx=idx: self._choose_multi_project_package_audio(row_idx, append=False))
+            btn_audio_append.clicked.connect(lambda _=False, row_idx=idx: self._choose_multi_project_package_audio(row_idx, append=True))
+            btn_media.clicked.connect(lambda _=False, row_idx=idx: self._choose_multi_project_package_media(row_idx, append=False))
+            btn_media_append.clicked.connect(lambda _=False, row_idx=idx: self._choose_multi_project_package_media(row_idx, append=True))
+            btn_remove.clicked.connect(lambda _=False, row_idx=idx: self._remove_multi_project_package(row_idx))
+            row_layout.addWidget(btn_audio)
+            row_layout.addWidget(btn_audio_append)
+            row_layout.addWidget(btn_media)
+            row_layout.addWidget(btn_media_append)
+            row_layout.addWidget(btn_remove)
+            grid.addWidget(row_frame, idx + 1, 0, 1, 9)
+
+    def _set_multi_project_package_enabled(self, index, checked):
+        packages = self._current_multi_project_packages()
+        if 0 <= index < len(packages):
+            packages[index]["enabled"] = bool(checked)
+            self._set_multi_project_packages(packages)
+            self._refresh_multi_project_controls()
+            self._capture_current_queue_state()
+
+    def _rename_multi_project_package(self, index, name):
+        packages = self._current_multi_project_packages()
+        if not (0 <= index < len(packages)):
+            return
+        name = str(name or "").strip() or f"项目 {index + 1}"
+        if packages[index].get("name", "") == name:
+            return
+        packages[index]["name"] = name
+        self._set_multi_project_packages(packages)
+        self._refresh_multi_project_controls()
+        self._capture_current_queue_state()
+
+    def _choose_multi_project_package_audio(self, index, append=False):
+        packages = self._current_multi_project_packages()
+        if not (0 <= index < len(packages)):
+            return
+        title = "追加项目音频" if append else "选择项目音频"
+        paths, _ = QFileDialog.getOpenFileNames(self, title, "", audio_file_filter())
+        paths = self._normalize_audio_paths(paths)
+        if not paths:
+            return
+        if append:
+            combined = list(packages[index].get("audio_paths", []))
+            for path in paths:
+                if path not in combined:
+                    combined.append(path)
+            paths = combined
+        packages[index]["audio_paths"] = self._normalize_audio_paths(paths)
+        packages[index]["enabled"] = True
+        self._set_multi_project_packages(packages)
+        if hasattr(self, "chk_multi_project_batch"):
+            self.chk_multi_project_batch.setChecked(True)
+        if hasattr(self, "multi_project_toggle"):
+            self.multi_project_toggle.setChecked(True)
+        self._refresh_multi_project_controls()
+        self._capture_current_queue_state()
+
+    def _choose_multi_project_package_media(self, index, append=False):
+        packages = self._current_multi_project_packages()
+        if not (0 <= index < len(packages)):
+            return
+        title = "追加项目素材" if append else "选择项目素材"
+        paths, _ = QFileDialog.getOpenFileNames(self, title, "", media_file_filter())
+        paths = self._normalize_batch_assembly_paths(paths)
+        if not paths:
+            return
+        if append:
+            combined = list(packages[index].get("media_paths", []))
+            for path in paths:
+                if path not in combined:
+                    combined.append(path)
+            paths = combined
+        packages[index]["media_paths"] = self._normalize_batch_assembly_paths(paths)
+        packages[index]["enabled"] = True
+        self._set_multi_project_packages(packages)
+        if hasattr(self, "chk_multi_project_batch"):
+            self.chk_multi_project_batch.setChecked(True)
+        if hasattr(self, "multi_project_toggle"):
+            self.multi_project_toggle.setChecked(True)
+        self._refresh_multi_project_controls()
+        self._capture_current_queue_state()
+
+    def _remove_multi_project_package(self, index):
+        packages = self._current_multi_project_packages()
+        if not (0 <= index < len(packages)):
+            return
+        removed = packages.pop(index)
+        self._set_multi_project_packages(packages)
+        self._refresh_multi_project_controls()
+        self._capture_current_queue_state()
+        self.sig_log.emit(f"已删除项目包: {removed.get('name', '')}", "#f38ba8")
+
+    def _refresh_multi_project_controls(self, *_):
+        packages = self._current_multi_project_packages() if hasattr(self, "multi_project_packages") else []
+        active = self._active_multi_project_packages(packages)
+        self._rebuild_multi_project_package_options(packages)
+        enabled = bool(getattr(self, "chk_multi_project_batch", None) and self.chk_multi_project_batch.isChecked())
+        for widget in (
+            getattr(self, "btn_add_multi_project", None),
+            getattr(self, "btn_import_multi_project_folder", None),
+            getattr(self, "btn_import_multi_project_multi_folder", None),
+        ):
+            if widget is not None:
+                widget.setEnabled(True)
+        if hasattr(self, "btn_clear_multi_project"):
+            self.btn_clear_multi_project.setEnabled(bool(packages))
+        if getattr(self, "chk_multi_project_batch", None) is not None and enabled and not active:
+            self.chk_multi_project_batch.blockSignals(True)
+            self.chk_multi_project_batch.setChecked(False)
+            self.chk_multi_project_batch.blockSignals(False)
+            enabled = False
+        if hasattr(self, "lbl_multi_project_summary"):
+            prefix = "已启用 | " if self._multi_project_enabled() else ""
+            self.lbl_multi_project_summary.setText(prefix + self._multi_project_summary(packages))
+        self._refresh_multi_project_script_controls()
+        self._update_queue_stats()
+
+    def add_multi_project_package(self):
+        packages = self._current_multi_project_packages()
+        used = {str(package.get("name", "")) for package in packages}
+        idx = len(packages) + 1
+        name = f"项目 {idx}"
+        while name in used:
+            idx += 1
+            name = f"项目 {idx}"
+        packages.append({"name": name, "audio_paths": [], "media_paths": [], "enabled": True})
+        self._set_multi_project_packages(packages)
+        if hasattr(self, "multi_project_toggle"):
+            self.multi_project_toggle.setChecked(True)
+        self._refresh_multi_project_controls()
+        self._capture_current_queue_state()
+        self.sig_log.emit(f"已新增项目包: {name}，请在卡片里选音频和素材。", "#a6e3a1")
+
+    def _audio_paths_in_folder(self, folder):
+        found = []
+        for root, _, files in os.walk(folder):
+            for filename in sorted(files, key=natural_sort_key):
+                path = os.path.join(root, filename)
+                if looks_audio_path(path) and os.path.exists(path) and path not in found:
+                    found.append(path)
+        return self._normalize_audio_paths(found)
+
+    def _multi_project_package_from_folder(self, folder):
+        return {
+            "name": os.path.basename(os.path.normpath(folder)) or "项目",
+            "audio_paths": self._audio_paths_in_folder(folder),
+            "media_paths": self._media_paths_in_folder(folder),
+            "enabled": True,
+        }
+
+    def _append_multi_project_packages(self, new_packages, source_label):
+        new_packages = [package for package in self._normalize_multi_project_packages(new_packages) if package.get("audio_paths") or package.get("media_paths")]
+        if not new_packages:
+            return QMessageBox.information(self, "没有素材", "选中的文件夹里没有找到可用音频或视频/图片素材。")
+        packages = self._current_multi_project_packages() + new_packages
+        self._set_multi_project_packages(packages)
+        if hasattr(self, "chk_multi_project_batch"):
+            self.chk_multi_project_batch.setChecked(True)
+        if hasattr(self, "multi_project_toggle"):
+            self.multi_project_toggle.setChecked(True)
+        self._refresh_multi_project_controls()
+        self._capture_current_queue_state()
+        self.sig_log.emit(f"已从{source_label}生成 {len(new_packages)} 个项目包。", "#a6e3a1")
+
+    def _select_multi_project_folders(self):
+        dialog = QFileDialog(self, "多选项目文件夹")
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        for view in dialog.findChildren(QAbstractItemView):
+            view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return []
+        return [folder for folder in dialog.selectedFiles() if os.path.isdir(folder)]
+
+    def import_multi_project_packages_from_selected_folders(self):
+        folders = self._select_multi_project_folders()
+        if not folders:
+            return
+        self._append_multi_project_packages([self._multi_project_package_from_folder(folder) for folder in folders], "多选文件夹")
+
+    def import_multi_project_packages_from_folder(self):
+        root = QFileDialog.getExistingDirectory(self, "选择项目包父文件夹")
+        if not root:
+            return
+        new_packages = []
+        for name in sorted(os.listdir(root), key=natural_sort_key):
+            folder = os.path.join(root, name)
+            if os.path.isdir(folder):
+                package = self._multi_project_package_from_folder(folder)
+                if package.get("audio_paths") or package.get("media_paths"):
+                    new_packages.append(package)
+        if not new_packages:
+            package = self._multi_project_package_from_folder(root)
+            if package.get("audio_paths") or package.get("media_paths"):
+                new_packages.append(package)
+        self._append_multi_project_packages(new_packages, "项目文件夹")
+
+    def clear_multi_project_packages(self):
+        self._set_multi_project_packages([])
+        if hasattr(self, "chk_multi_project_batch"):
+            self.chk_multi_project_batch.setChecked(False)
+        self._refresh_multi_project_controls()
+        self._capture_current_queue_state()
+
+    def _multi_project_script_index(self):
+        combo = getattr(self, "multi_project_script_package_combo", None)
+        if combo is None:
+            return -1
+        try:
+            return int(combo.currentData(Qt.ItemDataRole.UserRole))
+        except Exception:
+            return -1
+
+    def _refresh_multi_project_script_controls(self):
+        combo = getattr(self, "multi_project_script_package_combo", None)
+        if combo is None:
+            return
+        packages = self._current_multi_project_packages()
+        current = self._multi_project_script_index()
+        combo.blockSignals(True)
+        combo.clear()
+        for idx, package in enumerate(packages):
+            combo.addItem(
+                f"{package.get('name', f'项目 {idx + 1}')}  音频{len(package.get('audio_paths', []))} / 文案{len(package.get('script_lines', []))}",
+                userData=idx,
+            )
+        if packages:
+            combo.setCurrentIndex(current if 0 <= current < len(packages) else 0)
+        combo.blockSignals(False)
+        self._load_multi_project_script_editor()
+
+    def _load_multi_project_script_editor(self):
+        edit = getattr(self, "multi_project_scripts_edit", None)
+        label = getattr(self, "lbl_multi_project_script_hint", None)
+        if edit is None:
+            return
+        packages = self._current_multi_project_packages()
+        idx = self._multi_project_script_index()
+        if not (0 <= idx < len(packages)):
+            edit.setPlainText("")
+            edit.setPlaceholderText("先在项目包页新增项目，再回到这里给该项目粘贴文案。")
+            if label is not None:
+                label.setText("未选择项目包")
+            return
+        package = packages[idx]
+        lines = package.get("script_lines", []) or []
+        edit.blockSignals(True)
+        edit.setPlainText("\n".join(lines))
+        edit.blockSignals(False)
+        if label is not None:
+            label.setText(f"{package.get('name', '')}: 每行一条文案，会按音频顺序分配；多余音频仍会自动听译。")
+
+    def save_multi_project_script_lines(self):
+        edit = getattr(self, "multi_project_scripts_edit", None)
+        if edit is None:
+            return
+        packages = self._current_multi_project_packages()
+        idx = self._multi_project_script_index()
+        if not (0 <= idx < len(packages)):
+            return QMessageBox.information(self, "没有项目包", "请先新增一个项目包。")
+        lines = [line.strip() for line in edit.toPlainText().splitlines() if line.strip()]
+        packages[idx]["script_lines"] = lines
+        self._set_multi_project_packages(packages)
+        self._refresh_multi_project_controls()
+        self._capture_current_queue_state()
+        self.sig_log.emit(f"已为 {packages[idx].get('name', '')} 保存 {len(lines)} 条文案。", "#a6e3a1")
+
+    def clear_multi_project_script_lines(self):
+        packages = self._current_multi_project_packages()
+        idx = self._multi_project_script_index()
+        if not (0 <= idx < len(packages)):
+            return
+        packages[idx]["script_lines"] = []
+        self._set_multi_project_packages(packages)
+        self._refresh_multi_project_controls()
+        self._capture_current_queue_state()
+
+    def _sidecar_text_for_audio(self, audio_path):
+        if not audio_path:
+            return ""
+        folder = os.path.dirname(audio_path)
+        stem = file_stem(audio_path)
+        for ext in TEXT_EXTS:
+            candidate = os.path.join(folder, stem + ext)
+            if os.path.exists(candidate):
+                return read_text_source(candidate)
+        return ""
+
     def _music_path_for_task(self, payload, task_index):
         if not isinstance(payload, dict) or not payload.get("enabled"):
             return ""
@@ -1323,19 +2405,19 @@ class BatchView(QWidget):
         if hasattr(self, "_theme_colors"):
             apply_tinted_styles(dialog, self._theme_colors)
         layout = QVBoxLayout(dialog)
-        
+
         lbl = QLabel("去 Excel / 飞书 / 腾讯文档 选中内容按 Ctrl+C，在这里 Ctrl+V：\n👉 单列：只填正文；两列：大标题 + 正文\n👉 也支持：视频路径 / 配音路径 / 字幕Y值 / 大标题 / 正文")
         lbl.setStyleSheet("color: #a6e3a1; font-weight: bold; font-size: 14px; line-height: 1.5;")
         layout.addWidget(lbl)
-        
+
         tb = QTextEdit()
         tb.setStyleSheet("background-color: #11111b; color: #cdd6f4; font-size: 14px; border: 1px solid #313244; border-radius: 5px; padding: 10px;")
         layout.addWidget(tb)
-        
+
         btn = QPushButton("✅ 解析并填入表格")
         btn.setFixedHeight(45)
         btn.setStyleSheet("background-color: #89b4fa; color: #11111b; font-weight: bold; font-size: 16px; border-radius: 5px;")
-        
+
         def apply_paste():
             content = tb.toPlainText().strip()
             if not content: return
@@ -1343,23 +2425,23 @@ class BatchView(QWidget):
                 lines = list(csv.reader(io.StringIO(content), delimiter='\t'))
             except:
                 lines = [line.split('\t') for line in content.split('\n')]
-                
+
             row_widgets = []
             for i in range(self.table_layout.count()):
                 w = self.table_layout.itemAt(i).widget()
                 if isinstance(w, BatchTaskRow): row_widgets.append(w)
-                    
+
             if auto_add:
                 while len(row_widgets) < len(lines):
                     self.add_table_row()
                     w = self.table_layout.itemAt(self.table_layout.count()-1).widget()
                     row_widgets.append(w)
-                    
+
             for i, parts in enumerate(lines):
                 if i >= len(row_widgets): break
                 if not parts: continue
                 row_obj = row_widgets[i]
-                
+
                 values = [str(p or "").strip() for p in parts]
                 video_col = next((v for v in values if looks_media_path(v)), "")
                 audio_col = next((v for v in values if looks_audio_path(v)), "")
@@ -1393,6 +2475,8 @@ class BatchView(QWidget):
                     loaded_text = read_text_source(text_col) if text_col else ""
                     title_text = ""
                     body_text = loaded_text
+                    if not body_text and audio_col:
+                        body_text = self._sidecar_text_for_audio(audio_col)
                     if plain_values:
                         if body_text:
                             title_text = plain_values[0]
@@ -1413,9 +2497,9 @@ class BatchView(QWidget):
                     row_obj.txt_content.setPlainText(parts[1].strip())
                 elif len(parts) == 1:
                     row_obj.txt_content.setPlainText(parts[0].strip())
-                    
+
             dialog.accept()
-            
+
         btn.clicked.connect(apply_paste)
         layout.addWidget(btn)
         if hasattr(self, "_theme_colors"):
@@ -1426,17 +2510,17 @@ class BatchView(QWidget):
         layout = QVBoxLayout(self.tab_table)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
-        
+
         toolbar = QHBoxLayout()
         toolbar.setSpacing(8)
         btn_batch_vid = QPushButton("🎞️ 1. 批量选视频"); btn_batch_vid.setStyleSheet("background-color: #89b4fa; color: #11111b; font-weight: bold; padding: 6px 10px; border-radius: 4px;")
         btn_batch_aud = QPushButton("🎵 2. 批量选音频"); btn_batch_aud.setStyleSheet("background-color: #cba6f7; color: #11111b; font-weight: bold; padding: 6px 10px; border-radius: 4px;")
         btn_paste = QPushButton("📋 3. 从表格/Excel一键粘贴"); btn_paste.setStyleSheet("background-color: #b4befe; color: #11111b; font-weight: bold; padding: 6px 10px; border-radius: 4px;")
-        
+
         btn_batch_vid.clicked.connect(self.batch_select_videos)
         btn_batch_aud.clicked.connect(self.batch_select_audios)
         btn_paste.clicked.connect(lambda: self.open_paste_dialog(auto_add=True))
-        
+
         btn_start_table = QPushButton("🚀 建工程并导出")
         btn_start_table.setStyleSheet("background-color: #a6e3a1; color: #11111b; font-size: 15px; font-weight: bold; padding: 7px 18px; border-radius: 4px;")
         btn_start_table.clicked.connect(self.start_table_batch)
@@ -1449,25 +2533,378 @@ class BatchView(QWidget):
         toolbar.addStretch(); toolbar.addWidget(btn_build_projects); toolbar.addWidget(btn_start_table)
         layout.addLayout(toolbar)
 
+        audio_sort_row = QHBoxLayout()
+        audio_sort_row.setSpacing(8)
+        audio_sort_row.addWidget(QLabel("🎵 音频导入排序:", styleSheet="color: #cba6f7; font-weight: bold;"))
+        self.audio_import_sort_combo = QComboBox()
+        for label, mode in BATCH_AUDIO_SORT_MODES:
+            self.audio_import_sort_combo.addItem(label, userData=mode)
+        self.audio_import_sort_combo.setFixedWidth(184)
+        self.audio_import_sort_combo.setToolTip("控制‘批量选音频’和文件夹模式里配音的排列方式。按时间顺序生成的 6 个一组素材，建议选创建/生成时间从早到晚。")
+        self.audio_import_sort_combo.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 8px; font-weight: bold; border-radius: 5px;")
+        self.audio_import_sort_combo.currentIndexChanged.connect(lambda *_: self._capture_current_queue_state())
+        audio_sort_row.addWidget(self.audio_import_sort_combo)
+        audio_sort_row.addWidget(QLabel("默认按文件名；重复 1-6 编号时可改按时间。", styleSheet="color: #a6adc8; font-size: 12px;"), stretch=1)
+        layout.addLayout(audio_sort_row)
+
+        self.batch_workflow_tabs = QTabWidget()
+        self.batch_workflow_tabs.setMinimumHeight(120)
+        self.batch_workflow_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.batch_workflow_tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #313244; border-radius: 8px; background: #11111b; }
+            QTabBar::tab { background:#181825; color:#a6adc8; padding:7px 12px; border-top-left-radius:6px; border-top-right-radius:6px; font-weight:800; }
+            QTabBar::tab:selected { background:#313244; color:#cdd6f4; }
+        """)
+        def _scrollable_workflow_page(content_widget):
+            scroll_page = QScrollArea()
+            scroll_page.setWidgetResizable(True)
+            scroll_page.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll_page.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            scroll_page.setFrameShape(QFrame.Shape.NoFrame)
+            scroll_page.setStyleSheet("""
+                QScrollArea { border: none; background: #11111b; }
+                QScrollBar:vertical { background: #11111b; width: 10px; margin: 2px; }
+                QScrollBar::handle:vertical { background: #45475a; border-radius: 5px; min-height: 28px; }
+                QScrollBar::handle:vertical:hover { background: #89b4fa; }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            """)
+            scroll_page.setWidget(content_widget)
+            return scroll_page
+
+        assembly_page = QWidget()
+        assembly_page_layout = QVBoxLayout(assembly_page)
+        assembly_page_layout.setContentsMargins(8, 8, 8, 8)
+        assembly_page_layout.setSpacing(6)
+        smart_page = QWidget()
+        smart_page_layout = QVBoxLayout(smart_page)
+        smart_page_layout.setContentsMargins(8, 8, 8, 8)
+        smart_page_layout.setSpacing(6)
+        multi_page = QWidget()
+        multi_page_layout = QVBoxLayout(multi_page)
+        multi_page_layout.setContentsMargins(8, 8, 8, 8)
+        multi_page_layout.setSpacing(6)
+        self.batch_workflow_tabs.addTab(_scrollable_workflow_page(assembly_page), "随机组接")
+        self.batch_workflow_tabs.addTab(_scrollable_workflow_page(smart_page), "智能主体")
+        self._hidden_multi_project_workflow_page = _scrollable_workflow_page(multi_page)
+        self.batch_table_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.batch_table_splitter.setChildrenCollapsible(False)
+        self.batch_table_splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #313244;
+                height: 6px;
+                border-radius: 3px;
+                margin: 3px 0;
+            }
+            QSplitter::handle:hover { background-color: #89b4fa; }
+        """)
+        self.batch_table_splitter.addWidget(self.batch_workflow_tabs)
+
+        assembly_row = QHBoxLayout()
+        assembly_row.setSpacing(8)
+        assembly_row.addWidget(QLabel("🎬 随机组接池:", styleSheet="color: #f9e2af; font-weight: bold;"))
+        self.btn_select_batch_assembly = QPushButton("选择拼接素材")
+        self.btn_select_batch_assembly.setToolTip("一次选择多个画面素材；建工程时每条任务会随机抽取指定数量进行拼接。")
+        self.btn_select_batch_assembly.setStyleSheet("background-color: #313244; color: #cdd6f4; font-weight: bold; padding: 5px 12px; border-radius: 5px;")
+        self.btn_select_batch_assembly.clicked.connect(self.select_batch_assembly_pool)
+        assembly_row.addWidget(self.btn_select_batch_assembly)
+        self.btn_clear_batch_assembly = QPushButton("清空")
+        self.btn_clear_batch_assembly.setStyleSheet("background-color: #45475a; color: #cdd6f4; font-weight: bold; padding: 5px 10px; border-radius: 5px;")
+        self.btn_clear_batch_assembly.clicked.connect(self.clear_batch_assembly_pool)
+        assembly_row.addWidget(self.btn_clear_batch_assembly)
+        self.batch_assembly_mode_combo = QComboBox()
+        self.batch_assembly_mode_combo.addItem("智能匹配", userData="smart")
+        self.batch_assembly_mode_combo.addItem("固定数量", userData="fixed")
+        self.batch_assembly_mode_combo.setFixedWidth(92)
+        self.batch_assembly_mode_combo.setToolTip("智能匹配会按配音时长自动决定用几个素材；固定数量则按右侧数量抽取。")
+        self.batch_assembly_mode_combo.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 8px; font-weight: bold; border-radius: 5px;")
+        self.batch_assembly_mode_combo.currentIndexChanged.connect(lambda *_: (self._set_batch_assembly_controls_enabled(), self._capture_current_queue_state()))
+        assembly_row.addWidget(self.batch_assembly_mode_combo)
+        assembly_row.addWidget(QLabel("每条:", styleSheet="color: #a6adc8; font-weight: bold;"))
+        self.batch_assembly_count_spin = QSpinBox()
+        self.batch_assembly_count_spin.setRange(1, 12)
+        self.batch_assembly_count_spin.setValue(3)
+        self.batch_assembly_count_spin.setSuffix(" 个")
+        self.batch_assembly_count_spin.setFixedWidth(70)
+        self.batch_assembly_count_spin.setToolTip("例如素材池 12 个、每条 3 个，就会每个工程随机抽 3 个拼接。")
+        self.batch_assembly_count_spin.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 4px; font-weight: bold; border-radius: 5px;")
+        self.batch_assembly_count_spin.valueChanged.connect(lambda *_: (self._set_batch_assembly_controls_enabled(), self._capture_current_queue_state()))
+        assembly_row.addWidget(self.batch_assembly_count_spin)
+        self.lbl_batch_assembly = QLabel("未选择；选择后会覆盖每行单视频，按配音/工程时长自动拼接")
+        self.lbl_batch_assembly.setStyleSheet("color: #a6adc8; font-size: 12px;")
+        assembly_row.addWidget(self.lbl_batch_assembly, stretch=1)
+        assembly_page_layout.addLayout(assembly_row)
+        assembly_page_layout.addStretch(1)
+
+        smart_shell = QFrame()
+        smart_shell.setObjectName("SmartQueueShell")
+        smart_shell.setStyleSheet("""
+            QFrame#SmartQueueShell { background-color: #11111b; border: 1px solid #313244; border-radius: 8px; }
+            QFrame#SmartQueueBody, QFrame#SmartQueueGroups { background: transparent; border: none; }
+        """)
+        smart_shell_layout = QVBoxLayout(smart_shell)
+        smart_shell_layout.setContentsMargins(8, 6, 8, 6)
+        smart_shell_layout.setSpacing(6)
+
+        smart_header = QHBoxLayout()
+        smart_header.setSpacing(8)
+        self.smart_queue_toggle = QToolButton()
+        self.smart_queue_toggle.setText("\u667a\u80fd\u4e3b\u4f53\u961f\u5217")
+        self.smart_queue_toggle.setCheckable(True)
+        self.smart_queue_toggle.setChecked(False)
+        self.smart_queue_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.smart_queue_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.smart_queue_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.smart_queue_toggle.setStyleSheet("QToolButton { color:#a6e3a1; font-weight:900; border:none; padding:4px 6px; }")
+        smart_header.addWidget(self.smart_queue_toggle)
+
+        self.chk_smart_queue = QCheckBox("\u542f\u7528")
+        self.chk_smart_queue.setToolTip("\u6309\u4f60\u52fe\u9009\u7684\u4e3b\u4f53\u7ec4\u8f6e\u6362\u6216\u968f\u673a\uff0c\u4e0d\u4f9d\u8d56\u82f1\u6587\u6587\u6848\u6216\u7d20\u6750\u547d\u540d\u3002")
+        self.chk_smart_queue.setStyleSheet("QCheckBox { color: #cdd6f4; font-weight: 900; border:none; } QCheckBox:checked { color:#a6e3a1; }")
+        self.chk_smart_queue.stateChanged.connect(lambda *_: (self._refresh_smart_queue_controls(), self._capture_current_queue_state()))
+        smart_header.addWidget(self.chk_smart_queue)
+
+        self.lbl_smart_queue_summary = QLabel("\u672a\u5efa\u4e3b\u4f53\u7ec4\uff1b\u624b\u52a8\u65b0\u589e\u6216\u6309\u6587\u4ef6\u5939\u6210\u7ec4\uff0c\u4e0d\u4f9d\u8d56\u7d20\u6750\u547d\u540d")
+        self.lbl_smart_queue_summary.setStyleSheet("color: #a6adc8; font-size: 12px; border:none;")
+        smart_header.addWidget(self.lbl_smart_queue_summary, stretch=1)
+        smart_shell_layout.addLayout(smart_header)
+
+        self.smart_queue_body = QFrame()
+        self.smart_queue_body.setObjectName("SmartQueueBody")
+        smart_body_layout = QVBoxLayout(self.smart_queue_body)
+        smart_body_layout.setContentsMargins(0, 0, 0, 0)
+        smart_body_layout.setSpacing(6)
+
+        smart_group_row = QHBoxLayout()
+        smart_group_row.setSpacing(8)
+        smart_group_row.addWidget(QLabel("1. \u4e3b\u4f53\u7ec4:", styleSheet="color:#f9e2af; font-weight:900; border:none;"))
+        self.btn_add_smart_queue_group = QPushButton("\u65b0\u589e\u7a7a\u7ec4")
+        self.btn_import_smart_queue_folder = QPushButton("\u6587\u4ef6\u5939\u6210\u7ec4")
+        self.btn_import_smart_queue_multi_folder = QPushButton("\u591a\u9009\u6587\u4ef6\u5939\u6210\u7ec4")
+        self.btn_clear_smart_queue = QPushButton("\u6e05\u7a7a")
+        for btn in (self.btn_add_smart_queue_group, self.btn_import_smart_queue_folder, self.btn_import_smart_queue_multi_folder, self.btn_clear_smart_queue):
+            btn.setStyleSheet("background-color: #313244; color: #cdd6f4; font-weight: bold; padding: 5px 10px; border-radius: 5px; border:none;")
+        self.btn_add_smart_queue_group.clicked.connect(self.add_smart_queue_group)
+        self.btn_import_smart_queue_folder.clicked.connect(self.import_smart_queue_groups_from_folder)
+        self.btn_import_smart_queue_multi_folder.clicked.connect(self.import_smart_queue_groups_from_selected_folders)
+        self.btn_clear_smart_queue.clicked.connect(self.clear_smart_queue_groups)
+        smart_group_row.addWidget(self.btn_add_smart_queue_group)
+        smart_group_row.addWidget(self.btn_import_smart_queue_folder)
+        smart_group_row.addWidget(self.btn_import_smart_queue_multi_folder)
+        smart_group_row.addWidget(self.btn_clear_smart_queue)
+        smart_group_row.addStretch()
+        smart_body_layout.addLayout(smart_group_row)
+
+        self.smart_queue_groups_panel = QFrame()
+        self.smart_queue_groups_panel.setObjectName("SmartQueueGroups")
+        self.smart_queue_groups_layout = QGridLayout(self.smart_queue_groups_panel)
+        self.smart_queue_groups_layout.setContentsMargins(8, 4, 8, 4)
+        self.smart_queue_groups_layout.setHorizontalSpacing(8)
+        self.smart_queue_groups_layout.setVerticalSpacing(4)
+        smart_body_layout.addWidget(self.smart_queue_groups_panel)
+
+        smart_mode_row = QHBoxLayout()
+        smart_mode_row.setSpacing(8)
+        smart_mode_row.addWidget(QLabel("2. \u5206\u914d\u65b9\u5f0f:", styleSheet="color:#89b4fa; font-weight:900; border:none;"))
+        self.smart_queue_mode_combo = QComboBox()
+        self.smart_queue_mode_combo.addItem("\u6309\u52fe\u9009\u4e3b\u4f53\u8f6e\u6362", userData="cycle")
+        self.smart_queue_mode_combo.addItem("\u968f\u673a\u4e3b\u4f53\u7ec4", userData="random")
+        self.smart_queue_mode_combo.addItem("\u6807\u9898\u5173\u952e\u8bcd\u5339\u914d", userData="match")
+        self.smart_queue_mode_combo.setFixedWidth(154)
+        self.smart_queue_mode_combo.setToolTip("\u9ed8\u8ba4\u6309\u52fe\u9009\u4e3b\u4f53\u8f6e\u6362\uff0c\u4e0d\u9700\u8981\u82f1\u6587\u6587\u6848\u6216\u7d20\u6750\u547d\u540d\uff1b\u5173\u952e\u8bcd\u5339\u914d\u53ea\u4f5c\u4e3a\u9ad8\u7ea7\u9009\u9879\u3002")
+        self.smart_queue_mode_combo.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 8px; font-weight: bold; border-radius: 5px;")
+        self.smart_queue_mode_combo.currentIndexChanged.connect(lambda *_: (self._refresh_smart_queue_controls(), self._capture_current_queue_state()))
+        smart_mode_row.addWidget(self.smart_queue_mode_combo)
+        smart_mode_row.addStretch()
+        smart_body_layout.addLayout(smart_mode_row)
+
+        smart_cut_row = QHBoxLayout()
+        smart_cut_row.setSpacing(8)
+        smart_cut_row.addWidget(QLabel("3. \u526a\u8f91\u65b9\u5f0f:", styleSheet="color:#cba6f7; font-weight:900; border:none;"))
+        self.smart_queue_cut_combo = QComboBox()
+        self.smart_queue_cut_combo.addItem("\u5355\u4e3b\u4f53\u968f\u673a", userData="single")
+        self.smart_queue_cut_combo.addItem("\u81ea\u52a8\u526a\u8f91", userData="auto")
+        self.smart_queue_cut_combo.addItem("\u5e73\u884c\u526a\u8f91", userData="parallel")
+        self.smart_queue_cut_combo.addItem("\u4ea4\u53c9\u526a\u8f91", userData="cross")
+        self.smart_queue_cut_combo.addItem("\u5e73\u7eed\u526a\u8f91", userData="sequence")
+        self.smart_queue_cut_combo.setFixedWidth(128)
+        self.smart_queue_cut_combo.setToolTip("\u5355\u4e3b\u4f53\u968f\u673a: \u6bcf\u6761\u5148\u9009\u4e00\u4e2a\u4e3b\u4f53\u7ec4\uff0c\u518d\u4ece\u8be5\u7ec4\u91cc\u6309\u6570\u91cf\u62bd\u591a\u4e2a\u7d20\u6750\uff1b\u81ea\u52a8: 2\u7ec4\u5e73\u884c\uff0c3\u7ec4\u4ee5\u4e0a\u4ea4\u53c9\u3002")
+        self.smart_queue_cut_combo.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 8px; font-weight: bold; border-radius: 5px;")
+        self.smart_queue_cut_combo.currentIndexChanged.connect(lambda *_: (self._refresh_smart_queue_controls(), self._capture_current_queue_state()))
+        smart_cut_row.addWidget(self.smart_queue_cut_combo)
+        smart_cut_row.addStretch()
+        smart_body_layout.addLayout(smart_cut_row)
+
+        self.smart_queue_body.setVisible(False)
+        smart_shell_layout.addWidget(self.smart_queue_body)
+        smart_page_layout.addWidget(smart_shell)
+        smart_page_layout.addStretch(1)
+
+        def _toggle_smart_queue_body(checked):
+            self.smart_queue_body.setVisible(bool(checked))
+            self.smart_queue_toggle.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
+            if hasattr(self, "batch_table_splitter"):
+                self.batch_table_splitter.setSizes([320 if checked else 180, 640])
+        self.smart_queue_toggle.toggled.connect(_toggle_smart_queue_body)
+        self._set_batch_assembly_controls_enabled(False)
+        self._refresh_smart_queue_controls()
+
+        multi_project_shell = QFrame()
+        multi_project_shell.setObjectName("MultiProjectShell")
+        multi_project_shell.setStyleSheet("""
+            QFrame#MultiProjectShell { background-color: #11111b; border: 1px solid #313244; border-radius: 8px; }
+            QFrame#MultiProjectBody, QFrame#MultiProjectPanel { background: transparent; border: none; }
+        """)
+        multi_project_layout = QVBoxLayout(multi_project_shell)
+        multi_project_layout.setContentsMargins(8, 6, 8, 6)
+        multi_project_layout.setSpacing(6)
+
+        multi_header = QHBoxLayout()
+        multi_header.setSpacing(8)
+        self.multi_project_toggle = QToolButton()
+        self.multi_project_toggle.setText("批量多项目包")
+        self.multi_project_toggle.setCheckable(True)
+        self.multi_project_toggle.setChecked(True)
+        self.multi_project_toggle.setArrowType(Qt.ArrowType.DownArrow)
+        self.multi_project_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.multi_project_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.multi_project_toggle.setStyleSheet("QToolButton { color:#f9e2af; font-weight:900; border:none; padding:4px 6px; }")
+        multi_header.addWidget(self.multi_project_toggle)
+
+        self.chk_multi_project_batch = QCheckBox("启用")
+        self.chk_multi_project_batch.setToolTip("启用后，当前表格页会按项目包生成任务；每个项目包的音频只匹配该项目包自己的素材。")
+        self.chk_multi_project_batch.setStyleSheet("QCheckBox { color: #cdd6f4; font-weight: 900; border:none; } QCheckBox:checked { color:#a6e3a1; }")
+        self.chk_multi_project_batch.stateChanged.connect(lambda *_: (self._refresh_multi_project_controls(), self._capture_current_queue_state()))
+        multi_header.addWidget(self.chk_multi_project_batch)
+
+        self.lbl_multi_project_summary = QLabel("未建项目包；每个项目包单独选择音频和素材")
+        self.lbl_multi_project_summary.setStyleSheet("color: #a6adc8; font-size: 12px; border:none;")
+        multi_header.addWidget(self.lbl_multi_project_summary, stretch=1)
+        multi_project_layout.addLayout(multi_header)
+
+        self.multi_project_body = QFrame()
+        self.multi_project_body.setObjectName("MultiProjectBody")
+        multi_body_layout = QVBoxLayout(self.multi_project_body)
+        multi_body_layout.setContentsMargins(0, 0, 0, 0)
+        multi_body_layout.setSpacing(6)
+        self.multi_project_inner_tabs = QTabWidget()
+        self.multi_project_inner_tabs.setStyleSheet("QTabWidget::pane { border: none; } QTabBar::tab { background:#181825; color:#a6adc8; padding:6px 10px; font-weight:800; } QTabBar::tab:selected { background:#313244; color:#cdd6f4; }")
+        multi_package_page = QWidget()
+        multi_package_layout = QVBoxLayout(multi_package_page)
+        multi_package_layout.setContentsMargins(0, 0, 0, 0)
+        multi_package_layout.setSpacing(6)
+        multi_script_page = QWidget()
+        multi_script_layout = QVBoxLayout(multi_script_page)
+        multi_script_layout.setContentsMargins(0, 0, 0, 0)
+        multi_script_layout.setSpacing(6)
+        self.multi_project_inner_tabs.addTab(multi_package_page, "项目包")
+        self.multi_project_inner_tabs.addTab(multi_script_page, "音频/文案")
+        multi_body_layout.addWidget(self.multi_project_inner_tabs)
+
+        multi_btn_row = QHBoxLayout()
+        multi_btn_row.setSpacing(8)
+        multi_btn_row.addWidget(QLabel("项目包:", styleSheet="color:#f9e2af; font-weight:900; border:none;"))
+        self.btn_add_multi_project = QPushButton("新增项目")
+        self.btn_import_multi_project_folder = QPushButton("项目文件夹成组")
+        self.btn_import_multi_project_multi_folder = QPushButton("多选文件夹成项目")
+        self.btn_clear_multi_project = QPushButton("清空")
+        for btn in (self.btn_add_multi_project, self.btn_import_multi_project_folder, self.btn_import_multi_project_multi_folder, self.btn_clear_multi_project):
+            btn.setStyleSheet("background-color: #313244; color: #cdd6f4; font-weight: bold; padding: 5px 10px; border-radius: 5px; border:none;")
+        self.btn_add_multi_project.clicked.connect(self.add_multi_project_package)
+        self.btn_import_multi_project_folder.clicked.connect(self.import_multi_project_packages_from_folder)
+        self.btn_import_multi_project_multi_folder.clicked.connect(self.import_multi_project_packages_from_selected_folders)
+        self.btn_clear_multi_project.clicked.connect(self.clear_multi_project_packages)
+        multi_btn_row.addWidget(self.btn_add_multi_project)
+        multi_btn_row.addWidget(self.btn_import_multi_project_folder)
+        multi_btn_row.addWidget(self.btn_import_multi_project_multi_folder)
+        multi_btn_row.addWidget(self.btn_clear_multi_project)
+        multi_btn_row.addStretch()
+        multi_package_layout.addLayout(multi_btn_row)
+
+        multi_project_scroll = QScrollArea()
+        multi_project_scroll.setWidgetResizable(True)
+        multi_project_scroll.setMaximumHeight(178)
+        multi_project_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        self.multi_project_panel = QFrame()
+        self.multi_project_panel.setObjectName("MultiProjectPanel")
+        self.multi_project_layout = QGridLayout(self.multi_project_panel)
+        self.multi_project_layout.setContentsMargins(8, 4, 8, 4)
+        self.multi_project_layout.setHorizontalSpacing(8)
+        self.multi_project_layout.setVerticalSpacing(4)
+        multi_project_scroll.setWidget(self.multi_project_panel)
+        multi_package_layout.addWidget(multi_project_scroll)
+
+        script_row = QHBoxLayout()
+        script_row.setSpacing(8)
+        script_row.addWidget(QLabel("项目包:", styleSheet="color:#f9e2af; font-weight:900; border:none;"))
+        self.multi_project_script_package_combo = QComboBox()
+        self.multi_project_script_package_combo.setStyleSheet("background-color:#313244; color:#cdd6f4; padding:5px 8px; font-weight:800; border-radius:5px;")
+        self.multi_project_script_package_combo.currentIndexChanged.connect(lambda *_: self._load_multi_project_script_editor())
+        script_row.addWidget(self.multi_project_script_package_combo, stretch=1)
+        self.btn_save_multi_project_scripts = QPushButton("保存文案")
+        self.btn_clear_multi_project_scripts = QPushButton("清空文案")
+        for btn in (self.btn_save_multi_project_scripts, self.btn_clear_multi_project_scripts):
+            btn.setStyleSheet("background-color:#313244; color:#cdd6f4; font-weight:800; padding:5px 10px; border-radius:5px; border:none;")
+        self.btn_save_multi_project_scripts.clicked.connect(self.save_multi_project_script_lines)
+        self.btn_clear_multi_project_scripts.clicked.connect(self.clear_multi_project_script_lines)
+        script_row.addWidget(self.btn_save_multi_project_scripts)
+        script_row.addWidget(self.btn_clear_multi_project_scripts)
+        multi_script_layout.addLayout(script_row)
+        self.lbl_multi_project_script_hint = QLabel("每行一条文案，按该项目包里的音频顺序分配。")
+        self.lbl_multi_project_script_hint.setStyleSheet("color:#a6adc8; font-size:12px; border:none;")
+        multi_script_layout.addWidget(self.lbl_multi_project_script_hint)
+        self.multi_project_scripts_edit = QTextEdit()
+        self.multi_project_scripts_edit.setPlaceholderText("例如：\n第一条音频对应的文案\n第二条音频对应的文案\n第三条音频对应的文案")
+        self.multi_project_scripts_edit.setStyleSheet("background-color:#11111b; color:#cdd6f4; border:1px solid #313244; border-radius:6px; padding:8px;")
+        multi_script_layout.addWidget(self.multi_project_scripts_edit, stretch=1)
+
+        self.multi_project_body.setVisible(True)
+        multi_project_layout.addWidget(self.multi_project_body)
+        multi_page_layout.addWidget(multi_project_shell)
+        multi_page_layout.addStretch(1)
+
+        def _toggle_multi_project_body(checked):
+            self.multi_project_body.setVisible(bool(checked))
+            self.multi_project_toggle.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
+            if hasattr(self, "batch_table_splitter"):
+                self.batch_table_splitter.setSizes([340 if checked else 180, 640])
+        self.multi_project_toggle.toggled.connect(_toggle_multi_project_body)
+        self._refresh_multi_project_controls()
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(230)
-        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        scroll.setMinimumHeight(150)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setStyleSheet("""
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { background: #11111b; width: 10px; margin: 2px; }
+            QScrollBar::handle:vertical { background: #45475a; border-radius: 5px; min-height: 28px; }
+            QScrollBar::handle:vertical:hover { background: #89b4fa; }
+            QScrollBar:horizontal { background: #11111b; height: 10px; margin: 2px; }
+            QScrollBar::handle:horizontal { background: #45475a; border-radius: 5px; min-width: 42px; }
+            QScrollBar::handle:horizontal:hover { background: #89b4fa; }
+            QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+        """)
         self.table_scroll = scroll
         self.table_content = QWidget()
+        self.table_content.setMinimumWidth(1180)
         self.table_layout = QVBoxLayout(self.table_content)
         self.table_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.table_layout.setContentsMargins(0, 0, 0, 0)
         self.table_layout.setSpacing(6)
         scroll.setWidget(self.table_content)
-        layout.addWidget(scroll)
+        self.batch_table_splitter.addWidget(scroll)
+        self.batch_table_splitter.setStretchFactor(0, 0)
+        self.batch_table_splitter.setStretchFactor(1, 1)
+        self.batch_table_splitter.setSizes([240, 640])
+        layout.addWidget(self.batch_table_splitter, stretch=1)
 
         btn_add_row = QPushButton("➕ 新增空行")
         btn_add_row.setFixedHeight(32)
         btn_add_row.setStyleSheet("background-color: #313244; color: #cdd6f4; font-weight: bold; padding: 6px; border-radius: 5px;")
         btn_add_row.clicked.connect(self.add_table_row)
         layout.addWidget(btn_add_row)
-        
+
         self.add_table_row()
 
     def add_table_row(self):
@@ -1518,11 +2955,51 @@ class BatchView(QWidget):
                 last_idx = idx
         return last_idx
 
+    def _row_has_batch_content(self, row):
+        return bool(
+            (row.get("video") or "").strip()
+            or (row.get("audio") or "").strip()
+            or (row.get("title") or "").strip()
+            or (row.get("text") or "").strip()
+        )
+
+    def _state_has_dynamic_media(self, state):
+        if self._normalize_batch_assembly_paths(state.get("assembly_paths", [])):
+            return True
+        return self._smart_queue_enabled(state)
+
     def _set_row_title_for_pair(self, row, video_path="", audio_path=""):
         if audio_path:
             row.txt_title.setText(file_stem(audio_path))
         elif video_path and not row.txt_title.text().strip():
             row.txt_title.setText(file_stem(video_path))
+
+    def _valid_audio_import_sort_mode(self, mode):
+        valid = {value for _, value in BATCH_AUDIO_SORT_MODES}
+        return mode if mode in valid else "natural"
+
+    def _audio_import_sort_mode(self):
+        combo = getattr(self, "audio_import_sort_combo", None)
+        if combo is None:
+            return "natural"
+        return self._valid_audio_import_sort_mode(combo.currentData(Qt.ItemDataRole.UserRole) or "natural")
+
+    def _set_audio_import_sort_mode(self, mode):
+        combo = getattr(self, "audio_import_sort_combo", None)
+        if combo is None:
+            return
+        mode = self._valid_audio_import_sort_mode(mode)
+        idx = combo.findData(mode, Qt.ItemDataRole.UserRole)
+        combo.blockSignals(True)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _audio_import_sort_label(self, mode=None):
+        mode = self._valid_audio_import_sort_mode(mode or self._audio_import_sort_mode())
+        return next((label for label, value in BATCH_AUDIO_SORT_MODES if value == mode), "文件名自然排序")
+
+    def _sort_audio_import_paths(self, paths):
+        return sort_audio_paths(paths, self._audio_import_sort_mode())
 
     def batch_select_videos(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "批量选择画面", "", media_file_filter())
@@ -1542,7 +3019,8 @@ class BatchView(QWidget):
         paths, _ = QFileDialog.getOpenFileNames(self, "批量选择配音", "", audio_file_filter())
         if not paths:
             return
-        paths = sorted(paths, key=natural_sort_key)
+        paths = self._sort_audio_import_paths(paths)
+        self.sig_log.emit(f"配音导入排序：{self._audio_import_sort_label()}，共 {len(paths)} 个。", "#89b4fa")
         video_paths = self._existing_video_paths()
         append_start = self._last_audio_row_index() + 1
         rows = self._ensure_table_rows(append_start + len(paths))
@@ -1551,6 +3029,10 @@ class BatchView(QWidget):
             if video_paths:
                 row.set_video_path(video_paths[i % len(video_paths)])
             row.set_audio_path(path)
+            if not row.txt_content.toPlainText().strip():
+                sidecar_text = self._sidecar_text_for_audio(path)
+                if sidecar_text:
+                    row.txt_content.setPlainText(sidecar_text)
             self._set_row_title_for_pair(row, row.video_path, path)
         if video_paths and len(paths) > len(video_paths):
             self.sig_log.emit(f"配音 {len(paths)} 个，画面 {len(video_paths)} 个，已按顺序循环套用画面。", "#a6e3a1")
@@ -1561,13 +3043,13 @@ class BatchView(QWidget):
         layout = QVBoxLayout(self.tab_folder)
         layout.addWidget(QLabel("1. 选择一个包含视频的文件夹，系统会自动扫描并处理。"))
         layout.addWidget(QLabel("2. 如果文件夹内有同名的 .mp3 文件，系统会自动将其作为配音合成。"))
-        
+
         self.btn_input = QPushButton("📂 选择输入文件夹")
         self.btn_input.setFixedHeight(50)
         self.btn_input.setStyleSheet("background-color: #313244; color: white; font-weight: bold; font-size: 16px; border-radius: 8px;")
         self.btn_input.clicked.connect(self.select_input_dir)
         self.lbl_input = QLabel("未选择")
-        
+
         btn_start_folder = QPushButton("🚀 扫盘建工程并导出")
         btn_start_folder.setFixedHeight(60)
         btn_start_folder.setStyleSheet("background-color: #f38ba8; color: #11111b; font-size: 18px; font-weight: bold; border-radius: 8px; margin-top: 20px;")
@@ -1808,7 +3290,7 @@ class BatchView(QWidget):
         return self.batch_job_control.wait_if_paused(
             on_pause_once=lambda: self.sig_log.emit("批量已暂停，点击“继续”后从下一条任务恢复。", "#f9e2af")
         )
-        
+
     @pyqtSlot(int, str, str)
     def _update_table_row_status(self, idx, text, color):
         if self.tabs.currentIndex() == 0:
@@ -1818,22 +3300,92 @@ class BatchView(QWidget):
                     row_widget.lbl_status.setText(text)
                     row_widget.lbl_status.setStyleSheet(f"color: {color}; font-weight: bold;")
 
+    def _select_assembly_combo(self, paths, count, used_combos, rng):
+        paths = self._normalize_batch_assembly_paths(paths)
+        if not paths:
+            return []
+        count = max(1, min(int(count or 1), len(paths)))
+        if len(paths) <= count:
+            combo = list(paths)
+            rng.shuffle(combo)
+            return combo
+
+        total_combos = math.comb(len(paths), count) if len(paths) >= count else 1
+        if total_combos <= 8000:
+            all_combos = list(itertools.combinations(paths, count))
+            available = [combo for combo in all_combos if tuple(sorted(combo)) not in used_combos]
+            if not available:
+                used_combos.clear()
+                available = all_combos
+            combo = list(rng.choice(available))
+            rng.shuffle(combo)
+            used_combos.add(tuple(sorted(combo)))
+            return combo
+
+        best = None
+        best_score = -1
+        recent = list(used_combos)[-50:]
+        for _ in range(80):
+            combo = rng.sample(paths, count)
+            signature = tuple(sorted(combo))
+            if signature not in used_combos:
+                used_combos.add(signature)
+                return combo
+            overlap_penalty = sum(len(set(combo).intersection(prev)) for prev in recent)
+            score = -overlap_penalty
+            if best is None or score > best_score:
+                best = combo
+                best_score = score
+        return best or rng.sample(paths, count)
+
     def _table_tasks_from_state(self, state):
         tasks = []
         preset_pos_x, _ = self._load_preset_position_by_name(state.get("preset_name", ""), default_y=float(state.get("subtitle_y", 25.0) or 25.0))
         preset_style = self._load_preset_style_by_name(state.get("preset_name", ""))
         signature = self._load_signature_preset_by_name(state.get("signature_preset_name", ""))
         music_payload = self._batch_music_payload(state)
+        assembly_paths = self._normalize_batch_assembly_paths(state.get("assembly_paths", []))
+        assembly_count = self._batch_assembly_count(state)
+        assembly_mode = self._batch_assembly_mode(state)
+        smart_groups = self._active_smart_queue_groups(state.get("smart_queue_groups", []))
+        smart_enabled = bool(state.get("smart_queue_enabled", False)) and bool(smart_groups)
+        smart_mode = self._smart_queue_mode(state)
+        smart_cut_mode = self._smart_queue_cut_mode(state)
+        used_assembly_combos = {}
+        used_smart_queue_clips = {}
+        rng = random.Random(f"{state.get('name', 'queue')}|{datetime.now().timestamp()}")
         for i, row in enumerate(state.get("table_rows", [])):
-            if row.get("video"):
+            row_video = (row.get("video", "") or "").strip()
+            row_audio = (row.get("audio", "") or "").strip()
+            row_title = (row.get("title", "") or "").strip()
+            row_text = (row.get("text", "") or "").strip()
+            if not self._row_has_batch_content(row):
+                continue
+            smart_groups_for_task = self._smart_queue_groups_for_cut(smart_groups, row, i, rng, smart_mode, smart_cut_mode) if smart_enabled else []
+            smart_group_name = self._smart_queue_group_names_label(smart_groups_for_task, smart_cut_mode)
+            active_assembly_paths = [path for group in smart_groups_for_task for path in self._normalize_batch_assembly_paths(group.get("paths", []))] if smart_groups_for_task else assembly_paths
+            selected_count = self._smart_assembly_count(active_assembly_paths, audio_path=row_audio) if assembly_mode == "smart" else assembly_count
+            if smart_groups_for_task:
+                video_clips = self._select_smart_queue_clips(smart_groups_for_task, selected_count, used_smart_queue_clips, rng, smart_cut_mode)
+            else:
+                combo_key = "__default__"
+                used_combos = used_assembly_combos.setdefault(combo_key, set())
+                video_clips = self._select_assembly_combo(active_assembly_paths, selected_count, used_combos, rng) if active_assembly_paths else []
+            if row_video or video_clips:
                 task_order = len(tasks)
+                primary_video = video_clips[0] if video_clips else row_video
                 tasks.append({
                     "type": "table",
                     "idx": i,
-                    "video": row.get("video", ""),
-                    "audio": row.get("audio", ""),
-                    "title": row.get("title", ""),
-                    "text": row.get("text", ""),
+                    "video": primary_video,
+                    "video_clips": video_clips,
+                    "assembly_count": len(video_clips),
+                    "assembly_mode": assembly_mode,
+                    "smart_queue_group": smart_group_name,
+                    "smart_queue_cut_mode": smart_cut_mode if smart_groups_for_task else "",
+                    "audio": row_audio,
+                    "title": row_title,
+                    "text": row_text or self._sidecar_text_for_audio(row_audio),
                     "a_mode": state.get("audio_mode", self.audio_mode.currentText()),
                     "video_volume": int(state.get("video_volume", self.video_volume_percent())),
                     "music_path": self._music_path_for_task(music_payload, task_order),
@@ -1843,6 +3395,64 @@ class BatchView(QWidget):
                     "pos_x": preset_pos_x,
                     "pos_y": float(row.get("pos_y", state.get("subtitle_y", 25.0)) or 25.0),
                     "queue_name": state.get("name", "队列"),
+                    "output_dir": state.get("output_dir", ""),
+                    "chunk_mode": state.get("chunk_mode", self.chunk_mode.currentText()),
+                    "timing_mode": state.get("timing_mode", self.timing_mode.currentText()),
+                    "preset_style": preset_style,
+                    "signature": copy.deepcopy(signature),
+                })
+        return tasks
+
+    def _multi_project_tasks_from_state(self, state):
+        tasks = []
+        packages = self._active_multi_project_packages(state.get("multi_project_packages", []))
+        if not packages:
+            return tasks
+        preset_pos_x, preset_pos_y = self._load_preset_position_by_name(state.get("preset_name", ""), default_y=float(state.get("subtitle_y", 25.0) or 25.0))
+        preset_style = self._load_preset_style_by_name(state.get("preset_name", ""))
+        signature = self._load_signature_preset_by_name(state.get("signature_preset_name", ""))
+        music_payload = self._batch_music_payload(state)
+        assembly_count = self._batch_assembly_count(state)
+        assembly_mode = self._batch_assembly_mode(state)
+        used_package_combos = {}
+        rng = random.Random(f"multi-project|{state.get('name', 'queue')}|{datetime.now().timestamp()}")
+        for package_index, package in enumerate(packages):
+            package_name = str(package.get("name") or f"项目 {package_index + 1}")
+            media_paths = self._normalize_batch_assembly_paths(package.get("media_paths", []))
+            if not media_paths:
+                continue
+            audio_paths = self._normalize_audio_paths(package.get("audio_paths", [])) or [""]
+            script_lines = package.get("script_lines", []) or []
+            for audio_index, audio_path in enumerate(audio_paths):
+                selected_count = self._smart_assembly_count(media_paths, audio_path=audio_path) if assembly_mode == "smart" else assembly_count
+                used_combos = used_package_combos.setdefault(package_name, set())
+                video_clips = self._select_assembly_combo(media_paths, selected_count, used_combos, rng)
+                if not video_clips:
+                    continue
+                task_order = len(tasks)
+                title = file_stem(audio_path) if audio_path else f"{package_name}-{audio_index + 1}"
+                text = script_lines[audio_index] if audio_index < len(script_lines) else self._sidecar_text_for_audio(audio_path)
+                tasks.append({
+                    "type": "multi_project",
+                    "idx": task_order,
+                    "video": video_clips[0],
+                    "video_clips": video_clips,
+                    "assembly_count": len(video_clips),
+                    "assembly_mode": assembly_mode,
+                    "smart_queue_group": f"项目包:{package_name}",
+                    "smart_queue_cut_mode": "project_package",
+                    "audio": audio_path,
+                    "title": title,
+                    "text": text,
+                    "a_mode": state.get("audio_mode", self.audio_mode.currentText()),
+                    "video_volume": int(state.get("video_volume", self.video_volume_percent())),
+                    "music_path": self._music_path_for_task(music_payload, task_order),
+                    "music_volume": music_payload.get("volume", self.music_volume_percent()),
+                    "music_mode": music_payload.get("mode", "cycle"),
+                    "performance_mode": state.get("performance_mode", self.performance_mode.currentText()),
+                    "pos_x": preset_pos_x,
+                    "pos_y": preset_pos_y,
+                    "queue_name": f"{state.get('name', '队列')} / {package_name}",
                     "output_dir": state.get("output_dir", ""),
                     "chunk_mode": state.get("chunk_mode", self.chunk_mode.currentText()),
                     "timing_mode": state.get("timing_mode", self.timing_mode.currentText()),
@@ -1921,42 +3531,52 @@ class BatchView(QWidget):
         self._capture_current_queue_state()
         tasks = self._tasks_from_queue_state(self.batch_queues[self.current_queue_index])
         if not tasks:
-            return QMessageBox.warning(self, "提示", "表格中没有任何有效画面！")
+            return QMessageBox.warning(self, "提示", "表格中没有有效任务：请填文案/音频，并选择画面，或启用随机组接/智能主体素材。")
         self._start_project_build(tasks, "表格建工程并导出", auto_render=True)
 
     def start_table_project_build(self):
         if self.is_running: return
         self._capture_current_queue_state()
-        tasks = self._tasks_from_queue_state(self.batch_queues[self.current_queue_index])
+        current_state = self.batch_queues[self.current_queue_index]
+        tasks = self._tasks_from_queue_state(current_state)
+        dynamic_media_enabled = self._state_has_dynamic_media(current_state)
         for row_widget in self._table_rows():
             row_widget.sync_paths_from_fields()
-            if not row_widget.video_path:
+            row_payload = {
+                "video": row_widget.video_path,
+                "audio": row_widget.audio_path,
+                "title": row_widget.txt_title.text().strip(),
+                "text": row_widget.txt_content.toPlainText().strip(),
+            }
+            if not self._row_has_batch_content(row_payload):
+                row_widget.lbl_status.setText("略过:空行")
+            elif not dynamic_media_enabled and not row_widget.video_path:
                 row_widget.lbl_status.setText("略过:无画面")
         if not tasks:
-            return QMessageBox.warning(self, "提示", "表格中没有任何有效画面，无法建立工程。")
+            return QMessageBox.warning(self, "提示", "表格中没有有效任务：请填文案/音频，并选择画面，或启用随机组接/智能主体素材。")
         self._start_project_build(tasks, "表格批量建工程")
 
     def start_folder_batch(self):
         if self.is_running: return
         self._capture_current_queue_state()
         if not self.input_dir: return QMessageBox.warning(self, "提示", "请先选择输入文件夹！")
-        
+
         self.task_queue.clear()
         v_files = sorted(
             [f for f in os.listdir(self.input_dir) if f.lower().endswith(MEDIA_EXTS)],
             key=natural_sort_key,
         )
-        audio_lookup = build_audio_lookup(self.input_dir)
+        audio_lookup = build_audio_lookup(self.input_dir, self._audio_import_sort_mode())
         a_mode = self.audio_mode.currentText()
         video_volume = self.video_volume_percent()
         music_payload = self._batch_music_payload()
         performance_mode = self.performance_mode.currentText()
         preset_pos_x, preset_pos_y = self.selected_preset_position()
-        
+
         for i, vf in enumerate(v_files):
             v_path = os.path.join(self.input_dir, vf)
             a_path = match_audio_for_media(vf, audio_lookup)
-                
+
             task_order = len(self.task_queue)
             self.task_queue.append({
                 "type": "folder",
@@ -1973,7 +3593,7 @@ class BatchView(QWidget):
                 "pos_x": preset_pos_x,
                 "pos_y": preset_pos_y # 文件夹模式默认高度
             })
-            
+
         if not self.task_queue: return QMessageBox.warning(self, "提示", "文件夹中没找到视频/图片！")
         self._start_project_build(self.task_queue, "文件夹建工程并导出", auto_render=True)
 
@@ -1987,7 +3607,7 @@ class BatchView(QWidget):
             [f for f in os.listdir(self.input_dir) if f.lower().endswith(MEDIA_EXTS)],
             key=natural_sort_key,
         )
-        audio_lookup = build_audio_lookup(self.input_dir)
+        audio_lookup = build_audio_lookup(self.input_dir, self._audio_import_sort_mode())
         preset_pos_x, preset_pos_y = self.selected_preset_position()
         music_payload = self._batch_music_payload()
         for i, vf in enumerate(v_files):
@@ -2031,8 +3651,8 @@ class BatchView(QWidget):
         if not v_files:
             return []
         video_paths = [os.path.join(self.input_dir, vf) for vf in v_files]
-        audio_paths = list_audio_paths(self.input_dir)
-        audio_lookup = build_audio_lookup(self.input_dir)
+        audio_paths = list_audio_paths(self.input_dir, self._audio_import_sort_mode())
+        audio_lookup = build_audio_lookup(self.input_dir, self._audio_import_sort_mode())
         items = []
 
         def sidecar_text(*stems):
@@ -2279,6 +3899,8 @@ class BatchView(QWidget):
                 "status": "pending",
                 "title": task.get("title", ""),
                 "video": task.get("video", ""),
+                "smart_queue_group": task.get("smart_queue_group", ""),
+                "smart_queue_cut_mode": task.get("smart_queue_cut_mode", ""),
                 "audio": task.get("audio", ""),
                 "video_volume": int(task.get("video_volume", self.video_volume_percent())),
                 "music": task.get("music_path", ""),
@@ -2304,7 +3926,7 @@ class BatchView(QWidget):
                 json.dump(record, f, indent=2, ensure_ascii=False)
             fields = [
                 "row", "ui_row", "status", "project_name", "project_rel_path",
-                "video", "audio", "video_volume", "music", "music_volume", "music_mode", "title", "subtitle_x", "subtitle_y", "text_chars", "error",
+                "video", "smart_queue_group", "smart_queue_cut_mode", "audio", "video_volume", "music", "music_volume", "music_mode", "title", "subtitle_x", "subtitle_y", "text_chars", "error",
             ]
             with open(record["files"]["csv"], "w", encoding="utf-8-sig", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fields)
@@ -2406,8 +4028,64 @@ class BatchView(QWidget):
             return (audio_path if has_audio else ""), v_volume, 100
         return (audio_path if has_audio else ""), 0, 100
 
+    def _media_source_duration(self, path):
+        if not path or not os.path.exists(path):
+            return 0.0, 0.0
+        ext = os.path.splitext(path)[1].lower()
+        if ext in IMAGE_EXTS:
+            return 5.0, 5.0
+        video_dur = float(get_exact_duration(path) or 0.0)
+        stream_dur = float(get_video_stream_duration(path) or video_dur or 0.0)
+        if video_dur <= 0:
+            video_dur = stream_dur or 5.0
+        if stream_dur <= 0:
+            stream_dur = video_dur
+        return max(0.1, video_dur), max(0.1, stream_dur)
+
+    def _build_video_clip_sequence(self, video_paths, content_dur):
+        paths = [path for path in video_paths or [] if path and os.path.exists(path) and looks_media_path(path)]
+        if not paths:
+            return [], 0.0
+        media = []
+        for path in paths:
+            video_dur, stream_dur = self._media_source_duration(path)
+            media.append({"path": path, "video_dur": video_dur, "stream_dur": stream_dur})
+        source_total = sum(item["video_dur"] for item in media) or len(media) * 5.0
+        target = max(1.0, float(content_dur or 0.0) or source_total)
+        clips = []
+        cursor = 0.0
+        remaining = target
+        for idx, item in enumerate(media):
+            if idx == len(media) - 1:
+                clip_len = max(0.1, remaining)
+            else:
+                weight = item["video_dur"] / source_total if source_total > 0 else 1.0 / len(media)
+                clip_len = max(0.1, target * weight)
+                clip_len = min(clip_len, max(0.1, remaining - 0.1 * (len(media) - idx - 1)))
+                remaining -= clip_len
+            clips.append({
+                "path": item["path"],
+                "start": cursor,
+                "end": cursor + clip_len,
+                "dur": item["stream_dur"],
+                "source_in": 0.0,
+                "source_out": item["video_dur"],
+                "speed": 1.0,
+                "scale": 100,
+                "volume": 100,
+                "transition": {"type": "cut", "duration": 0.0},
+                "assembly_mode": "batch_random",
+            })
+            cursor += clip_len
+        return clips, source_total
+
     def _build_single_project(self, task, project_dir, preset_style, c_mode, timing_mode):
         video_path = task.get("video", "")
+        video_paths = [path for path in (task.get("video_clips") or []) if path and os.path.exists(path)]
+        if not video_paths and video_path:
+            video_paths = [video_path]
+        if video_paths:
+            video_path = video_paths[0]
         audio_path = task.get("audio", "")
         if not video_path or not os.path.exists(video_path):
             raise Exception("视频路径不存在")
@@ -2419,11 +4097,14 @@ class BatchView(QWidget):
         if task.get("batch_record"):
             project_data["batch_record"] = task.get("batch_record")
 
-        video_dur = get_exact_duration(video_path) or 5.0
-        video_stream_dur = get_video_stream_duration(video_path) or video_dur
+        video_durs = [self._media_source_duration(path)[0] for path in video_paths]
+        video_dur = sum(video_durs) if video_durs else (get_exact_duration(video_path) or 5.0)
         audio_dur = get_exact_duration(audio_path) if audio_path and os.path.exists(audio_path) else 0.0
         audio_mode = task.get("a_mode") or self.audio_mode.currentText()
-        content_dur = self._content_total_duration(video_dur, audio_dur, audio_mode)
+        if task.get("video_clips") and audio_dur > 0:
+            content_dur = max(1.0, audio_dur)
+        else:
+            content_dur = self._content_total_duration(video_dur, audio_dur, audio_mode)
         total_dur = content_dur + render_tail_padding_seconds()
         music_path = task.get("music_path", "")
         has_music = bool(music_path and os.path.exists(music_path))
@@ -2455,8 +4136,10 @@ class BatchView(QWidget):
             force_standard_box=True
         )
 
+        video_clip_sequence, _ = self._build_video_clip_sequence(video_paths, content_dur)
+
         edit_state = {
-            "video_clips": [{"path": video_path, "start": 0.0, "end": content_dur, "dur": video_stream_dur}],
+            "video_clips": video_clip_sequence,
             "audio_path": project_audio_path,
             "music_path": music_path if has_music else "",
             "subs_data": subs_data,
@@ -2511,43 +4194,13 @@ class BatchView(QWidget):
         return self.process_words(words, c_mode, timing_mode)
 
     def _transcribe_words(self, target_path):
-        accounts = local_get_cf_accounts()
-        if not accounts:
-            raise Exception("未配置 Cloudflare API 凭证")
-
         temp_audio = os.path.join(tempfile.gettempdir(), f"sh_project_build_{threading.get_ident()}.mp3")
         try:
             cmd = [get_ffmpeg_cmd(), "-y", "-i", target_path, "-vn", "-map", "a:0?", "-ar", "16000", "-ac", "1", "-b:a", "16k", temp_audio]
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000 if os.name == 'nt' else 0)
             if not os.path.exists(temp_audio) or os.path.getsize(temp_audio) <= 100:
-                raise Exception("音频抽取失败")
-            with open(temp_audio, "rb") as f:
-                data = f.read()
-
-            res_json = None
-            last_err = ""
-            for acc in accounts:
-                if acc.get("id") and acc.get("token"):
-                    try:
-                        res = requests.post(
-                            f"https://api.cloudflare.com/client/v4/accounts/{acc['id']}/ai/run/@cf/openai/whisper",
-                            headers={"Authorization": f"Bearer {acc['token']}", "Content-Type": "application/octet-stream"},
-                            data=data,
-                            timeout=60
-                        )
-                        if res.status_code == 200 and res.json().get("success"):
-                            res_json = res.json()
-                            break
-                        last_err = f"HTTP {res.status_code}: {res.text[:100]}"
-                    except Exception as e:
-                        last_err = str(e)
-            if not res_json:
-                raise Exception(f"AI 请求失败: {last_err}")
-            return normalize_word_timestamps([
-                {"word": re.sub(r'(?i)stereo_[^\s]+', '', w["word"]).replace(".mp3", "").replace(".wav", "").strip(), "start": w["start"], "end": w["end"]}
-                for w in res_json["result"]["words"]
-                if re.sub(r'(?i)stereo_[^\s]+', '', w["word"]).strip()
-            ])
+                raise Exception("\u97f3\u9891\u62bd\u53d6\u5931\u8d25")
+            return transcribe_audio_words(temp_audio, provider_order=self._selected_ai_transcription_provider_order())
         finally:
             if os.path.exists(temp_audio):
                 try:
@@ -2696,6 +4349,13 @@ class BatchView(QWidget):
                 return candidate
             n += 1
 
+    def _selected_ai_transcription_provider_order(self):
+        combo = getattr(self, "ai_transcription_provider_combo", None)
+        if combo is None:
+            return None
+        data = combo.currentData()
+        return data if data else None
+
     def process_next(self):
         if self.batch_cancel_requested:
             self.batch_finish_reason = "cancelled"
@@ -2708,25 +4368,26 @@ class BatchView(QWidget):
         if self.current_idx >= len(self.task_queue):
             self.sig_all_done.emit()
             return
-            
+
         task = self.task_queue[self.current_idx]
         v_path = task["video"]
         a_path = task["audio"]
         if task.get("queue_name"):
             self.sig_log.emit(f"队列「{task.get('queue_name')}」任务 {self.current_idx + 1}/{len(self.task_queue)}", "#89b4fa")
-        
+
         out_dir = task.get("output_dir") or self.output_dir or os.path.dirname(v_path)
         out_path = self._unique_output_path(out_dir, self._task_output_stem(task))
-        
+
         c_mode = self.chunk_mode.currentText()
         timing_mode = self.timing_mode.currentText()
-        
+
         self.sig_table_row_status.emit(task["idx"], "🔄 正在渲染", "#f9e2af")
         self.sig_progress.emit(0)
-        
-        threading.Thread(target=self.pipeline_worker, args=(task, out_path, c_mode, timing_mode), daemon=True).start()
 
-    def pipeline_worker(self, task, out_path, c_mode, timing_mode):
+        provider_order = self._selected_ai_transcription_provider_order()
+        threading.Thread(target=self.pipeline_worker, args=(task, out_path, c_mode, timing_mode, provider_order), daemon=True).start()
+
+    def pipeline_worker(self, task, out_path, c_mode, timing_mode, provider_order=None):
         temp_dir = tempfile.mkdtemp()
         try:
             v_path = task["video"]
@@ -2736,42 +4397,28 @@ class BatchView(QWidget):
             a_mode = task.get("a_mode", "🔈 原声20% + 配音")
             performance_mode = task.get("performance_mode", self.performance_mode.currentText() if hasattr(self, "performance_mode") else "标准画质")
             signature = task.get("signature", {})
-            
+
             self.sig_log.emit(f"▶ 开始装配视频: {os.path.basename(v_path)}", "#89b4fa")
-            
+
             subs_data = []
-            
+
             target_path = a_path if a_path else v_path
             use_custom_text = bool(custom_text.strip())
 
             self.sig_log.emit(f"  [1/4] 抽取音频供 AI 识别{'并对齐手工文案' if use_custom_text else ''}...", "#cdd6f4")
             temp_audio = os.path.join(temp_dir, "temp.mp3")
             subprocess.run([get_ffmpeg_cmd(), "-y", "-i", target_path, "-vn", "-map", "a:0", "-ar", "16000", "-ac", "1", "-b:a", "16k", "-t", "600", temp_audio], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000 if os.name == 'nt' else 0)
-            
+
             if os.path.exists(temp_audio) and os.path.getsize(temp_audio) > 10 * 1024 * 1024:
                 raise Exception(f"源文件音频轨道异常，已被系统拦截！")
-                
+
             self.sig_progress.emit(10)
-            self.sig_log.emit(f"  [2/4] 呼叫 Cloudflare 大模型...", "#cdd6f4")
-
-            accounts = local_get_cf_accounts()
-            if not accounts: raise Exception("未配置 Cloudflare API 凭证！")
-
-            res_json = None; last_err = ""
-            with open(temp_audio, 'rb') as f: data = f.read()
-            for acc in accounts:
-                if acc.get("id") and acc.get("token"):
-                    try:
-                        res = requests.post(f"https://api.cloudflare.com/client/v4/accounts/{acc['id']}/ai/run/@cf/openai/whisper", headers={"Authorization": f"Bearer {acc['token']}", "Content-Type": "application/octet-stream"}, data=data, timeout=60) 
-                        if res.status_code == 200 and res.json().get("success"): res_json = res.json(); break 
-                    except Exception as e: last_err = str(e)
-            if not res_json: raise Exception(f"AI 请求失败: {last_err}")
-
-            clean_words = normalize_word_timestamps([
-                {"word": re.sub(r'(?i)stereo_[^\s]+', '', w["word"]).strip(), "start": w["start"], "end": w["end"]}
-                for w in res_json["result"]["words"]
-                if re.sub(r'(?i)stereo_[^\s]+', '', w["word"]).strip()
-            ])
+            self.sig_log.emit("  [2/4] \u6309\u4f18\u5148\u7ea7\u547c\u53eb AI \u542c\u8bd1\u670d\u52a1...", "#cdd6f4")
+            clean_words = transcribe_audio_words(
+                temp_audio,
+                progress=lambda msg, color="#cdd6f4": self.sig_log.emit(f"  {msg}", color),
+                provider_order=provider_order,
+            )
 
             if use_custom_text:
                 self.sig_log.emit("  [2.5/4] 检测到手工文案，正在把文案对齐到 AI 时间轴...", "#a6e3a1")
@@ -2796,9 +4443,9 @@ class BatchView(QWidget):
             self.sig_log.emit(f"  [3/4] 启动 30FPS 特效物理引擎...", "#cdd6f4")
             concat_path = os.path.join(temp_dir, "subs_concat.txt").replace("\\", "/")
             blank_path = os.path.join(temp_dir, "blank.png").replace("\\", "/")
-            
+
             proj_w, proj_h = resolution_to_size(get_output_resolution(), v_path, get_video_dimensions)
-            
+
             v_dur = get_exact_duration(v_path)
             v_stream_dur = get_video_stream_duration(v_path) or v_dur
             a_dur = get_exact_duration(a_path) if a_path else 0
@@ -2828,21 +4475,21 @@ class BatchView(QWidget):
                         duration = max(0.001, float(duration or 0.0))
                         f_concat.write(ffconcat_file_entry(path, duration))
                         last_concat_file = path
-                    
+
                     for current_time, frame_duration in frame_schedule:
                         active_subs = active_subtitles_for_frame(subs_data, current_time, frame_duration)
                         signature_html = render_signature_html(signature, current_time, proj_w, proj_h)
                         if not active_subs and not signature_html:
                             write_subtitle_frame(blank_path, frame_duration)
                             continue
-                        
+
                         html_subs = signature_html
                         for s, sub_time in active_subs:
                             px = s.get("pos_x", 0.0); py = s.get("pos_y", 25.0)
                             base_css = f"position: absolute; left: calc(50% + {px}%); top: calc(50% + {py}%); transform: translate(-50%, -50%); z-index: 10; width: max-content; max-width: 92%;"
                             sub_html = render_subtitle_html(s, sub_time, proj_w, proj_h)
                             html_subs += f"<div style='{base_css}'>{sub_html}</div>\n"
-                        
+
                         # 👑 全局抗锯齿平滑渲染参数
                         html_content = f"<!DOCTYPE html><html><head><style>html, body {{ margin: 0; padding: 0; width: 100vw; height: 100vh; overflow: hidden; background: transparent; display: flex; justify-content: center; align-items: center; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }} #scale-wrapper {{ width: 100vw; height: 100vh; position: absolute; left: 0; top: 0; filter: drop-shadow(0px 0px 0px transparent); }}</style></head><body><div id='scale-wrapper'>{html_subs}</div></body></html>"
                         page.set_content(html_content)
@@ -2852,11 +4499,11 @@ class BatchView(QWidget):
                         frame_idx += 1
 
                     f_concat.write(ffconcat_file_entry(last_concat_file))
-                        
+
             self.sig_progress.emit(70)
 
             self.sig_log.emit(f"  [4/4] 最终封装: 根据 {a_mode.split(' ')[0]} 压制中...", "#cdd6f4")
-            
+
             v_loop_path = os.path.join(temp_dir, "v_loop.txt").replace("\\", "/")
             with open(v_loop_path, 'w', encoding='utf-8') as f:
                 media_loop_dur = max(0.0, float(v_stream_dur or 0.0))
@@ -2880,7 +4527,7 @@ class BatchView(QWidget):
             encoder_label = render_profile.get("encoder_label") or render_profile.get("encoder", "CPU x264")
             video_args = build_video_encoder_args(render_profile, quality="batch")
             self.sig_log.emit(f"  ⚙️ 渲染配置: {encoder_label}", "#89b4fa")
-            
+
             args = ["-y", "-f", "concat", "-safe", "0", "-i", v_loop_path, "-f", "concat", "-safe", "0", "-i", concat_path]
             input_idx = 2
             audio_input_idx = None
@@ -2894,7 +4541,7 @@ class BatchView(QWidget):
                 music_input_idx = input_idx
                 input_idx += 1
                 self.sig_log.emit(f"  🎼 批量配乐: {os.path.basename(music_path)} @ {int(music_gain * 100)}%", "#f9e2af")
-            
+
             video_guard = f"tpad=stop_mode=clone:stop_duration={total_dur:.3f},trim=duration={total_dur:.3f},setpts=PTS-STARTPTS"
             sub_guard = f"tpad=stop_mode=clone:stop_duration={total_dur:.3f},trim=duration={total_dur:.3f},setpts=PTS-STARTPTS"
             layer_x, layer_y = ffmpeg_layer_overlay_xy()
@@ -2905,7 +4552,7 @@ class BatchView(QWidget):
                 f"[1:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos,{sub_guard}[sub];"
                 f"[bg][sub]overlay=0:0:eof_action=pass:format=auto,format=yuv420p[outv]"
             )
-            
+
             wants_mix = ("混合" in a_mode) or ("配音" in a_mode and "静音" not in a_mode and "替换" not in a_mode)
             wants_keep = "保留" in a_mode
             audio_filter = ""
@@ -2951,10 +4598,10 @@ class BatchView(QWidget):
                 args.extend(["-filter_complex", f"{vf};{audio_filter}", "-map", "[outv]", "-map", audio_map] + video_args + ["-c:a", "aac", "-b:a", "192k", "-t", str(total_dur), out_path])
             else:
                 args.extend(["-filter_complex", vf, "-map", "[outv]"] + video_args + ["-an", "-t", str(total_dur), out_path])
-            
+
             proc = subprocess.run([get_ffmpeg_cmd()] + args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=0x08000000 if os.name == 'nt' else 0)
             if proc.returncode != 0: raise Exception(f"FFmpeg 渲染失败!")
-            
+
             self.sig_log.emit(f"✅ {os.path.basename(v_path)} 交付成功！", "#a6e3a1")
             self.sig_progress.emit(100)
             self.sig_table_row_status.emit(t_idx, "✅ 完成", "#a6e3a1")
@@ -2970,27 +4617,27 @@ class BatchView(QWidget):
     def _load_nlp_dict(self):
         dict_path = os.path.join(os.getcwd(), "nlp_dictionary.txt")
         default_words = [
-            "a", "an", "the", "to", "in", "on", "at", "of", "for", "with", "from", "by", "about", 
-            "as", "into", "like", "through", "after", "over", "between", "out", "against", "during", 
+            "a", "an", "the", "to", "in", "on", "at", "of", "for", "with", "from", "by", "about",
+            "as", "into", "like", "through", "after", "over", "between", "out", "against", "during",
             "without", "before", "under", "around", "among", "and", "but", "or", "so", "because",
             "my", "your", "his", "her", "its", "our", "their", "this", "that", "these", "those",
-            "is", "am", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", 
+            "is", "am", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do",
             "does", "did", "will", "would", "shall", "should", "can", "could", "may", "might", "must",
             "very", "too", "not"
         ]
-        
+
         if not os.path.exists(dict_path):
             try:
                 with open(dict_path, 'w', encoding='utf-8') as f:
                     for w in default_words: f.write(f"{w}\n")
             except: pass
             return set(default_words)
-            
+
         custom_words = set()
         try:
             with open(dict_path, 'r', encoding='utf-8') as f:
                 for line in f:
-                    clean_line = line.split('#')[0].strip().lower() 
+                    clean_line = line.split('#')[0].strip().lower()
                     if clean_line: custom_words.add(clean_line)
             return custom_words if custom_words else set(default_words)
         except: return set(default_words)
@@ -3007,12 +4654,17 @@ class BatchView(QWidget):
         subs = []; curr = {"words": []}; puncts = ['.', '!', '?', ',', '，', '。', '！', '？']
         timing_mode = timing_mode or "J Cut (字幕稍后收尾)"
         sound_aligned = "对齐声音" in timing_mode
-        
+        fixed_count = fixed_word_count_for_chunk_mode(mode)
+        exact_single_word = is_exact_single_word_chunk_mode(mode)
+        precise_chunk_mode = exact_single_word or fixed_count > 0
+        narrative_min_words, narrative_max_words = narrative_chunk_word_bounds(mode)
+        narrative_merge_words = narrative_chunk_merge_words(mode)
+
         for i, w in enumerate(words):
             if not curr["words"]: curr["start"] = w["start"]
             curr["words"].append({"text": w["word"], "start": w["start"], "end": w["end"]})
             curr["end"] = w["end"]
-            
+
             clean_w = re.sub(r'[^a-zA-Z0-9\']', '', w["word"]).lower()
             has_punct = any(w["word"].endswith(p) for p in puncts)
             is_last_word = (i == len(words) - 1)
@@ -3020,7 +4672,7 @@ class BatchView(QWidget):
             next_start = words[i + 1]["start"] if i + 1 < len(words) else 9999.0
             silence_gap = next_start - curr["end"]
             curr_dur = curr["end"] - curr["start"]
-            narrative_block = is_reference_narrative_chunk_mode(mode)
+            narrative_block = narrative_max_words > 0
             tiktok_smart = "智能听译" in mode or "4-6" in mode or "4-7" in mode
 
             smart_short = "智能重点" in mode or "3-4词为主" in mode
@@ -3036,6 +4688,10 @@ class BatchView(QWidget):
                 elif "四词" in mode or "4词" in mode:
                     fixed_count = 4
 
+            fixed_count = fixed_word_count_for_chunk_mode(mode)
+            exact_single_word = is_exact_single_word_chunk_mode(mode)
+            precise_chunk_mode = exact_single_word or fixed_count > 0
+
             weak_words = {
                 "i", "you", "he", "she", "we", "they", "a", "an", "the", "to", "of", "in", "on",
                 "for", "and", "or", "but", "is", "am", "are", "was", "were", "be", "been", "do",
@@ -3046,15 +4702,18 @@ class BatchView(QWidget):
                 len(clean_w) >= 7 or clean_w in FAITH_WORDS or clean_w.isupper()
             )
 
-            if "单字" in mode: is_break = True
+            if exact_single_word: is_break = True
             elif fixed_count: is_break = len(curr["words"]) >= fixed_count or silence_gap > 0.8
             elif narrative_block:
+                narrative_hard_gap_min = max(6, narrative_min_words - 2)
+                narrative_key_min = max(narrative_min_words + 2, narrative_max_words - 2)
+                narrative_key_dur = 3.2 if narrative_max_words >= 18 else 2.6
                 is_break = (
-                    (silence_gap > 0.8 and len(curr["words"]) >= 6) or
-                    (has_punct and len(curr["words"]) >= 8) or
-                    (silence_gap > 0.42 and len(curr["words"]) >= 8) or
-                    (is_key_word and len(curr["words"]) >= 10 and (silence_gap > 0.16 or curr_dur > 2.6)) or
-                    len(curr["words"]) >= 12
+                    (silence_gap > 0.8 and len(curr["words"]) >= narrative_hard_gap_min) or
+                    (has_punct and len(curr["words"]) >= narrative_min_words) or
+                    (silence_gap > 0.42 and len(curr["words"]) >= narrative_min_words) or
+                    (is_key_word and len(curr["words"]) >= narrative_key_min and (silence_gap > 0.16 or curr_dur > narrative_key_dur)) or
+                    len(curr["words"]) >= narrative_max_words
                 )
             elif tiktok_smart:
                 is_break = (
@@ -3099,13 +4758,13 @@ class BatchView(QWidget):
                     if clean_w in NON_END_WORDS and not is_last_word and len(curr["words"]) < 8: is_break = False
                     else: is_break = True
                 else: is_break = False
-            else: 
+            else:
                 if has_punct or len(curr["words"]) >= 10:
                     if clean_w in NON_END_WORDS and not is_last_word and len(curr["words"]) < 15: is_break = False
                     else: is_break = True
                 else: is_break = False
 
-            if is_break and should_defer_subtitle_break_for_readability(
+            if not precise_chunk_mode and is_break and should_defer_subtitle_break_for_readability(
                 w.get("word", ""),
                 next_word,
                 segment_word_count=len(curr["words"]),
@@ -3114,8 +4773,8 @@ class BatchView(QWidget):
                 is_last_word=is_last_word,
             ):
                 is_break = False
-                    
-            if is_break: 
+
+            if is_break:
                 if sound_aligned and len(curr["words"]) >= 6:
                     mid = len(curr["words"]) // 2
                     curr["words"][mid]["text"] = "\n" + curr["words"][mid]["text"].lstrip()
@@ -3123,8 +4782,8 @@ class BatchView(QWidget):
                 curr["text"] = curr["text"].replace(" \n", "\n").replace("\n ", "\n")
                 curr["pos_x"] = 0.0; curr["pos_y"] = 25.0; curr["track"] = 1
                 subs.append(curr); curr = {"words": []}
-                
-        if curr["words"]: 
+
+        if curr["words"]:
             if sound_aligned and len(curr["words"]) >= 6:
                 mid = len(curr["words"]) // 2
                 curr["words"][mid]["text"] = "\n" + curr["words"][mid]["text"].lstrip()
@@ -3133,8 +4792,8 @@ class BatchView(QWidget):
             curr["pos_x"] = 0.0; curr["pos_y"] = 25.0; curr["track"] = 1
             subs.append(curr)
 
-        if narrative_block or "长句" in mode or "约10" in mode:
-            subs = merge_single_word_subtitle_segments(subs, max_merged_words=14)
+        if not precise_chunk_mode and (narrative_block or "长句" in mode or "约10" in mode):
+            subs = merge_single_word_subtitle_segments(subs, max_merged_words=narrative_merge_words if narrative_block else 14)
 
         return self._apply_timing_mode(subs, timing_mode)
 
