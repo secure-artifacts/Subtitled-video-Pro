@@ -22,19 +22,19 @@ workflow run that built the artifact.
 Install GitHub CLI, then download and verify:
 
 ```powershell
-gh release download V0.1.15 -R secure-artifacts/Subtitled-video-Pro
-Get-FileHash .\SubtitleComposer-V0.1.15-windows-x64.zip -Algorithm SHA256
+gh release download V0.1.16 -R secure-artifacts/Subtitled-video-Pro
+Get-FileHash .\SubtitleComposer-V0.1.16-windows-x64.zip -Algorithm SHA256
 Get-Content .\checksums.sha256
-gh attestation verify .\SubtitleComposer-V0.1.15-windows-x64.zip -R secure-artifacts/Subtitled-video-Pro
+gh attestation verify .\SubtitleComposer-V0.1.16-windows-x64.zip -R secure-artifacts/Subtitled-video-Pro
 ```
 
 On macOS:
 
 ```bash
-gh release download V0.1.15 -R secure-artifacts/Subtitled-video-Pro
-shasum -a 256 SubtitleComposer-V0.1.15-macos-arm64.zip
+gh release download V0.1.16 -R secure-artifacts/Subtitled-video-Pro
+shasum -a 256 SubtitleComposer-V0.1.16-macos-arm64.zip
 cat checksums.sha256
-gh attestation verify SubtitleComposer-V0.1.15-macos-arm64.zip -R secure-artifacts/Subtitled-video-Pro
+gh attestation verify SubtitleComposer-V0.1.16-macos-arm64.zip -R secure-artifacts/Subtitled-video-Pro
 ```
 
 The hash printed by `Get-FileHash` must match `checksums.sha256`.

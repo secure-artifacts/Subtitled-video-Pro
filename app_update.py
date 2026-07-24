@@ -10,7 +10,7 @@ from app_config import load_app_config, save_app_config
 
 DEFAULT_UPDATE_CONFIG = {
     "repo": "",
-    "current_version": "0.1.12",
+    "current_version": "0.1.16",
     "auto_check": True,
     "download_dir": "",
 }
