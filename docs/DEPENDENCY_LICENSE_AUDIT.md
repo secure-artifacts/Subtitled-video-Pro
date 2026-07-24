@@ -4,7 +4,7 @@
 
 - Project: Subtitle Composer / Subtitled Video Pro
 - Project type: Python desktop app with bundled open font assets
-- Audit date: 2026-06-04
+- Audit date: 2026-07-24
 - Audit baseline: public GitHub open-source distribution
 - Scope: direct runtime dependencies; build tools, external executables, and
   bundled font assets are tracked separately.
@@ -33,7 +33,7 @@ under MIT, Apache-2.0, or proprietary-only terms.
 | Low risk | 2 |
 | Needs attention | 2 |
 | Manual confirmation required | 0 |
-| Publication-relevant bundled font files | 22 |
+| Publication-relevant bundled font files | 47 |
 
 ## License Distribution
 
@@ -43,7 +43,7 @@ under MIT, Apache-2.0, or proprietary-only terms.
 | Apache-2.0 | 2 | Compatible with GPL-3.0-only; preserve notices |
 | MIT | 0 | Removed with the obsolete Web tools |
 
-Bundled font assets: 22 files under `OFL-1.1` or compatible open font
+Bundled font assets: 47 files under `OFL-1.1` or compatible open font
 licenses, recorded in `fonts/open/open_fonts_manifest.json`.
 
 ## Direct Dependency Details
@@ -59,7 +59,7 @@ licenses, recorded in `fonts/open/open_fonts_manifest.json`.
 
 | Asset | Quantity | License / Notice | Source | Conclusion |
 | --- | ---: | --- | --- | --- |
-| Open font pack | 22 font files | OFL-1.1 or compatible open font licenses | `fonts/open/open_fonts_manifest.json` | May be redistributed with the GPL-3.0-only project; keep each font license file |
+| Open font pack | 47 font files | OFL-1.1 or compatible open font licenses | `fonts/open/open_fonts_manifest.json` | May be redistributed with the GPL-3.0-only project; keep each font license file |
 | FFmpeg | Release workflow bundles FFmpeg/FFprobe under `vendor/<platform>/ffmpeg` | GPL/LGPL depending on build variant; Windows Gyan essentials builds are GPLv3 | https://www.gyan.dev/ffmpeg/builds/ and https://ffmpeg.org/legal.html | Preserve upstream notices and source/source-offer information |
 | PyInstaller | Build tool | GPL-2.0-or-later with bootloader exception | https://pyinstaller.org/en/stable/license.html | May be used for builds; preserve provenance |
 | Playwright browsers | Browser runtime installed during release build | Chromium/browser component licenses | https://playwright.dev/python/ | If bundled into artifacts, keep browser notices under review |

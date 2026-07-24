@@ -4,6 +4,7 @@ import math
 DEFAULT_RENDER_TAIL_PAD_SECONDS = 0.75
 SUBTITLE_ACTIVE_EPSILON_SECONDS = 0.002
 TIME_QUANTUM_SECONDS = 0.001
+FAST_WORD_VISUAL_MIN_SECONDS = 0.14
 
 
 def render_tail_padding_seconds():
@@ -108,9 +109,6 @@ def active_subtitles_for_frame(subs_data, frame_start, frame_duration, epsilon=S
     if active:
         return active
     frame_end = frame_start + frame_duration
-    short_window = frame_duration <= epsilon * 2.0
-    if not short_window:
-        return []
     for sub in subs_data or []:
         if not isinstance(sub, dict):
             continue
@@ -118,7 +116,8 @@ def active_subtitles_for_frame(subs_data, frame_start, frame_duration, epsilon=S
         end = _bounded_time(sub.get("end", start), 0.0, float("inf"))
         if end <= start:
             continue
-        if frame_start < start < frame_end:
+        short_event = (end - start) <= max(frame_duration, FAST_WORD_VISUAL_MIN_SECONDS)
+        if short_event and frame_start < start < frame_end:
             active.append((sub, start))
     return active
 
@@ -189,6 +188,7 @@ def build_subtitle_frame_schedule(subs_data, total_duration, extra_styles=None, 
         pop_speed = max(0.05, float(style.get("pop_speed", 0.18) or 0.18))
         hl_motion = style.get("hl_motion", "stable")
         use_hl = bool(style.get("use_hl", True))
+        word_visual_min = max(0.04, min(0.40, _bounded_time(style.get("word_visual_min_seconds", FAST_WORD_VISUAL_MIN_SECONDS), 0.0, 1.0)))
 
         _add_time(times, start, total_duration)
         _add_time(times, end, total_duration)
@@ -205,16 +205,18 @@ def build_subtitle_frame_schedule(subs_data, total_duration, extra_styles=None, 
             w_end = _bounded_time(word.get("end", w_start + 0.05), start, end)
             if w_end <= w_start:
                 w_end = min(end, w_start + 0.05)
+            visual_end = min(end, max(w_end, w_start + word_visual_min))
 
             _add_time(times, w_start, total_duration)
             _add_time(times, w_end, total_duration)
+            _add_time(times, visual_end, total_duration)
 
             if anim_type in PER_WORD_ANIMS:
                 multiplier = 1.35 if anim_type == "letter_scatter_in" else 1.0
-                _add_range_samples(times, w_start, min(w_end, w_start + pop_speed * multiplier), event_fps, total_duration)
+                _add_range_samples(times, w_start, min(visual_end, w_start + pop_speed * multiplier), event_fps, total_duration)
 
             if use_hl and hl_motion in ("pop", "push"):
-                _add_range_samples(times, w_start, min(w_end, w_start + 0.35), event_fps, total_duration)
+                _add_range_samples(times, w_start, min(visual_end, w_start + 0.35), event_fps, total_duration)
 
     ordered = sorted(t for t in times if 0.0 <= t <= total_duration)
     schedule = []

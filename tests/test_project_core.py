@@ -115,6 +115,7 @@ try:
         merge_single_word_subtitle_segments,
         normalize_scripture_quote_text,
         normalize_word_timestamps,
+        protect_fast_subtitle_pacing,
         rebalance_subtitle_layout,
         render_subtitle_html,
         should_defer_subtitle_break_for_readability,
@@ -130,6 +131,7 @@ except ModuleNotFoundError as exc:
         merge_single_word_subtitle_segments,
         normalize_scripture_quote_text,
         normalize_word_timestamps,
+        protect_fast_subtitle_pacing,
         rebalance_subtitle_layout,
         render_subtitle_html,
         should_defer_subtitle_break_for_readability,
@@ -224,6 +226,29 @@ class ChunkModeConfigTests(unittest.TestCase):
         self.assertEqual(style["caption_block_min_words"], 14)
         self.assertEqual(style["caption_block_max_words"], 18)
 
+    def test_fixed_chunk_modes_accept_word_and_character_aliases(self):
+        cases = [
+            ("\u53cc\u8bcd", 2),
+            ("\u53cc\u5b57", 2),
+            ("2\u8bcd", 2),
+            ("2\u5b57", 2),
+            ("\u4e8c\u8bcd", 2),
+            ("\u4e8c\u5b57", 2),
+            ("\u4e09\u5b57", 3),
+            ("3\u5b57", 3),
+            ("\u56db\u5b57", 4),
+            ("4\u5b57", 4),
+        ]
+
+        for mode, expected in cases:
+            with self.subTest(mode=mode):
+                self.assertEqual(caption_presets.fixed_word_count_for_chunk_mode(mode), expected)
+
+        self.assertTrue(caption_presets.is_exact_single_word_chunk_mode("1\u5b57"))
+        self.assertEqual(caption_presets.pacing_merge_word_limit_for_chunk_mode("2\u5b57"), 0)
+        self.assertEqual(caption_presets.pacing_merge_word_limit_for_chunk_mode("\u667a\u80fd\u91cd\u70b9\u77ed\u53e5 (3-4\u8bcd\u4e3a\u4e3b)"), 4)
+        self.assertEqual(caption_presets.pacing_merge_word_limit_for_chunk_mode("\u667a\u80fd\u542c\u8bd1 (4-7\u8bcd)"), 7)
+
     def test_edit_timeline_controller_interfaces_are_present(self):
         root_dir = os.path.dirname(os.path.dirname(__file__))
         with open(os.path.join(root_dir, "room_edit.py"), "r", encoding="utf-8") as f:
@@ -291,6 +316,15 @@ class RenderTimingTests(unittest.TestCase):
         self.assertIs(active[0][0], sub)
         self.assertEqual(active[0][1], 1.235)
         self.assertEqual(active_subtitles_for_frame([sub], 1.234, 0.4), [])
+
+    def test_short_subtitle_inside_frame_is_sampled(self):
+        sub = {"start": 0.010, "end": 0.018, "text": "God"}
+
+        active = active_subtitles_for_frame([sub], 0.0, 1 / 30)
+
+        self.assertEqual(len(active), 1)
+        self.assertIs(active[0][0], sub)
+        self.assertAlmostEqual(active[0][1], 0.010, places=3)
 
 
 class RenderRangeTests(unittest.TestCase):
@@ -435,6 +469,12 @@ class PreviewProxyTests(unittest.TestCase):
         self.assertIn("1", cmd)
         self.assertNotIn("-shortest", cmd)
         self.assertEqual(cmd[-1], "proxy.mp4")
+
+        low_cmd = build_preview_proxy_command("ffmpeg", "input.mov", "proxy.mp4", proxy_height=360, proxy_fps=18, proxy_crf=30)
+        low_joined = " ".join(low_cmd)
+        self.assertIn("scale=-2:360", low_joined)
+        self.assertIn("fps=18", low_joined)
+        self.assertIn("30", low_cmd)
 
     def test_smart_proxy_only_targets_large_or_long_clips(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1306,6 +1346,20 @@ class SubtitleTimingTests(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["text"], "God sees your burden")
         self.assertEqual(len(merged[0]["words"]), 4)
+
+
+    def test_fast_subtitle_pacing_merges_tiny_segments(self):
+        subs = [
+            {"text": "God", "start": 0.0, "end": 0.06, "track": 1, "words": [{"text": "God", "start": 0.0, "end": 0.06}]},
+            {"text": "sees", "start": 0.06, "end": 0.12, "track": 1, "words": [{"text": "sees", "start": 0.06, "end": 0.12}]},
+            {"text": "you", "start": 0.12, "end": 0.18, "track": 1, "words": [{"text": "you", "start": 0.12, "end": 0.18}]},
+        ]
+
+        protected = protect_fast_subtitle_pacing(subs)
+
+        self.assertEqual(len(protected), 1)
+        self.assertEqual(protected[0]["text"], "God sees you")
+        self.assertGreaterEqual(protected[0]["end"] - protected[0]["start"], 0.42)
         self.assertFalse(
             should_defer_subtitle_break_for_readability(
                 "I",
@@ -1333,6 +1387,18 @@ class SubtitleTimingTests(unittest.TestCase):
                 has_punct=True,
             )
         )
+
+    def test_fast_subtitle_pacing_preserves_precise_segments_without_merge(self):
+        subs = [
+            {"text": "God", "start": 0.0, "end": 0.06, "track": 1, "words": [{"text": "God", "start": 0.0, "end": 0.06}]},
+            {"text": "sees", "start": 0.06, "end": 0.12, "track": 1, "words": [{"text": "sees", "start": 0.06, "end": 0.12}]},
+            {"text": "you", "start": 0.12, "end": 0.18, "track": 1, "words": [{"text": "you", "start": 0.12, "end": 0.18}]},
+        ]
+
+        protected = protect_fast_subtitle_pacing(subs, allow_merge=False)
+
+        self.assertEqual([item["text"] for item in protected], ["God", "sees", "you"])
+
 
 
 if __name__ == "__main__":

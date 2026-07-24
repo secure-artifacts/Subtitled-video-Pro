@@ -16,7 +16,7 @@ import requests
 from core import DEFAULT_SYNC_URL, CLOUD_SECRET
 from app_theme import apply_tinted_styles
 from room_theme_bridge import apply_room_theme_bridge
-from font_assets import ensure_fonts_dir, font_asset_summary, register_bundled_fonts
+from font_assets import ensure_fonts_dir, ensure_personal_fonts_dir, font_asset_summary, register_bundled_fonts
 from render_config import (
     cpu_safe_profile,
     describe_render_profile,
@@ -38,12 +38,15 @@ from app_config import (
     CONFIG_FILE,
     DEFAULT_SHORTCUTS,
     OUTPUT_RESOLUTION_OPTIONS,
+    PREVIEW_PROXY_RESOLUTION_OPTIONS,
     get_output_resolution,
     get_preview_fullscreen_shortcut,
+    get_preview_proxy_resolution,
     load_app_config,
     save_app_config,
     set_output_resolution,
     set_preview_fullscreen_shortcut,
+    set_preview_proxy_resolution,
 )
 from app_update import (
     check_latest_release,
@@ -316,6 +319,29 @@ class SettingsView(QWidget):
         resolution_layout.addWidget(self.lbl_output_resolution)
 
         self.resolution_section = self._add_section(render_tab_layout, "画面分辨率", resolution_frame, "#cba6f7", expanded=True)
+
+        preview_frame = QFrame()
+        preview_frame.setStyleSheet("background-color: #181825; border-radius: 10px; border: 1px solid #89b4fa;")
+        preview_layout = QVBoxLayout(preview_frame)
+        preview_layout.setContentsMargins(25, 18, 25, 18)
+        preview_layout.setSpacing(10)
+        lbl_preview_title = QLabel("预览流畅度")
+        lbl_preview_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #89b4fa; border: none;")
+        preview_layout.addWidget(lbl_preview_title)
+        lbl_preview_desc = QLabel("只降低精修预览代理分辨率，适合长视频或电脑卡顿时使用；正式导出仍保持原始素材与工程画布。")
+        lbl_preview_desc.setWordWrap(True)
+        lbl_preview_desc.setStyleSheet("color: #a6adc8; font-size: 13px; border: none;")
+        preview_layout.addWidget(lbl_preview_desc)
+        self.preview_proxy_resolution_combo = QComboBox()
+        self.preview_proxy_resolution_combo.addItems(PREVIEW_PROXY_RESOLUTION_OPTIONS)
+        self.preview_proxy_resolution_combo.setCurrentText(get_preview_proxy_resolution())
+        self.preview_proxy_resolution_combo.setStyleSheet("background-color: #11111b; color: #cdd6f4; border: 1px solid #45475a; border-radius: 6px; padding: 8px; font-weight: bold;")
+        self.preview_proxy_resolution_combo.currentTextChanged.connect(self.save_preview_proxy_resolution_ui)
+        preview_layout.addWidget(self.preview_proxy_resolution_combo)
+        self.lbl_preview_proxy_resolution = QLabel("")
+        self.lbl_preview_proxy_resolution.setStyleSheet("color: #a6e3a1; font-size: 12px; border: none;")
+        preview_layout.addWidget(self.lbl_preview_proxy_resolution)
+        self.preview_proxy_section = self._add_section(render_tab_layout, "预览流畅度", preview_frame, "#89b4fa", expanded=True)
 
         shortcuts_frame = QFrame()
         shortcuts_frame.setStyleSheet("background-color: #181825; border-radius: 10px; border: 1px solid #89b4fa;")
@@ -764,6 +790,19 @@ class SettingsView(QWidget):
             except Exception:
                 pass
 
+    def save_preview_proxy_resolution_ui(self, value):
+        saved = set_preview_proxy_resolution(value)
+        if hasattr(self, "lbl_preview_proxy_resolution"):
+            self.lbl_preview_proxy_resolution.setText(f"当前预览代理：{saved}（不影响导出）")
+        parent = self.parent()
+        while parent is not None and not hasattr(parent, "room_edit"):
+            parent = parent.parent()
+        if parent and hasattr(parent, "room_edit"):
+            try:
+                parent.room_edit.on_preview_proxy_resolution_changed(saved)
+            except Exception:
+                pass
+
     def _main_window(self):
         parent = self.parent()
         while parent is not None and not hasattr(parent, "room_edit"):
@@ -961,6 +1000,12 @@ class SettingsView(QWidget):
             self.output_resolution_combo.setCurrentText(current_resolution)
             self.output_resolution_combo.blockSignals(False)
             self.lbl_output_resolution.setText(f"当前固定画布：{current_resolution}")
+        if hasattr(self, "preview_proxy_resolution_combo"):
+            current_preview_resolution = get_preview_proxy_resolution()
+            self.preview_proxy_resolution_combo.blockSignals(True)
+            self.preview_proxy_resolution_combo.setCurrentText(current_preview_resolution)
+            self.preview_proxy_resolution_combo.blockSignals(False)
+            self.lbl_preview_proxy_resolution.setText(f"当前预览代理：{current_preview_resolution}（不影响导出）")
         if hasattr(self, "preview_fullscreen_shortcut_edit"):
             shortcut = get_preview_fullscreen_shortcut()
             self.preview_fullscreen_shortcut_edit.blockSignals(True)
@@ -1116,9 +1161,11 @@ class SettingsView(QWidget):
             if not family_text:
                 family_text = "尚未放入字体文件"
             self.lbl_font_assets.setText(
-                f"内置字体包: {summary.get('font_file_count', 0)} 个字体文件 / "
+                f"开源字体包: {summary.get('font_file_count', 0)} 个文件 / "
+                f"个人字体: {summary.get('personal_font_file_count', 0)} 个文件 / "
                 f"{summary.get('family_count', 0)} 个字体族\n"
-                f"目录: {summary.get('fonts_dir')}\n"
+                f"开源目录: {summary.get('fonts_dir')}\n"
+                f"个人目录: {summary.get('personal_fonts_dir')}\n"
                 f"已识别: {family_text}"
             )
         except Exception as e:
@@ -1135,7 +1182,7 @@ class SettingsView(QWidget):
             QMessageBox.warning(self, "刷新失败", str(e))
 
     def open_fonts_dir_ui(self):
-        QDesktopServices.openUrl(QUrl.fromLocalFile(ensure_fonts_dir()))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(ensure_personal_fonts_dir()))
 
     def save_font_registry_ui(self):
         names = [line.strip() for line in self.txt_approved_fonts.toPlainText().splitlines() if line.strip()]

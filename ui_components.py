@@ -67,6 +67,8 @@ ENGLISH_SUFFIX_TOKENS = {
 
 MIN_WORD_DURATION_SECONDS = 0.04
 MIN_SUBTITLE_DURATION_SECONDS = 0.18
+FAST_WORD_VISUAL_MIN_SECONDS = 0.14
+FAST_SUBTITLE_READABLE_MIN_SECONDS = 0.42
 
 
 def _safe_float(value, default=0.0):
@@ -826,6 +828,68 @@ def _apply_balanced_breaks(words, line_capacity, max_lines, style=None):
             rebuilt.append(item)
     return rebuilt
 
+
+def _readable_subtitle_duration(subtitle, min_seconds=FAST_SUBTITLE_READABLE_MIN_SECONDS, min_word_seconds=FAST_WORD_VISUAL_MIN_SECONDS):
+    word_count = max(1, _subtitle_word_count(subtitle))
+    return max(float(min_seconds), min(1.15, word_count * float(min_word_seconds) + 0.16))
+
+
+def protect_fast_subtitle_pacing(
+    subtitles,
+    *,
+    min_seconds=FAST_SUBTITLE_READABLE_MIN_SECONDS,
+    min_word_seconds=FAST_WORD_VISUAL_MIN_SECONDS,
+    max_merged_words=8,
+    gap_tolerance=0.18,
+    allow_merge=True,
+):
+    items = [copy.deepcopy(s) for s in (subtitles or []) if isinstance(s, dict)]
+    if not items:
+        return []
+
+    result = []
+    idx = 0
+    while idx < len(items):
+        current = items[idx]
+        if allow_merge:
+            while idx + 1 < len(items):
+                next_item = items[idx + 1]
+                if int(current.get("track", 1)) != int(next_item.get("track", 1)):
+                    break
+                combined_words = _subtitle_word_count(current) + _subtitle_word_count(next_item)
+                if combined_words > max_merged_words:
+                    break
+                start = _safe_float(current.get("start", 0.0), 0.0)
+                end = _safe_float(current.get("end", start), start)
+                next_start = _safe_float(next_item.get("start", end), end)
+                gap = next_start - end
+                if gap > gap_tolerance:
+                    break
+                desired = _readable_subtitle_duration(current, min_seconds, min_word_seconds)
+                if end - start >= desired and gap >= 0.04:
+                    break
+                current = _merge_subtitle_segments(current, next_item)
+                idx += 1
+        result.append(current)
+        idx += 1
+
+    for pos, sub in enumerate(result):
+        start = _safe_float(sub.get("start", 0.0), 0.0)
+        end = _safe_float(sub.get("end", start + MIN_SUBTITLE_DURATION_SECONDS), start + MIN_SUBTITLE_DURATION_SECONDS)
+        desired_end = start + _readable_subtitle_duration(sub, min_seconds, min_word_seconds)
+        next_start = None
+        for later in result[pos + 1:]:
+            if int(later.get("track", 1)) == int(sub.get("track", 1)):
+                next_start = _safe_float(later.get("start", end), end)
+                break
+        if next_start is not None:
+            end = min(max(end, desired_end), max(start + MIN_SUBTITLE_DURATION_SECONDS, next_start - 0.01))
+        else:
+            end = max(end, desired_end)
+        sub["start"] = start
+        sub["end"] = max(start + MIN_SUBTITLE_DURATION_SECONDS, end)
+    return result
+
 def subtitle_layout_capacity(style, proj_w=1080):
     style = style or {}
     size = max(12.0, float(style.get("size", 100)))
@@ -1154,6 +1218,7 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
     hl_bg_skew = max(-35.0, min(35.0, float(style.get("hl_bg_skew", 0) or 0)))
     hl_trail_words = max(1, min(8, int(style.get("hl_trail_words", 1) or 1)))
     hl_trail_min_alpha = max(0.0, min(1.0, float(style.get("hl_trail_min_alpha", 35) or 0) / 100.0))
+    word_visual_min = max(0.02, min(0.40, _safe_float(style.get("word_visual_min_seconds", FAST_WORD_VISUAL_MIN_SECONDS), FAST_WORD_VISUAL_MIN_SECONDS)))
 
     lh = style.get("line_height", 1.1)
     layout_row_gap = max(0.6, min(2.2, _safe_float(style.get("layout_row_gap", 100), 100) / 100.0))
@@ -1410,15 +1475,26 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
             layout_content_indices = [content_indices[0]]
     emphasis_idx = set()
     small_idx = set()
+    word_visual_windows = {}
+    for order, i in enumerate(content_indices):
+        ww = words[i]
+        w_start = _safe_float(ww.get("start", clip_start), clip_start)
+        w_end = _safe_float(ww.get("end", w_start + MIN_WORD_DURATION_SECONDS), w_start + MIN_WORD_DURATION_SECONDS)
+        if w_end <= w_start:
+            w_end = w_start + MIN_WORD_DURATION_SECONDS
+        visual_end = max(w_end, w_start + word_visual_min)
+        if order + 1 < len(content_indices):
+            next_word = words[content_indices[order + 1]]
+            next_start = _safe_float(next_word.get("start", w_end), w_end)
+            if next_start > w_start:
+                visual_end = min(visual_end, max(w_start + 0.02, next_start - 0.001))
+        word_visual_windows[i] = (w_start, max(w_start + 0.02, visual_end))
+
     current_word_idx = None
     if use_hl and hl_style != "none":
         active_candidates = []
         for i in content_indices:
-            ww = words[i]
-            w_start = float(ww.get("start", clip_start))
-            w_end = float(ww.get("end", w_start + 0.5))
-            if w_end <= w_start:
-                w_end = w_start + 0.05
+            w_start, w_end = word_visual_windows.get(i, (clip_start, clip_end))
             if w_start <= current_time < w_end:
                 active_candidates.append((w_start, i))
         if active_candidates:

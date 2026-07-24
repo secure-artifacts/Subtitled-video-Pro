@@ -219,7 +219,7 @@ def narrative_chunk_merge_words(mode):
 def is_exact_single_word_chunk_mode(mode):
     text = str(mode or "")
     return (
-        any(token in text for token in ("单字", "单词", "逐词", "1词"))
+        any(token in text for token in ("单字", "单词", "逐词", "1词", "1字", "一词", "一字"))
         or any(token in text for token in ("Ã¥Ââ€¢Ã¥Â­â€”", "Ã¥Ââ€¢Ã¨Â¯Â", "Ã©â‚¬ï¿½Ã¨Â¯Â", "1Ã¨Â¯Â"))
     ) and not any(token in text for token in ("1-3", "1-4"))
 
@@ -239,14 +239,26 @@ def fixed_word_count_for_chunk_mode(mode):
         return 0
     if "短句快速" in text or "短句快闪" in text or "1-3" in text or "3-5" in text:
         return 3
-    if "双词" in text or "2词" in text:
+    if any(token in text for token in ("双词", "双字", "2词", "2字", "二词", "二字")):
         return 2
-    if "三词" in text or "3词" in text:
+    if any(token in text for token in ("三词", "三字", "3词", "3字")):
         return 3
-    if "四词" in text or "4词" in text:
+    if any(token in text for token in ("四词", "四字", "4词", "4字")):
         return 4
     return 0
 
+
+def pacing_merge_word_limit_for_chunk_mode(mode):
+    text = str(mode or "")
+    if is_exact_single_word_chunk_mode(text) or fixed_word_count_for_chunk_mode(text) > 0:
+        return 0
+    if any(token in text for token in ("\u667a\u80fd\u91cd\u70b9", "3-4\u8bcd\u4e3a\u4e3b", "3-4")):
+        return 4
+    if any(token in text for token in ("\u81ea\u7136\u77ed\u53e5", "1-4")):
+        return 4
+    if any(token in text for token in ("\u667a\u80fd\u542c\u8bd1", "4-7\u8bcd", "4-7", "4-6")):
+        return 7
+    return 8
 
 def is_precise_chunk_mode(mode):
     return is_exact_single_word_chunk_mode(mode) or fixed_word_count_for_chunk_mode(mode) > 0

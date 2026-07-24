@@ -244,6 +244,39 @@ def upsert_approved_fonts(font_names):
     return save_font_registry(data)
 
 
+def upsert_personal_font_assets(records):
+    data = load_font_registry()
+    fonts = data.setdefault("fonts", {})
+    existing_by_key = {_key(name): name for name in fonts.keys()}
+
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        family = str(record.get("family", "") or "").strip()
+        if not family:
+            continue
+        target_name = existing_by_key.get(_key(family), family)
+        existing = fonts.get(target_name, {}) if isinstance(fonts.get(target_name), dict) else {}
+        if existing.get("status") == STATUS_OPEN:
+            continue
+        updated = copy.deepcopy(existing)
+        updated.update({
+            "status": STATUS_NONCOMMERCIAL,
+            "source": record.get("source") or "User personal fonts folder",
+            "commercial_use": "personal_only_registered",
+            "category": "restricted_noncommercial",
+            "style_class": record.get("style_class") or updated.get("style_class") or _infer_style_class(family, record),
+            "personal_file": record.get("file", updated.get("personal_file", "")),
+            "license": record.get("license") or updated.get("license") or "Personal use / local only",
+            "license_file": record.get("license_file", updated.get("license_file", "")),
+            "license_url": record.get("license_url", updated.get("license_url", "")),
+            "notes": record.get("notes") or updated.get("notes") or "Loaded from fonts/personal for local personal use only. Do not bundle, redistribute, upload to GitHub, or use commercially unless separate license proof is recorded.",
+        })
+        fonts[target_name] = updated
+        existing_by_key[_key(target_name)] = target_name
+
+    return save_font_registry(data)
+
 def upsert_open_font_assets(records):
     data = load_font_registry()
     fonts = data.setdefault("fonts", {})

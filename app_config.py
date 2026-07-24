@@ -13,6 +13,17 @@ OUTPUT_RESOLUTION_OPTIONS = [
     "正方 1080x1080",
     "自动检测 (跟随素材)",
 ]
+DEFAULT_PREVIEW_PROXY_RESOLUTION = "流畅 540p"
+PREVIEW_PROXY_RESOLUTION_OPTIONS = [
+    "极速 360p",
+    "流畅 540p",
+    "清晰 720p",
+]
+PREVIEW_PROXY_RESOLUTION_PROFILES = {
+    "极速 360p": {"height": 360, "fps": 18, "crf": 30},
+    "流畅 540p": {"height": 540, "fps": 24, "crf": 26},
+    "清晰 720p": {"height": 720, "fps": 24, "crf": 23},
+}
 
 
 def load_app_config():
@@ -36,6 +47,26 @@ def set_output_resolution(value):
     config["output_resolution"] = value
     save_app_config(config)
     return value
+
+
+def get_preview_proxy_resolution():
+    value = str(load_app_config().get("preview_proxy_resolution") or DEFAULT_PREVIEW_PROXY_RESOLUTION).strip()
+    return value if value in PREVIEW_PROXY_RESOLUTION_OPTIONS else DEFAULT_PREVIEW_PROXY_RESOLUTION
+
+
+def set_preview_proxy_resolution(value):
+    value = value if value in PREVIEW_PROXY_RESOLUTION_OPTIONS else DEFAULT_PREVIEW_PROXY_RESOLUTION
+    config = load_app_config()
+    config["preview_proxy_resolution"] = value
+    save_app_config(config)
+    return value
+
+
+def preview_proxy_settings(value=None):
+    value = value if value in PREVIEW_PROXY_RESOLUTION_OPTIONS else get_preview_proxy_resolution()
+    profile = dict(PREVIEW_PROXY_RESOLUTION_PROFILES.get(value) or PREVIEW_PROXY_RESOLUTION_PROFILES[DEFAULT_PREVIEW_PROXY_RESOLUTION])
+    profile["label"] = value
+    return profile
 
 
 def _shortcut_text(value, default):

@@ -7,6 +7,7 @@ from core import get_app_dir
 
 
 FONTS_DIR = os.path.join(get_app_dir(), "fonts", "open")
+PERSONAL_FONTS_DIR = os.path.join(get_app_dir(), "fonts", "personal")
 FONT_ASSET_MANIFEST = os.path.join(FONTS_DIR, "open_fonts_manifest.json")
 FONT_EXTS = (".ttf", ".otf", ".ttc", ".otc")
 LICENSE_EXTS = (".txt", ".md", ".license", ".copyright")
@@ -15,6 +16,7 @@ DEFAULT_SOURCE = "Bundled open font asset"
 DEFAULT_NOTES = "Bundled with Subtitle Composer as an open/commercial-safe font. Keep the font license when redistributing project packages."
 
 _REGISTERED_FONT_RECORDS = []
+_REGISTERED_PERSONAL_FONT_RECORDS = []
 
 
 def _key(value):
@@ -23,7 +25,12 @@ def _key(value):
 
 def ensure_fonts_dir():
     os.makedirs(FONTS_DIR, exist_ok=True)
+    os.makedirs(PERSONAL_FONTS_DIR, exist_ok=True)
     return FONTS_DIR
+
+def ensure_personal_fonts_dir():
+    os.makedirs(PERSONAL_FONTS_DIR, exist_ok=True)
+    return PERSONAL_FONTS_DIR
 
 
 def load_font_asset_manifest():
@@ -58,6 +65,12 @@ def _relative_font_path(path):
     except Exception:
         return os.path.basename(path)
 
+def _relative_personal_font_path(path):
+    try:
+        return os.path.relpath(os.path.abspath(path), PERSONAL_FONTS_DIR).replace("\\", "/")
+    except Exception:
+        return os.path.basename(path)
+
 
 def _font_file_path(filename):
     filename = str(filename or "").strip()
@@ -68,14 +81,24 @@ def _font_file_path(filename):
     return os.path.join(FONTS_DIR, filename)
 
 
-def bundled_font_files():
-    ensure_fonts_dir()
+def _font_files_in_dir(root_dir):
+    os.makedirs(root_dir, exist_ok=True)
     files = []
-    for root, _, names in os.walk(FONTS_DIR):
+    for root, _, names in os.walk(root_dir):
         for name in names:
             if name.lower().endswith(FONT_EXTS):
                 files.append(os.path.abspath(os.path.join(root, name)))
     return sorted(files, key=lambda item: item.casefold())
+
+
+def bundled_font_files():
+    ensure_fonts_dir()
+    return _font_files_in_dir(FONTS_DIR)
+
+
+def personal_font_files():
+    ensure_personal_fonts_dir()
+    return _font_files_in_dir(PERSONAL_FONTS_DIR)
 
 
 def _guess_family_from_filename(path):
@@ -166,16 +189,48 @@ def sync_registry_from_manifest():
     manifest = load_font_asset_manifest()
     return upsert_open_font_assets(manifest.get("fonts", []))
 
+def _record_for_personal_font(font_path, family):
+    license_file = ""
+    candidates = _license_candidates_for(font_path)
+    if candidates:
+        license_file = _relative_personal_font_path(candidates[0])
+    return {
+        "family": str(family or "").strip() or _guess_family_from_filename(font_path),
+        "file": _relative_personal_font_path(font_path),
+        "source": "User personal fonts folder",
+        "license": "Personal use / local only",
+        "license_file": license_file,
+        "license_url": "",
+        "notes": "Loaded from fonts/personal for local personal use only. Do not bundle, redistribute, upload to GitHub, or use commercially unless separate license proof is recorded.",
+        "personal_only": True,
+    }
 
-def register_bundled_fonts():
-    global _REGISTERED_FONT_RECORDS
+
+def sync_registry_from_personal(loaded_records):
+    try:
+        from font_registry import upsert_personal_font_assets
+    except Exception:
+        return None
+    records = []
+    for item in loaded_records or []:
+        path = item.get("path", "")
+        if not path or not os.path.exists(path):
+            continue
+        for family in item.get("families", []) or [_guess_family_from_filename(path)]:
+            family = str(family or "").strip()
+            if family:
+                records.append(_record_for_personal_font(path, family))
+    return upsert_personal_font_assets(records)
+
+
+def _load_font_files_into_qt(font_files):
     try:
         from PyQt6.QtGui import QFontDatabase
     except Exception:
         return []
 
     loaded = []
-    for font_path in bundled_font_files():
+    for font_path in font_files:
         try:
             font_id = QFontDatabase.addApplicationFont(font_path)
             if font_id >= 0:
@@ -185,13 +240,22 @@ def register_bundled_fonts():
                 })
         except Exception:
             continue
-    _REGISTERED_FONT_RECORDS = loaded
+    return loaded
+
+
+def register_bundled_fonts():
+    global _REGISTERED_FONT_RECORDS, _REGISTERED_PERSONAL_FONT_RECORDS
+    open_loaded = _load_font_files_into_qt(bundled_font_files())
+    personal_loaded = _load_font_files_into_qt(personal_font_files())
+    _REGISTERED_FONT_RECORDS = open_loaded
+    _REGISTERED_PERSONAL_FONT_RECORDS = personal_loaded
     try:
-        sync_manifest_from_registered(loaded)
+        sync_manifest_from_registered(open_loaded)
         sync_registry_from_manifest()
+        sync_registry_from_personal(personal_loaded)
     except Exception:
         pass
-    return loaded
+    return open_loaded + personal_loaded
 
 
 def _file_url(path):
@@ -236,6 +300,19 @@ def font_asset_records():
             records.append(_record_for_font(path, family))
             records[-1]["path"] = os.path.abspath(path)
 
+    for item in _REGISTERED_PERSONAL_FONT_RECORDS:
+        path = item.get("path", "")
+        if not path or not os.path.exists(path):
+            continue
+        for family in item.get("families", []) or [_guess_family_from_filename(path)]:
+            key = (_key(family), os.path.abspath(path).casefold())
+            if not family or key in seen:
+                continue
+            seen.add(key)
+            record = _record_for_personal_font(path, family)
+            record["path"] = os.path.abspath(path)
+            records.append(record)
+
     return sorted(records, key=lambda item: (str(item.get("family", "")).casefold(), str(item.get("file", "")).casefold()))
 
 
@@ -266,11 +343,14 @@ def font_face_css():
 def font_asset_summary():
     records = font_asset_records()
     font_files = bundled_font_files()
+    personal_files = personal_font_files()
     families = sorted({record.get("family", "") for record in records if record.get("family")}, key=lambda item: item.casefold())
     return {
         "fonts_dir": FONTS_DIR,
+        "personal_fonts_dir": PERSONAL_FONTS_DIR,
         "manifest": FONT_ASSET_MANIFEST,
         "font_file_count": len(font_files),
+        "personal_font_file_count": len(personal_files),
         "family_count": len(families),
         "families": families,
     }
@@ -295,6 +375,8 @@ def font_package_entries_for_families(families):
         entries.append((abs_path, arc_rel.replace("\\", "/")))
 
     for record in font_asset_records():
+        if record.get("personal_only"):
+            continue
         if _key(record.get("family", "")) not in wanted:
             continue
         path = record.get("path") or _font_file_path(record.get("file", ""))

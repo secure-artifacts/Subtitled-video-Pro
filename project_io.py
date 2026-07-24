@@ -395,6 +395,10 @@ def update_room_state(project_data, room_name, room_payload):
     project_data.setdefault("room_state", {})[room_name] = copy.deepcopy(room_payload)
 
     if room_name == "edit_room":
+        project_tag = str(room_payload.get("project_tag", "") or "").strip()
+        if project_tag:
+            project_data["project_tag"] = project_tag
+            project_data["tags"] = [project_tag]
         project_data["subs_data"] = copy.deepcopy(room_payload.get("subs_data", []))
         project_data["timeline"] = copy.deepcopy(room_payload.get("video_clips", []))
         media_files = project_data.setdefault("media_files", {})

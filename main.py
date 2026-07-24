@@ -610,6 +610,14 @@ class SubtitledvideoPro(QMainWindow):
         name = os.path.basename(path or "").lower()
         return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name)]
 
+    def current_project_tag_text(self):
+        project = self.project if isinstance(self.project, dict) else {}
+        edit_state = project.get("room_state", {}).get("edit_room", {}) if isinstance(project, dict) else {}
+        raw = project.get("project_tag") or edit_state.get("project_tag") or project.get("tag") or ""
+        if not raw and isinstance(project.get("tags"), list) and project.get("tags"):
+            raw = project.get("tags", [""])[0]
+        return str(raw or "").strip()
+
     def current_project_folder_progress(self):
         project_path = self.project.get("project_path", "") if isinstance(self.project, dict) else ""
         if not project_path:
@@ -635,9 +643,13 @@ class SubtitledvideoPro(QMainWindow):
     def refresh_room_links(self):
         if hasattr(self, "project_label"):
             project_name = self.project.get("project_name") or os.path.basename(self.project.get("project_path", "")) or "未命名工程"
+            tag_text = self.current_project_tag_text()
+            tag_part = f"  |  标签：{tag_text or '未设置'}"
             progress = self.current_project_folder_progress()
             progress_text = f"  |  文件夹进度：{progress[0]}/{progress[1]}" if progress else ""
-            self.project_label.setText(f"当前工程：{project_name}{progress_text}")
+            label_text = f"当前工程：{project_name}{tag_part}{progress_text}"
+            self.project_label.setText(label_text)
+            self.project_label.setToolTip(label_text)
 
         if hasattr(self, "room_project"):
             self.room_project.project_data = self.project
@@ -647,6 +659,8 @@ class SubtitledvideoPro(QMainWindow):
             self.room_edit.project_data = self.project
         if hasattr(self.room_edit, "sync_design_panel_controls"):
             self.room_edit.sync_design_panel_controls()
+        if hasattr(self.room_edit, "refresh_project_header"):
+            self.room_edit.refresh_project_header()
 
         if hasattr(self.room_deliver, "project_data"):
             self.room_deliver.project_data = self.project

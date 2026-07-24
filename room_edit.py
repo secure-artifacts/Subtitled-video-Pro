@@ -15,6 +15,7 @@ import copy
 import time
 import html
 import hashlib
+import random
 
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QTextEdit, QScrollArea, QTabWidget, QComboBox,
@@ -45,10 +46,20 @@ from ui_components import (hex_to_rgb, get_exact_duration, get_video_dimensions,
                            normalize_word_timestamps, align_reference_text_to_timestamps,
                            format_subtitle_text_spacing, normalize_scripture_quote_text,
                            should_defer_subtitle_break_for_readability,
-                           merge_single_word_subtitle_segments,
+                           merge_single_word_subtitle_segments, protect_fast_subtitle_pacing,
                            FAITH_WORDS)
 from project_io import copy_media_to_project_assets, load_project, save_project, sync_project_assets_to_project_dir, update_room_state
-from app_config import OUTPUT_RESOLUTION_OPTIONS, get_output_resolution, get_preview_fullscreen_shortcut, load_app_config, resolution_to_size
+from app_config import (
+    OUTPUT_RESOLUTION_OPTIONS,
+    PREVIEW_PROXY_RESOLUTION_OPTIONS,
+    get_output_resolution,
+    get_preview_fullscreen_shortcut,
+    get_preview_proxy_resolution,
+    load_app_config,
+    preview_proxy_settings,
+    resolution_to_size,
+    set_preview_proxy_resolution,
+)
 from ai_transcription import transcribe_audio_words
 from app_storage import read_json_file, resolve_user_file, write_json_file
 from font_assets import font_face_css
@@ -62,6 +73,9 @@ from caption_presets import (
     REFERENCE_NARRATIVE_BLOCK_PRESET,
     REFERENCE_NARRATIVE_CHUNK_MODE,
     built_in_style_presets,
+    fixed_word_count_for_chunk_mode,
+    pacing_merge_word_limit_for_chunk_mode,
+    is_exact_single_word_chunk_mode,
     is_reference_narrative_chunk_mode,
     merge_built_in_style_presets,
     narrative_chunk_merge_words,
@@ -529,7 +543,7 @@ class EditView(QWidget):
         self.default_style = {
             "size": 100, "font": "Noto Sans SC", "font_weight": "700", "font_style": "normal", "color_txt": "#FFFFFF", "color_hl": "#FFFFFF",
             "bg_mode": "none", "bg_color": "#000000", "bg_alpha": 80, "bg_radius": 15, "bg_padding": 20, "bg_auto_resolution": True,
-            "hl_bg_color": "#FF0050", "hl_bg_alpha": 100, "hl_bg_radius": 8, "hl_bg_padding": 8, "hl_trail_words": 1, "hl_trail_min_alpha": 35,
+            "hl_bg_color": "#FF0050", "hl_bg_alpha": 100, "hl_bg_radius": 8, "hl_bg_padding": 8, "hl_trail_words": 1, "hl_trail_min_alpha": 35, "word_visual_min_seconds": 0.14,
             "stroke_width": 4, "stroke_color": "#000000", "stroke_o_width": 0, "stroke_o_color": "#000000", "stroke_softness": 0,
             "shadow_x": 5, "shadow_y": 5, "shadow_blur": 0, "shadow_color": "#000000", "shadow_alpha": 100,
             "line_height": 1.1, "layout_row_gap": 100, "text_dir": "ltr", "use_hl": True, "hl_style": "text", "hl_glow": False, "glow_size": 20,
@@ -557,6 +571,7 @@ class EditView(QWidget):
             "timing_mode": "J Cut (字幕稍后收尾)",
             "fill_subtitle_gaps": True,
             "custom_text": "", # 👑 新增：用于保存用户文案到工程
+            "project_tag": "",
             "default_pos_x": 0.0,
             "default_pos_y": 25.0,
             "default_style": self.default_style.copy(),
@@ -581,6 +596,7 @@ class EditView(QWidget):
         self.project_autosave_busy = False
         self._preview_proxy_jobs = set()
         self.preview_proxy_auto_generate = True
+        self.preview_proxy_resolution = get_preview_proxy_resolution()
 
         self.sig_ai_progress.connect(self._on_ai_progress); self.sig_ai_success.connect(self._on_ai_success)
         self.sig_ai_error.connect(self._on_ai_error); self.sig_ai_finish.connect(self._on_ai_finish)
@@ -600,6 +616,23 @@ class EditView(QWidget):
                 or "未命名工程"
             )
         return "未命名工程"
+
+    def _project_tag_text(self):
+        project_data = self.project_data if isinstance(self.project_data, dict) else {}
+        edit_state = project_data.get("room_state", {}).get("edit_room", {}) if isinstance(project_data, dict) else {}
+        raw = project_data.get("project_tag") or edit_state.get("project_tag") or project_data.get("tag") or ""
+        if not raw and isinstance(project_data.get("tags"), list) and project_data.get("tags"):
+            raw = project_data.get("tags", [""])[0]
+        return str(raw or "").strip()
+
+    def refresh_project_header(self):
+        if hasattr(self, "lbl_top_project_name"):
+            self.lbl_top_project_name.setText(self._project_display_name())
+        tag_text = self._project_tag_text()
+        if hasattr(self, "lbl_top_project_tag"):
+            self.lbl_top_project_tag.setText(f"🏷 {tag_text}" if tag_text else "")
+            self.lbl_top_project_tag.setVisible(bool(tag_text))
+
 
     def _make_design_spin(self, min_v, max_v, step):
         spin = QSpinBox()
@@ -1201,6 +1234,11 @@ class EditView(QWidget):
         self.lbl_top_project_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_top_project_name.setStyleSheet("font-size: 14px; font-weight: 800;")
         top_app_layout.addWidget(self.lbl_top_project_name)
+        self.lbl_top_project_tag = QLabel("")
+        self.lbl_top_project_tag.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_top_project_tag.setStyleSheet("background: rgba(249,226,175,0.20); color: #fff8d9; border: 1px solid rgba(249,226,175,0.36); border-radius: 10px; padding: 3px 8px; font-size: 12px; font-weight: 900;")
+        top_app_layout.addWidget(self.lbl_top_project_tag)
+        self.refresh_project_header()
         top_app_layout.addStretch()
         self.lbl_top_user = QLabel("ZH")
         self.lbl_top_user.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1318,9 +1356,15 @@ class EditView(QWidget):
         self.btn_assembly_cut.setFixedHeight(27)
         self.btn_assembly_cut.setStyleSheet("background-color:#f9e2af; color:#11111b; border-radius:5px; font-weight:900;")
         self.btn_assembly_cut.clicked.connect(self.assemble_selected_media_to_timeline)
+        self.btn_assembly_random = QPushButton("随机铺满")
+        self.btn_assembly_random.setFixedHeight(27)
+        self.btn_assembly_random.setToolTip("随机打乱选中的素材，并按配音/字幕/工程时长自动铺满时间线。")
+        self.btn_assembly_random.setStyleSheet("background-color:#a6e3a1; color:#11111b; border-radius:5px; font-weight:900;")
+        self.btn_assembly_random.clicked.connect(self.assemble_selected_media_random_to_timeline)
         assembly_actions.addWidget(self.btn_assembly_pick)
         assembly_actions.addWidget(self.btn_assembly_clear)
         assembly_actions.addWidget(self.btn_assembly_cut)
+        assembly_actions.addWidget(self.btn_assembly_random)
         assembly_layout.addLayout(assembly_actions)
         self.left_media_layout.addWidget(self.assembly_panel)
         self.refresh_assembly_media_list()
@@ -1726,6 +1770,19 @@ class EditView(QWidget):
         self.btn_preview_zoom_in = QPushButton("+"); self.btn_preview_zoom_in.setFixedSize(28, 26); self.btn_preview_zoom_in.setToolTip("放大监看预览 Ctrl++"); self.btn_preview_zoom_in.setStyleSheet("background-color: #313244; color: #cdd6f4; font-weight: bold; border-radius: 5px;"); self.btn_preview_zoom_in.clicked.connect(lambda: self.adjust_preview_zoom(1)); view_row.addWidget(self.btn_preview_zoom_in)
         self.btn_preview_reset = QPushButton("100"); self.btn_preview_reset.setFixedSize(38, 26); self.btn_preview_reset.setToolTip("重置监看视窗 Ctrl+0"); self.btn_preview_reset.setStyleSheet("background-color: #313244; color: #a6e3a1; font-family: Consolas; font-weight: bold; border-radius: 5px;"); self.btn_preview_reset.clicked.connect(self.reset_preview_view); view_row.addWidget(self.btn_preview_reset)
         self.btn_preview_fullscreen = QPushButton("全屏"); self.btn_preview_fullscreen.setFixedSize(52, 26); self.btn_preview_fullscreen.setToolTip(f"全屏观看预览 {self.preview_fullscreen_shortcut_text} / Esc 退出"); self.btn_preview_fullscreen.setStyleSheet("background-color: #313244; color: #f9e2af; font-weight: bold; border-radius: 5px;"); self.btn_preview_fullscreen.clicked.connect(self.toggle_preview_fullscreen); view_row.addWidget(self.btn_preview_fullscreen)
+        view_row.addSpacing(8)
+        self.lbl_preview_proxy_resolution = QLabel("预览清晰度")
+        self.lbl_preview_proxy_resolution.setStyleSheet("color: #89b4fa; font-size: 11px; font-weight: 900; border: none;")
+        self.lbl_preview_proxy_resolution.setToolTip("只调精修观看预览，不影响导出画质。")
+        view_row.addWidget(self.lbl_preview_proxy_resolution)
+        self.preview_proxy_resolution_combo = QComboBox()
+        self.preview_proxy_resolution_combo.addItems(PREVIEW_PROXY_RESOLUTION_OPTIONS)
+        self.preview_proxy_resolution_combo.setCurrentText(self.preview_proxy_resolution)
+        self.preview_proxy_resolution_combo.setFixedWidth(96)
+        self.preview_proxy_resolution_combo.setToolTip("只影响精修预览代理清晰度；正式导出仍使用原始素材和工程画布。卡顿时选 360p，想看细节选 720p。")
+        self.preview_proxy_resolution_combo.setStyleSheet("background-color: #313244; color: #cdd6f4; font-weight: bold; border-radius: 5px; padding: 4px 6px;")
+        self.preview_proxy_resolution_combo.currentTextChanged.connect(self.on_preview_proxy_resolution_changed)
+        view_row.addWidget(self.preview_proxy_resolution_combo)
         view_row.addStretch()
         controls_layout.addLayout(view_row)
         center_layout.addWidget(controls_panel)
@@ -2995,12 +3052,182 @@ class EditView(QWidget):
         if not paths:
             return QMessageBox.information(self, "没有组接素材", "请先在组接面板里选择几个视频素材。")
         start_t = self.current_play_time if self.edit_mode else None
-        if self.add_media_paths_to_timeline(paths, start_t=start_t):
+        if self.assemble_media_paths_to_audio_duration(paths, start_t=start_t):
             if hasattr(self, "status_lbl"):
-                self.status_lbl.setText(f"已组接 {len(paths)} 段画面素材。")
+                self.status_lbl.setText(f"已按配音/字幕时长组接 {len(paths)} 段画面素材。")
             self.focus_media_pool()
             return True
         return False
+
+    def assemble_selected_media_random_to_timeline(self):
+        paths = [
+            path for path in getattr(self, "assembly_media_paths", []) or []
+            if path and os.path.exists(path) and self._supported_media_path(path) == "video"
+        ]
+        if not paths:
+            return QMessageBox.information(self, "没有组接素材", "请先在组接面板里选择几个视频素材。")
+        shuffled = list(paths)
+        random.shuffle(shuffled)
+        start_t = 0.0
+        if self.assemble_media_paths_to_audio_duration(shuffled, start_t=start_t, replace_existing=True, assembly_mode="random_fill"):
+            if hasattr(self, "status_lbl"):
+                self.status_lbl.setText(f"已随机铺满 {len(shuffled)} 段画面素材。")
+            self.focus_media_pool()
+            return True
+        return False
+
+    def _assembly_target_duration(self, paths):
+        audio_path = self.state.get("audio_path", "")
+        if audio_path and os.path.exists(audio_path):
+            a_trim = self.state.get("a_trim") or []
+            if len(a_trim) >= 2:
+                try:
+                    trimmed = max(0.0, float(a_trim[1]) - float(a_trim[0]))
+                    if trimmed > 0:
+                        return trimmed, "配音"
+                except Exception:
+                    pass
+            audio_dur = float(get_exact_duration(audio_path) or 0.0)
+            if audio_dur > 0:
+                return audio_dur, "配音"
+        sub_end = max([float(s.get("end", 0.0) or 0.0) for s in self.state.get("subs_data", []) or []] or [0.0])
+        if sub_end > 0:
+            return sub_end, "字幕"
+        content_dur = float(self.state.get("content_duration", 0.0) or 0.0)
+        if content_dur > 0:
+            return content_dur, "工程"
+        state_dur = float(self.state.get("duration", 0.0) or 0.0)
+        if state_dur > 1.0:
+            return max(1.0, state_dur - render_tail_padding_seconds()), "工程"
+        return 0.0, "素材"
+
+    def _build_assembly_clip_plan(self, paths, target_duration=0.0):
+        valid = []
+        for path in paths or []:
+            if not path or not os.path.exists(path) or self._supported_media_path(path) != "video":
+                continue
+            try:
+                meta = get_video_import_metadata(path)
+                dur = float(meta.get("duration", 0.0) or 0.0)
+                duration_info = meta.get("duration_info", {})
+                width = int(meta.get("width", 0) or 0)
+                height = int(meta.get("height", 0) or 0)
+            except Exception:
+                dur, duration_info, width, height = 0.0, {}, 0, 0
+            if dur <= 0:
+                dur = float(get_video_stream_duration(path) or get_exact_duration(path) or 0.0)
+            if dur <= 0:
+                dur = 5.0
+            if width <= 0 or height <= 0:
+                try:
+                    width, height = get_video_dimensions(path)
+                except Exception:
+                    width, height = 0, 0
+            valid.append({
+                "path": path,
+                "dur": max(0.05, dur),
+                "duration_info": duration_info,
+                "width": int(width or 0),
+                "height": int(height or 0),
+            })
+        if not valid:
+            return []
+
+        source_total = sum(item["dur"] for item in valid)
+        target_duration = float(target_duration or 0.0)
+        if target_duration <= 0:
+            target_duration = source_total
+        if target_duration <= 0:
+            target_duration = len(valid) * 5.0
+
+        timeline_segments = []
+        remaining = max(0.05, target_duration)
+        for idx, item in enumerate(valid):
+            if idx == len(valid) - 1:
+                clip_len = remaining
+            else:
+                weight = item["dur"] / source_total if source_total > 0 else 1.0 / len(valid)
+                clip_len = max(0.20, target_duration * weight)
+                clip_len = min(clip_len, max(0.20, remaining - 0.20 * (len(valid) - idx - 1)))
+                remaining -= clip_len
+            timeline_segments.append({
+                "path": item["path"],
+                "timeline_duration": max(0.05, clip_len),
+                "source_duration": item["dur"],
+                "source_in": 0.0,
+                "source_out": item["dur"],
+                "speed": 1.0,
+                "duration_info": item.get("duration_info", {}),
+                "width": item.get("width", 0),
+                "height": item.get("height", 0),
+            })
+        return timeline_segments
+
+    def assemble_media_paths_to_audio_duration(self, paths, start_t=None, replace_existing=False, assembly_mode="audio_matched"):
+        if not paths:
+            return False
+        target_duration, target_label = self._assembly_target_duration(paths)
+        plan = self._build_assembly_clip_plan(paths, target_duration)
+        if not plan:
+            return False
+
+        start = max(0.0, float(start_t if start_t is not None else 0.0))
+        cursor = start
+        clips = [] if replace_existing else list(self.state.get("video_clips", []) or [])
+        new_clips = []
+        for item in plan:
+            clip_len = float(item.get("timeline_duration", 0.0) or 0.0)
+            if clip_len <= 0:
+                continue
+            new_clip = {
+                "path": self.cloud_import_media_if_needed(item["path"]),
+                "start": cursor,
+                "end": cursor + clip_len,
+                "dur": float(item.get("source_duration", clip_len) or clip_len),
+                "width": int(item.get("width", 0) or 0),
+                "height": int(item.get("height", 0) or 0),
+                "scale": 100,
+                "volume": 100,
+                "duration_probe": item.get("duration_info", {}),
+                "source_in": float(item.get("source_in", 0.0) or 0.0),
+                "source_out": float(item.get("source_out", item.get("source_duration", clip_len)) or clip_len),
+                "speed": float(item.get("speed", 1.0) or 1.0),
+                "transition": {"type": "cut", "duration": 0.0},
+                "assembly_mode": assembly_mode,
+            }
+            clips.append(new_clip)
+            new_clips.append(new_clip)
+            cursor = new_clip["end"]
+
+        if not new_clips:
+            return False
+        clips.sort(key=lambda c: float(c.get("start", 0.0) or 0.0))
+        self.state["video_clips"] = clips
+        self.current_v_idx = clips.index(new_clips[0])
+        self.current_selected_idx = -1
+        self.selected_track = "video"
+        if hasattr(self, "btn_v"):
+            self.btn_v.setText("✅ 已组接素材")
+        self._prepare_preview_proxies_for_clips(new_clips, announce=True)
+        self._prime_video_preview_source(new_clips[0], announce=True)
+        self.on_resolution_changed(self.state.get("resolution", get_output_resolution()))
+        self.generate_waveform(new_clips[0]["path"], "v_wave_pixmap", max_seconds=90)
+        threading.Thread(target=self._gen_thumbs_cache, daemon=True).start()
+        self._recalc_duration()
+        self.render_ui_list()
+        self.update_timeline_size()
+        self.update_floating_subtitle()
+        self.refresh_media_pool()
+        self.auto_save_cache()
+        self.switch_inspector("video")
+        self.sync_player_to_time(new_clips[0]["start"])
+        QTimer.singleShot(0, self._request_preview_video_refresh)
+        QTimer.singleShot(280, self._request_preview_video_refresh)
+        self.push_history()
+        total = max(0.0, cursor - start)
+        if hasattr(self, "status_lbl"):
+            self.status_lbl.setText(f"已组接 {len(new_clips)} 段素材，按{target_label}时长分配到 {total:.1f}s。")
+        return True
 
     def dragEnterEvent(self, event):
         if not self.edit_mode:
@@ -4968,6 +5195,10 @@ body {{
         self.auto_save_cache()
         parent = self.parent_window()
         project_data = getattr(parent, "project", None) or self.project_data or {"project_type": "edit_room"}
+        project_tag = str(self.state.get("project_tag", "") or "").strip()
+        if project_tag:
+            project_data["project_tag"] = project_tag
+            project_data["tags"] = [project_tag]
         project_data = update_room_state(project_data, "edit_room", self.state)
         if self.is_cloud_project_active():
             project_data, report = sync_project_assets_to_project_dir(project_data)
@@ -6823,12 +7054,19 @@ body {{
         self.update_floating_subtitle()
         self.auto_save_cache()
 
-    def generate_waveform(self, path, attr_name):
+    def generate_waveform(self, path, attr_name, max_seconds=None):
         if not path or not os.path.exists(path): return
         def _task():
             try:
                 out = os.path.join(tempfile.gettempdir(), f"sh_wave_{attr_name}.png")
-                cmd = [get_ffmpeg_cmd(), "-y", "-i", path, "-map", "0:a:0?", "-filter_complex", "showwavespic=s=2000x60:colors=#a6e3a1", "-frames:v", "1", out]
+                cmd = [get_ffmpeg_cmd(), "-y", "-i", path, "-map", "0:a:0?"]
+                try:
+                    limit = float(max_seconds or 0.0)
+                except Exception:
+                    limit = 0.0
+                if limit > 0:
+                    cmd.extend(["-t", f"{limit:.3f}"])
+                cmd.extend(["-filter_complex", "showwavespic=s=2000x60:colors=#a6e3a1", "-frames:v", "1", out])
                 flags = 0x08000000 if os.name == 'nt' else 0
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags, timeout=10)
                 if os.path.exists(out): QTimer.singleShot(0, lambda: self._apply_waveform(out, attr_name))
@@ -6837,6 +7075,40 @@ body {{
 
     def _apply_waveform(self, img_path, attr_name):
         setattr(self, attr_name, QPixmap(img_path)); self.timeline_widget.sync_from_controller()
+
+    def _preview_proxy_settings(self):
+        return preview_proxy_settings(getattr(self, "preview_proxy_resolution", None) or get_preview_proxy_resolution())
+
+    def on_preview_proxy_resolution_changed(self, value):
+        saved = set_preview_proxy_resolution(value)
+        self.preview_proxy_resolution = saved
+        combo = getattr(self, "preview_proxy_resolution_combo", None)
+        if combo is not None and combo.currentText() != saved:
+            combo.blockSignals(True)
+            combo.setCurrentText(saved)
+            combo.blockSignals(False)
+        self.video_thumbs = []
+        self.last_video_image = None
+        self._preview_scaled_pixmap_key = None
+        self._preview_scaled_pixmap = None
+        clips = self.state.get("video_clips", []) or []
+        active_idx, active_clip = self._video_clip_for_time(self.current_play_time)
+        was_playing = bool(getattr(self, "is_playing", False))
+        for clip in clips:
+            self._queue_preview_proxy_for_clip(clip, announce=False)
+        if active_clip:
+            if was_playing and not preview_proxy_is_ready(active_clip):
+                # Keep the current player source alive while the newly selected proxy is being generated.
+                pass
+            else:
+                self._prime_video_preview_source(active_clip, announce=True)
+                self._sync_video_playback_to_time(self.current_play_time, force_seek=True)
+        if hasattr(self, "status_lbl"):
+            if was_playing and active_clip and not preview_proxy_is_ready(active_clip):
+                self.status_lbl.setText(f"预览清晰度已切换为 {saved}，正在后台生成；当前播放先保持旧预览，导出不受影响。")
+            else:
+                self.status_lbl.setText(f"预览清晰度已切换为 {saved}，导出画质不受影响。")
+        self.auto_save_cache()
 
     def _ensure_clip_import_metadata(self, clip):
         if not isinstance(clip, dict):
@@ -6873,7 +7145,9 @@ body {{
             return False
         if preview_proxy_is_ready(clip):
             return False
-        return clip.get("preview_proxy_status") in {PROXY_STATUS_PENDING, PROXY_STATUS_GENERATING}
+        if clip.get("preview_proxy_status") == PROXY_STATUS_FAILED:
+            return False
+        return True
 
     def _clip_dimensions_from_state(self, media_path):
         media_path = os.path.abspath(media_path or "")
@@ -6909,7 +7183,7 @@ body {{
         if self._should_defer_original_preview(clip):
             self.player.setSource(QUrl())
             if announce and hasattr(self, "status_lbl"):
-                self.status_lbl.setText("4K/高码率素材已加入；正在后台生成流畅预览代理，期间界面可继续操作。")
+                self.status_lbl.setText("长视频/高码率素材已加入；正在后台生成流畅预览代理，期间界面可继续操作。")
         return False
 
     def _prepare_preview_proxies_for_clips(self, clips, announce=False):
@@ -6922,7 +7196,13 @@ body {{
         clip = self._ensure_clip_import_metadata(clip)
         if not clip_should_auto_proxy(clip):
             return
-        proxy_path, fingerprint, needs_generation = prepare_clip_for_preview_proxy(clip)
+        proxy_settings = self._preview_proxy_settings()
+        proxy_path, fingerprint, needs_generation = prepare_clip_for_preview_proxy(
+            clip,
+            proxy_height=proxy_settings.get("height"),
+            proxy_fps=proxy_settings.get("fps"),
+            proxy_crf=proxy_settings.get("crf"),
+        )
         if not proxy_path or not needs_generation:
             return
         job_key = os.path.abspath(proxy_path)
@@ -6936,11 +7216,11 @@ body {{
         self.auto_save_cache()
         threading.Thread(
             target=self._generate_preview_proxy_task,
-            args=(clip.get("path", ""), proxy_path, fingerprint),
+            args=(clip.get("path", ""), proxy_path, fingerprint, proxy_settings),
             daemon=True,
         ).start()
 
-    def _generate_preview_proxy_task(self, source_path, proxy_path, fingerprint):
+    def _generate_preview_proxy_task(self, source_path, proxy_path, fingerprint, proxy_settings=None):
         tmp_path = proxy_path + ".tmp.mp4"
         try:
             if not source_path or not os.path.exists(source_path):
@@ -6952,7 +7232,15 @@ body {{
                         os.remove(tmp_path)
                     except OSError:
                         pass
-                cmd = build_preview_proxy_command(get_ffmpeg_cmd(), source_path, tmp_path)
+                proxy_settings = proxy_settings or self._preview_proxy_settings()
+                cmd = build_preview_proxy_command(
+                    get_ffmpeg_cmd(),
+                    source_path,
+                    tmp_path,
+                    proxy_height=proxy_settings.get("height"),
+                    proxy_fps=proxy_settings.get("fps"),
+                    proxy_crf=proxy_settings.get("crf"),
+                )
                 flags = 0x08000000 if os.name == 'nt' else 0
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags, check=True)
                 if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) <= 1024:
@@ -6970,10 +7258,12 @@ body {{
 
     def _finish_preview_proxy_job(self, source_path, proxy_path, fingerprint, success, error):
         self._preview_proxy_jobs.discard(os.path.abspath(proxy_path))
+        matched_clip = False
         matched_active_clip = False
         for clip in self.state.get("video_clips", []) or []:
             if clip.get("path") != source_path or clip.get("preview_proxy_fingerprint") != fingerprint:
                 continue
+            matched_clip = True
             if success:
                 clip["preview_proxy_path"] = proxy_path
                 clip["preview_proxy_status"] = PROXY_STATUS_READY
@@ -6983,6 +7273,8 @@ body {{
                 clip["preview_proxy_error"] = error[:300]
             _, active_clip = self._video_clip_for_time(self.current_play_time)
             matched_active_clip = matched_active_clip or active_clip is clip
+        if not matched_clip:
+            return
         if success:
             if hasattr(self, "status_lbl"):
                 self.status_lbl.setText("流畅预览代理已生成，预览已切换到轻量素材。")
@@ -6990,6 +7282,7 @@ body {{
                 self.last_video_image = None
                 self._preview_frame_retry_count = 0
                 self._sync_video_playback_to_time(self.current_play_time, force_seek=True)
+                threading.Thread(target=self._gen_thumbs_cache, daemon=True).start()
         elif hasattr(self, "status_lbl"):
             self.status_lbl.setText("流畅预览代理生成失败，已继续使用原素材预览。")
         self.auto_save_cache()
@@ -7066,7 +7359,7 @@ body {{
         if len(clips) == 1 or not self.player.source().isValid():
             self._prime_video_preview_source(new_clip, announce=True)
             self.on_resolution_changed(self.res_combo.currentText())
-            self.generate_waveform(file_path, "v_wave_pixmap")
+            self.generate_waveform(file_path, "v_wave_pixmap", max_seconds=90)
             threading.Thread(target=self._gen_thumbs_cache, daemon=True).start()
         self._recalc_duration()
         self.auto_save_cache()
@@ -7845,6 +8138,9 @@ body {{
         sound_aligned = "对齐声音" in timing_mode
         narrative_min_words, narrative_max_words = narrative_chunk_word_bounds(mode)
         narrative_merge_words = narrative_chunk_merge_words(mode)
+        fixed_count = fixed_word_count_for_chunk_mode(mode)
+        exact_single_word = is_exact_single_word_chunk_mode(mode)
+        precise_chunk_mode = exact_single_word or fixed_count > 0
 
         for i, w in enumerate(words):
             if not curr["words"]:
@@ -7870,17 +8166,6 @@ body {{
             tiktok_smart = "智能听译" in mode or "4-7词" in mode or "4-7" in mode
             smart_short = "智能重点" in mode or "3-4词为主" in mode
             natural_short = "自然短句" in mode or "1-4" in mode
-            fixed_count = 0
-            if not natural_short and not smart_short and not tiktok_smart and not narrative_block:
-                if "短句快速" in mode or "1-3" in mode:
-                    fixed_count = 3
-                elif "双词" in mode or "2词" in mode:
-                    fixed_count = 2
-                elif "三词" in mode or "3词" in mode:
-                    fixed_count = 3
-                elif "四词" in mode or "4词" in mode:
-                    fixed_count = 4
-
             clean_curr = re.sub(r"[^A-Za-z0-9\u4e00-\u9fff']", "", str(w.get("word", ""))).lower()
             weak_words = {
                 "i", "you", "he", "she", "we", "they", "a", "an", "the", "to", "of", "in", "on",
@@ -7892,7 +8177,7 @@ body {{
                 len(clean_curr) >= 7 or clean_curr in FAITH_WORDS or clean_curr.isupper()
             )
 
-            if "单字" in mode:
+            if exact_single_word:
                 is_break = True
             elif fixed_count:
                 is_break = w_len >= fixed_count or force_break
@@ -7992,7 +8277,7 @@ body {{
                 if w["word"].endswith(":"):
                     is_break = False
 
-                if is_break and should_defer_subtitle_break_for_readability(
+                if not precise_chunk_mode and is_break and should_defer_subtitle_break_for_readability(
                     w.get("word", ""),
                     next_word,
                     segment_word_count=w_len,
@@ -8021,12 +8306,18 @@ body {{
             curr["text"] = format_subtitle_text_spacing(raw_text)
             subs.append(curr)
 
-        if narrative_block or "双行" in mode or "长句" in mode or "约10" in mode:
+        if not precise_chunk_mode and (narrative_block or "双行" in mode or "长句" in mode or "约10" in mode):
             subs = merge_single_word_subtitle_segments(subs, max_merged_words=narrative_merge_words if narrative_block else 18)
 
         subs = self._apply_timing_mode(subs, timing_mode)
         if self.state.get("fill_subtitle_gaps", True):
             subs = self._fill_subtitle_gaps(subs)
+        pacing_merge_words = pacing_merge_word_limit_for_chunk_mode(mode)
+        subs = protect_fast_subtitle_pacing(
+            subs,
+            allow_merge=pacing_merge_words > 0,
+            max_merged_words=pacing_merge_words or 1,
+        )
         return subs
 
     def _fill_subtitle_gaps(self, subs, max_fill=1.20, min_gap=0.05):
@@ -8184,6 +8475,7 @@ body {{
             self.project_autosave_busy = False
 
     def load_project_on_boot(self):
+        self.refresh_project_header()
         room_state = {}
         if isinstance(self.project_data, dict):
             room_state = self.project_data.get("room_state", {}).get("edit_room", {})
@@ -8198,6 +8490,7 @@ body {{
                     merged_default_style.update(room_state.get("default_style", {}))
                 room_state["default_style"] = merged_default_style
                 self.state.update(room_state)
+                self.refresh_project_header()
                 self.default_style.update(merged_default_style)
                 self.state["signature"] = normalize_signature_config(self.state.get("signature"), self.default_style)
                 self.sync_signature_controls()
@@ -8230,7 +8523,7 @@ body {{
                     self._prepare_preview_proxies_for_clips(clips, announce=True)
                     self._prime_video_preview_source(clips[0], announce=True)
                     self.on_resolution_changed(self.state.get("resolution", get_output_resolution()))
-                    self.generate_waveform(clips[0]["path"], "v_wave_pixmap")
+                    self.generate_waveform(clips[0]["path"], "v_wave_pixmap", max_seconds=90)
                     threading.Thread(target=self._gen_thumbs_cache, daemon=True).start()
                 if self.state.get("audio_path") and os.path.exists(self.state.get("audio_path")):
                     self.btn_a.setText("✅ " + os.path.basename(self.state.get("audio_path"))[:15])
@@ -8285,7 +8578,7 @@ body {{
                 self._prepare_preview_proxies_for_clips(clips, announce=True)
                 self._prime_video_preview_source(clips[0], announce=True)
                 self.on_resolution_changed(self.state.get("resolution", get_output_resolution()))
-                self.generate_waveform(clips[0]["path"], "v_wave_pixmap")
+                self.generate_waveform(clips[0]["path"], "v_wave_pixmap", max_seconds=90)
                 threading.Thread(target=self._gen_thumbs_cache, daemon=True).start()
             if self.state.get("audio_path") and os.path.exists(self.state.get("audio_path")):
                 self.btn_a.setText("✅ " + os.path.basename(self.state.get("audio_path"))[:15]); self.audio_player.setSource(QUrl.fromLocalFile(self.state.get("audio_path"))); self.generate_waveform(self.state.get("audio_path"), "a_wave_pixmap")
@@ -8313,17 +8606,23 @@ body {{
         clips = self.state.get("video_clips", [])
         if not clips: return
         try:
-            clip_path = clips[0].get("path", "")
+            clip = self._ensure_clip_import_metadata(clips[0])
+            source_path = clip.get("path", "")
+            if not source_path or not os.path.exists(source_path):
+                return
+            heavy_clip = clip_should_auto_proxy(clip)
+            if heavy_clip and not preview_proxy_is_ready(clip):
+                return
+            clip_path = preview_source_for_clip(clip) if heavy_clip else source_path
             if not clip_path or not os.path.exists(clip_path):
                 return
-            stat = os.stat(clip_path)
-            cache_sig = f"{os.path.abspath(clip_path)}|{stat.st_mtime_ns}|{stat.st_size}"
+            stat = os.stat(source_path)
+            cache_sig = f"{os.path.abspath(source_path)}|{stat.st_mtime_ns}|{stat.st_size}"
             cache_key = hashlib.sha1(cache_sig.encode("utf-8", "replace")).hexdigest()[:18]
             tdir = os.path.join(tempfile.gettempdir(), f"sh_v8_thumbs_{cache_key}")
             os.makedirs(tdir, exist_ok=True)
             if len([f for f in os.listdir(tdir) if f.endswith('.jpg')]) == 0:
-                heavy_clip = clip_should_auto_proxy(self._ensure_clip_import_metadata(clips[0]))
-                thumb_seconds = "60" if heavy_clip else "180"
+                thumb_seconds = "45" if heavy_clip else "180"
                 thumb_fps = "0.25" if heavy_clip else "0.5"
                 thumb_filter = f"fps={thumb_fps},scale=80:45:force_original_aspect_ratio=decrease,pad=80:45:(ow-iw)/2:(oh-ih)/2"
                 subprocess.run(
