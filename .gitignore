@@ -3,9 +3,11 @@ __pycache__/
 *.py[cod]
 *.bak
 .venv/
+wheelhouse/
 venv/
 
 # Local app state and credentials
+/UserData/
 /settings.json
 /settings.*.json
 /effects.json
@@ -18,6 +20,8 @@ venv/
 .env
 .env.*
 *.log
+launch_stdout.txt
+launch_stderr.txt
 
 # Build output
 /build/

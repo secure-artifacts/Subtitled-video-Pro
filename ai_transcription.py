@@ -1,5 +1,8 @@
+import json
 import os
 import re
+import shutil
+import subprocess
 from typing import Callable, Iterable
 
 import requests
@@ -14,6 +17,83 @@ PROVIDER_LABELS = {
     "groq": "Groq Whisper",
     "cloudflare": "Cloudflare Whisper",
 }
+
+
+class _CurlResponse:
+    def __init__(self, status_code, text, stderr="", returncode=0):
+        self.status_code = int(status_code or 0)
+        self.text = text or ""
+        self.stderr = stderr or ""
+        self.returncode = int(returncode or 0)
+
+    def json(self):
+        return json.loads(self.text or "{}")
+
+
+def _curl_executable():
+    return shutil.which("curl.exe") or shutil.which("curl")
+
+
+def _run_curl(args, timeout):
+    exe = _curl_executable()
+    if not exe:
+        raise Exception("curl.exe not found")
+    max_time = max(1, int(timeout or 60))
+    marker = "\n__SUBTITLE_COMPOSER_HTTP_STATUS__:"
+    cmd = [exe, "-sS", "-L", "--max-time", str(max_time), "-w", marker + "%{http_code}", *args]
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        completed = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max_time + 15,
+            creationflags=creationflags,
+        )
+    except subprocess.TimeoutExpired:
+        raise Exception(f"curl request timed out after {max_time}s")
+    stdout = completed.stdout.decode("utf-8", errors="replace")
+    stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+    if marker not in stdout:
+        detail = stderr or stdout[:300] or f"curl exit {completed.returncode}"
+        raise Exception(f"curl request failed: {detail}")
+    body, status_text = stdout.rsplit(marker, 1)
+    try:
+        status_code = int(status_text.strip()[:3])
+    except Exception:
+        status_code = 0
+    if completed.returncode != 0 and status_code == 0:
+        detail = stderr or body[:300] or f"curl exit {completed.returncode}"
+        raise Exception(f"curl request failed: {detail}")
+    return _CurlResponse(status_code, body, stderr=stderr, returncode=completed.returncode)
+
+
+def _groq_request_with_curl(audio_path, key, model, language, timeout):
+    filename = os.path.basename(str(audio_path or "audio.mp3")) or "audio.mp3"
+    file_spec = f"file=@{audio_path};type={_audio_mime(audio_path)};filename={filename}"
+    args = [
+        "-X", "POST", GROQ_TRANSCRIPTION_ENDPOINT,
+        "-H", f"Authorization: Bearer {key}",
+        "-F", file_spec,
+        "-F", f"model={model}",
+        "-F", "response_format=verbose_json",
+        "-F", "temperature=0",
+        "-F", "timestamp_granularities[]=word",
+        "-F", "timestamp_granularities[]=segment",
+    ]
+    if language:
+        args.extend(["-F", f"language={language}"])
+    return _run_curl(args, timeout)
+
+
+def _cloudflare_request_with_curl(audio_path, account, timeout):
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account['id']}/ai/run/@cf/openai/whisper"
+    return _run_curl([
+        "-X", "POST", url,
+        "-H", f"Authorization: Bearer {account['token']}",
+        "-H", "Content-Type: application/octet-stream",
+        "--data-binary", f"@{audio_path}",
+    ], timeout)
 
 
 def _as_clean_list(value):
@@ -175,11 +255,21 @@ def _transcribe_with_groq(audio_path, data, config, timeout):
             else:
                 last_err = f"Groq key {index} HTTP {res.status_code}: {res.text[:300]}"
         except Exception as exc:
-            last_err = f"Groq key {index}: {exc}"
+            try:
+                res = _groq_request_with_curl(audio_path, key, model, language, timeout)
+                if res.status_code == 200:
+                    words = _words_from_verbose_json(res.json())
+                    if words:
+                        return words
+                    last_err = "Groq curl returned a result, but no usable word timestamps"
+                else:
+                    last_err = f"Groq key {index} curl HTTP {res.status_code}: {res.text[:300]}"
+            except Exception as curl_exc:
+                last_err = f"Groq key {index}: {exc}; curl fallback: {curl_exc}"
     raise Exception(last_err or "Groq \u8bf7\u6c42\u5931\u8d25")
 
 
-def _transcribe_with_cloudflare(data, config, timeout):
+def _transcribe_with_cloudflare(audio_path, data, config, timeout):
     accounts = cloudflare_accounts(config)
     if not accounts:
         raise Exception("Cloudflare API \u672a\u914d\u7f6e")
@@ -204,7 +294,21 @@ def _transcribe_with_cloudflare(data, config, timeout):
             else:
                 last_err = f"Cloudflare account {index} HTTP {res.status_code}: {res.text[:300]}"
         except Exception as exc:
-            last_err = f"Cloudflare account {index}: {exc}"
+            try:
+                res = _cloudflare_request_with_curl(audio_path, account, timeout)
+                if res.status_code == 200:
+                    payload = res.json()
+                    if payload.get("success"):
+                        words = _words_from_cloudflare(payload)
+                        if words:
+                            return words
+                        last_err = "Cloudflare curl returned a result, but no usable word timestamps"
+                    else:
+                        last_err = f"Cloudflare account {index} curl: {str(payload)[:300]}"
+                else:
+                    last_err = f"Cloudflare account {index} curl HTTP {res.status_code}: {res.text[:300]}"
+            except Exception as curl_exc:
+                last_err = f"Cloudflare account {index}: {exc}; curl fallback: {curl_exc}"
     raise Exception(last_err or "Cloudflare \u8bf7\u6c42\u5931\u8d25")
 
 
@@ -229,7 +333,7 @@ def transcribe_audio_words(audio_path, progress=None, timeout=60, provider_order
             if provider == "groq":
                 words = _transcribe_with_groq(audio_path, data, config, timeout)
             elif provider == "cloudflare":
-                words = _transcribe_with_cloudflare(data, config, timeout)
+                words = _transcribe_with_cloudflare(audio_path, data, config, timeout)
             else:
                 continue
             _emit_progress(progress, f"\u2705 {label} \u542c\u8bd1\u6210\u529f", "#a6e3a1")

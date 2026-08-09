@@ -6,7 +6,7 @@ from PyQt6.QtCore import Qt, QRectF, QObject, pyqtSignal, pyqtSlot, QPointF
 from PyQt6.QtGui import QBrush, QColor, QPen, QPainter, QFont
 import os
 
-from timeline_interaction import SNAP_STEP_SECONDS, format_timecode, format_timing_label, item_key, parse_item_key, shift_timing, snap_time_with_points, update_selection
+from timeline_interaction import SNAP_STEP_SECONDS, format_timecode, format_timing_label, item_key, parse_item_key, retime_subtitle_clip, shift_timing, snap_time_with_points, update_selection
 
 TRACK_H = 26
 HEADER_H = 22
@@ -536,16 +536,8 @@ class AdvancedTimeline(QGraphicsView):
         self._show_drag_feedback(clip_type, new_start, new_end)
         if clip_type == "sub":
             sub = self.controller.state["subs_data"][idx]
-            old_start = float(sub.get("start", 0)); old_end = float(sub.get("end", 1))
-            old_dur = max(0.001, old_end - old_start); new_dur = max(0.001, new_end - new_start)
-
-            words = sub.get("words", [])
-            for w in words:
-                rel_s = (float(w.get("start", 0)) - old_start) / old_dur
-                rel_e = (float(w.get("end", 1)) - old_start) / old_dur
-                w["start"] = new_start + rel_s * new_dur; w["end"] = new_start + rel_e * new_dur
-
-            sub["start"] = new_start; sub["end"] = new_end; sub["track"] = new_track
+            retime_subtitle_clip(sub, new_start, new_end)
+            sub["track"] = new_track
 
             if hasattr(self.controller, 'ui_entries') and 0 <= idx < len(self.controller.ui_entries):
                 entry_dict = self.controller.ui_entries[idx]

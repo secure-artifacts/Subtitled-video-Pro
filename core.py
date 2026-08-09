@@ -10,13 +10,15 @@ import subprocess
 import time
 import urllib.request
 
+from app_config import CONFIG_FILE
+from app_storage import resolve_user_file
+
 try:
     import requests
 except ImportError:
     pass
 
-CONFIG_FILE = "settings.json"
-EFFECTS_FILE = "effects.json"
+EFFECTS_FILE = resolve_user_file("effects.json", legacy_root=os.getcwd(), kind="config")
 CLOUD_SECRET = os.environ.get("SUBTITLE_COMPOSER_CLOUD_SECRET", "").strip()
 DEFAULT_SYNC_URL = os.environ.get("SUBTITLE_COMPOSER_SYNC_URL", "").strip()
 FFMPEG_DOWNLOAD_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
@@ -120,7 +122,7 @@ def auto_sync_cloud_data(on_complete=None):
         try:
             sync_url = DEFAULT_SYNC_URL
             cloud_secret = CLOUD_SECRET
-            config_path = os.path.join(os.getcwd(), CONFIG_FILE)
+            config_path = CONFIG_FILE
             config_data = {}
             
             if os.path.exists(config_path):
@@ -146,7 +148,7 @@ def auto_sync_cloud_data(on_complete=None):
                     json.dump(config_data, f, indent=4, ensure_ascii=False)
 
             has_effects = False
-            effects_path = os.path.join(os.getcwd(), EFFECTS_FILE)
+            effects_path = EFFECTS_FILE
             try:
                 with open(effects_path, "r", encoding="utf-8") as f: 
                     local_effects = json.load(f)

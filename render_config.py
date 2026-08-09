@@ -250,18 +250,23 @@ def describe_render_profile(profile=None):
 def build_video_encoder_args(profile=None, quality="deliver"):
     profile = profile or get_render_profile()
     encoder = profile.get("encoder", "libx264")
+    fast_quality = str(quality or "").lower() in {"batch_fast", "deliver_fast", "fast", "speed", "极速出片"}
+    batch_quality = str(quality or "").lower() == "batch"
     if encoder == "h264_nvenc":
-        cq = "23" if quality == "batch" else "24"
-        return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", cq, "-b:v", "0", "-pix_fmt", "yuv420p"]
+        cq = "31" if fast_quality else ("23" if batch_quality else "24")
+        preset = "p1" if fast_quality else "p4"
+        return ["-c:v", "h264_nvenc", "-preset", preset, "-cq", cq, "-b:v", "0", "-pix_fmt", "yuv420p"]
     if encoder == "h264_qsv":
-        q = "23" if quality == "batch" else "24"
+        q = "31" if fast_quality else ("23" if batch_quality else "24")
         return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", q, "-pix_fmt", "yuv420p"]
     if encoder == "h264_amf":
-        qp = "22" if quality == "batch" else "24"
+        qp = "31" if fast_quality else ("22" if batch_quality else "24")
         return ["-c:v", "h264_amf", "-quality", "speed", "-rc", "cqp", "-qp_i", qp, "-qp_p", qp, "-pix_fmt", "yuv420p"]
     if encoder == "h264_videotoolbox":
-        return ["-c:v", "h264_videotoolbox", "-q:v", "55", "-pix_fmt", "yuv420p"]
+        qv = "70" if fast_quality else "55"
+        return ["-c:v", "h264_videotoolbox", "-q:v", qv, "-pix_fmt", "yuv420p"]
 
     threads = str(max(1, int(profile.get("cpu_threads", os.cpu_count() or 4))))
-    crf = "22" if quality == "batch" else "24"
-    return ["-c:v", "libx264", "-preset", "superfast", "-crf", crf, "-threads", threads, "-pix_fmt", "yuv420p"]
+    crf = "30" if fast_quality else ("22" if batch_quality else "24")
+    preset = "ultrafast" if fast_quality else "superfast"
+    return ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-threads", threads, "-pix_fmt", "yuv420p"]

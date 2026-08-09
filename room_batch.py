@@ -31,10 +31,13 @@ from app_theme import apply_tinted_styles
 from room_theme_bridge import apply_room_theme_bridge
 from app_config import get_output_resolution, load_app_config, resolution_to_size
 from ai_transcription import transcribe_audio_words
+from caption_rewrite import build_full_text_subtitle
 from app_storage import read_json_file, resolve_user_file, write_json_file
 from render_config import build_video_encoder_args, get_render_profile
 from render_pipeline_model import ffconcat_file_entry, ffconcat_inout_entry, ffmpeg_canvas_source, ffmpeg_layer_overlay_xy, ffmpeg_layer_scale_filter
-from render_timing import active_subtitles_for_frame, build_subtitle_frame_schedule, render_tail_padding_seconds, subtitle_supersample
+from render_timing import active_subtitles_for_frame, build_subtitle_frame_schedule, render_tail_padding_seconds, subtitle_continuous_fps, subtitle_event_fps, subtitle_supersample
+from render_performance import export_render_profile, simplify_signature_for_export, simplify_subtitle_for_export
+from font_assets import font_face_css
 # 确保导入了 get_exact_duration
 from ui_components import (
     get_exact_duration, get_video_dimensions, render_signature_html, render_subtitle_html,
@@ -44,22 +47,38 @@ from ui_components import (
     format_subtitle_text_spacing,
     default_signature_config, normalize_signature_config,
     should_defer_subtitle_break_for_readability,
-    merge_single_word_subtitle_segments, protect_fast_subtitle_pacing,
+    merge_single_word_subtitle_segments, merge_short_subtitle_segments, protect_fast_subtitle_pacing,
     FAITH_WORDS
 )
 from project_io import create_reel, sync_project_assets_to_project_dir, update_room_state, save_project
 from workspace_config import WORKSPACE_MODE_CLOUD, get_active_workspace, get_workspace_config
 from job_control import CooperativeJobControl
 from caption_presets import (
+    chunk_mode_options,
     LEGACY_NARRATIVE_CHUNK_MODE,
     REFERENCE_NARRATIVE_CHUNK_MODE,
+    chunk_mode_preserves_caption_blocks,
     fixed_word_count_for_chunk_mode,
     pacing_merge_word_limit_for_chunk_mode,
     is_exact_single_word_chunk_mode,
+    is_full_text_chunk_mode,
+    is_smart_transcription_chunk_mode,
     is_reference_narrative_chunk_mode,
+    smart_transcription_word_bounds,
+    make_fixed_chunk_mode_label,
+    make_smart_chunk_mode_label,
     merge_built_in_style_presets,
     narrative_chunk_merge_words,
     narrative_chunk_word_bounds,
+)
+from caption_mode_presets import (
+    caption_mode_config_from_values,
+    delete_caption_mode_preset,
+    ensure_caption_mode_options,
+    is_built_in_caption_mode_preset,
+    load_caption_mode_presets,
+    normalize_caption_mode_preset,
+    save_caption_mode_preset,
 )
 
 PRESETS_FILE = resolve_user_file("style_presets.json", legacy_root=os.getcwd(), kind="config")
@@ -675,6 +694,7 @@ class BatchView(QWidget):
         self.batch_music_paths = []
         self.batch_assembly_paths = []
         self.smart_queue_groups = []
+        self.smart_queue_sequence_start = "auto"
         self.multi_project_packages = []
         self.task_queue = []
         self.batch_queues = []
@@ -789,8 +809,9 @@ class BatchView(QWidget):
 
         top_header.addWidget(QLabel("⚡ 性能:", styleSheet="color: #f9e2af; font-weight: bold; margin-left: 8px;"))
         self.performance_mode = QComboBox()
-        self.performance_mode.addItems(["标准画质", "轻量模式", "极速模式"])
-        self.performance_mode.setToolTip("轻量/极速会降低字幕透明层的超采样，减少内存和 CPU 占用；最终字幕锐度会略低。")
+        self.performance_mode.addItems(["极限速度", "极速模式", "轻量模式", "标准画质"])
+        self.performance_mode.setCurrentText("极限速度")
+        self.performance_mode.setToolTip("默认极限速度：批量会降低字幕透明层采样、压低连续动画采样并使用最快编码；需要更锐利时再切轻量/标准。")
         self.performance_mode.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 10px; font-weight: bold; border-radius: 5px;")
         top_header.addWidget(self.performance_mode)
 
@@ -823,12 +844,12 @@ class BatchView(QWidget):
         self.btn_apply_all_y.clicked.connect(self.apply_global_subtitle_y_to_rows)
         top_header.addWidget(self.btn_apply_all_y)
 
-        top_header.addWidget(QLabel("✂️ AI断句:", styleSheet="color: #89b4fa; font-weight: bold; margin-left: 15px;"))
+        self._syncing_chunk_controls = False
         self.chunk_mode = QComboBox()
-        self.chunk_mode.addItems(["单字轰炸 (1字/句)", "智能重点短句 (3-4词为主)", "智能听译 (4-7词，适配双行按词)", REFERENCE_NARRATIVE_CHUNK_MODE, LEGACY_NARRATIVE_CHUNK_MODE, "自然短句 (1-4词)", "双词节奏 (2词/句)", "三词短句 (3词/句)", "四词短句 (4词/句)", "短句快闪 (3-5字)", "长句大段 (约10字)"])
-        self.chunk_mode.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 10px; font-weight: bold; border-radius: 5px;")
-        top_header.addWidget(self.chunk_mode)
-
+        self.chunk_mode.addItems(chunk_mode_options())
+        ensure_caption_mode_options(self.chunk_mode)
+        self.chunk_mode.currentTextChanged.connect(self._on_chunk_mode_change)
+        self.chunk_mode.setVisible(False)
         top_header.addWidget(QLabel("🎚️ 时间:", styleSheet="color: #cba6f7; font-weight: bold; margin-left: 10px;"))
         self.timing_mode = QComboBox()
         self.timing_mode.addItems(["L Cut (字幕提前进入)", "J Cut (字幕稍后收尾)", "对齐声音 (按停顿)"])
@@ -853,6 +874,71 @@ class BatchView(QWidget):
         top_header.addWidget(self.btn_set_out_dir)
 
         main_layout.addLayout(top_header)
+
+        self.chunk_param_frame = QFrame()
+        self.chunk_param_frame.setStyleSheet("QFrame { background-color: #181825; border: 1px solid #313244; border-radius: 6px; }")
+        chunk_param_layout = QHBoxLayout(self.chunk_param_frame)
+        chunk_param_layout.setContentsMargins(10, 6, 10, 6)
+        chunk_param_layout.setSpacing(8)
+        chunk_param_layout.addWidget(QLabel("听译预设:", styleSheet="color:#89b4fa; font-weight:bold; border:none;"))
+        self.caption_mode_preset_combo = QComboBox()
+        self.caption_mode_preset_combo.setFixedWidth(190)
+        self.caption_mode_preset_combo.setToolTip("选择后自动套用听译模式；右侧可继续微调固定/智能词数。")
+        self.caption_mode_preset_combo.setStyleSheet("background-color:#313244; color:#cdd6f4; padding:4px; border-radius:4px;")
+        chunk_param_layout.addWidget(self.caption_mode_preset_combo)
+        self.btn_save_caption_mode_preset = QPushButton("保存")
+        self.btn_delete_caption_mode_preset = QPushButton("删除")
+        for btn in (self.btn_save_caption_mode_preset, self.btn_delete_caption_mode_preset):
+            btn.setFixedHeight(26)
+            btn.setStyleSheet("background-color:#242b3f; color:#cdd6f4; border:1px solid #3a425a; border-radius:5px; font-weight:800;")
+            chunk_param_layout.addWidget(btn)
+
+        chunk_param_layout.addWidget(QLabel("字数:", styleSheet="color:#89b4fa; font-weight:bold; border:none;"))
+        self.chunk_strategy_combo = QComboBox()
+        self.chunk_strategy_combo.addItem("智能范围", "smart")
+        self.chunk_strategy_combo.addItem("固定字数", "fixed")
+        self.chunk_strategy_combo.setFixedWidth(98)
+        self.chunk_strategy_combo.setStyleSheet("background-color:#313244; color:#cdd6f4; padding:4px; border-radius:4px;")
+        chunk_param_layout.addWidget(self.chunk_strategy_combo)
+
+        chunk_param_layout.addWidget(QLabel("固定:", styleSheet="color:#a6adc8; border:none;"))
+        self.fixed_chunk_words_combo = QComboBox()
+        for count in range(1, 13):
+            self.fixed_chunk_words_combo.addItem(f"{count}词", count)
+        self.fixed_chunk_words_combo.setFixedWidth(66)
+        self.fixed_chunk_words_combo.setStyleSheet("background-color:#313244; color:#cdd6f4; padding:4px; border-radius:4px;")
+        chunk_param_layout.addWidget(self.fixed_chunk_words_combo)
+
+        chunk_param_layout.addWidget(QLabel("智能最小", styleSheet="color:#a6adc8; border:none;"))
+        self.smart_min_words_spin = QSpinBox()
+        self.smart_min_words_spin.setRange(1, 30)
+        self.smart_min_words_spin.setValue(4)
+        self.smart_min_words_spin.setFixedWidth(56)
+        self.smart_min_words_spin.setStyleSheet("background-color:#313244; color:#cdd6f4; padding:3px; border-radius:4px;")
+        chunk_param_layout.addWidget(self.smart_min_words_spin)
+
+        chunk_param_layout.addWidget(QLabel("最大", styleSheet="color:#a6adc8; border:none;"))
+        self.smart_max_words_spin = QSpinBox()
+        self.smart_max_words_spin.setRange(1, 30)
+        self.smart_max_words_spin.setValue(7)
+        self.smart_max_words_spin.setFixedWidth(56)
+        self.smart_max_words_spin.setStyleSheet("background-color:#313244; color:#cdd6f4; padding:3px; border-radius:4px;")
+        chunk_param_layout.addWidget(self.smart_max_words_spin)
+
+        self.chunk_param_preview = QLabel("")
+        self.chunk_param_preview.setStyleSheet("color:#a6e3a1; font-size:12px; border:none;")
+        self.chunk_param_preview.setWordWrap(True)
+        chunk_param_layout.addWidget(self.chunk_param_preview, stretch=1)
+
+        self.chunk_strategy_combo.currentIndexChanged.connect(self._on_chunk_param_change)
+        self.fixed_chunk_words_combo.currentIndexChanged.connect(self._on_chunk_param_change)
+        self.smart_min_words_spin.valueChanged.connect(self._on_chunk_min_words_change)
+        self.smart_max_words_spin.valueChanged.connect(self._on_chunk_max_words_change)
+        self.caption_mode_preset_combo.currentTextChanged.connect(self.apply_caption_mode_preset)
+        self.btn_save_caption_mode_preset.clicked.connect(self.save_caption_mode_preset_from_controls)
+        self.btn_delete_caption_mode_preset.clicked.connect(self.delete_caption_mode_preset_from_controls)
+        self.refresh_caption_mode_preset_combo()
+        self._sync_chunk_controls_from_mode(self.chunk_mode.currentText())
 
         music_row = QHBoxLayout()
         music_row.setSpacing(8)
@@ -1024,13 +1110,14 @@ class BatchView(QWidget):
             "smart_queue_groups": self._current_smart_queue_groups() if hasattr(self, "smart_queue_groups") else [],
             "smart_queue_mode": self._smart_queue_mode() if hasattr(self, "smart_queue_mode_combo") else "cycle",
             "smart_queue_cut_mode": self._smart_queue_cut_mode() if hasattr(self, "smart_queue_cut_combo") else "single",
+            "smart_queue_sequence_start": self._smart_queue_sequence_start_key() if hasattr(self, "smart_queue_sequence_start_combo") else "auto",
             "multi_project_enabled": False,
             "multi_project_packages": [],
             "performance_mode": self.performance_mode.currentText() if hasattr(self, "performance_mode") else "",
             "preset_name": self.preset_combo.currentText() if hasattr(self, "preset_combo") else "",
             "signature_preset_name": self.signature_preset_combo.currentData(Qt.ItemDataRole.UserRole) if hasattr(self, "signature_preset_combo") else "",
             "subtitle_y": self.batch_subtitle_y() if hasattr(self, "global_subtitle_y_spin") else 25.0,
-            "chunk_mode": self.chunk_mode.currentText() if hasattr(self, "chunk_mode") else "",
+            "chunk_mode": self._effective_chunk_mode() if hasattr(self, "chunk_mode") else "",
             "timing_mode": self.timing_mode.currentText() if hasattr(self, "timing_mode") else "",
             "table_rows": [],
         }
@@ -1084,17 +1171,233 @@ class BatchView(QWidget):
             "smart_queue_groups": self._current_smart_queue_groups(),
             "smart_queue_mode": self._smart_queue_mode(),
             "smart_queue_cut_mode": self._smart_queue_cut_mode(),
+            "smart_queue_sequence_start": self._smart_queue_sequence_start_key(),
             "multi_project_enabled": False,
             "multi_project_packages": [],
             "performance_mode": self.performance_mode.currentText(),
             "preset_name": self.preset_combo.currentText(),
             "signature_preset_name": self.signature_preset_combo.currentData(Qt.ItemDataRole.UserRole) if hasattr(self, "signature_preset_combo") else "",
             "subtitle_y": self.batch_subtitle_y(),
-            "chunk_mode": self.chunk_mode.currentText(),
+            "chunk_mode": self._effective_chunk_mode(),
             "timing_mode": self.timing_mode.currentText(),
             "table_rows": self._table_rows_state(),
         })
         self._update_queue_stats()
+
+    def refresh_caption_mode_preset_combo(self, current_name=""):
+        combo = getattr(self, "caption_mode_preset_combo", None)
+        if combo is None:
+            return
+        presets = load_caption_mode_presets()
+        combo.blockSignals(True)
+        combo.clear()
+        for name in presets.keys():
+            combo.addItem(name)
+        if current_name:
+            idx = combo.findText(current_name)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+        ensure_caption_mode_options(getattr(self, "chunk_mode", None), presets)
+
+    def _select_caption_mode_preset_for_mode(self, mode):
+        combo = getattr(self, "caption_mode_preset_combo", None)
+        if combo is None:
+            return
+        target = str(mode or "").strip()
+        if not target:
+            return
+        presets = load_caption_mode_presets()
+        matched_name = ""
+        for name, cfg in presets.items():
+            if normalize_caption_mode_preset(cfg).get("chunk_mode", "") == target:
+                matched_name = name
+                break
+        if not matched_name:
+            return
+        idx = combo.findText(matched_name)
+        if idx >= 0 and idx != combo.currentIndex():
+            combo.blockSignals(True)
+            combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+    def apply_caption_mode_preset(self, *_):
+        combo = getattr(self, "caption_mode_preset_combo", None)
+        if combo is None:
+            return
+        name = combo.currentText()
+        presets = load_caption_mode_presets()
+        if name not in presets:
+            return
+        cfg = normalize_caption_mode_preset(presets[name])
+        mode = cfg.get("chunk_mode", "")
+        self._ensure_chunk_mode_option(mode)
+        self.chunk_mode.blockSignals(True)
+        self.chunk_mode.setCurrentText(mode)
+        self.chunk_mode.blockSignals(False)
+        timing = cfg.get("timing_mode", "")
+        if timing and hasattr(self, "timing_mode"):
+            idx = self.timing_mode.findText(timing)
+            if idx >= 0:
+                self.timing_mode.setCurrentIndex(idx)
+        self._sync_chunk_controls_from_mode(mode)
+        self._capture_current_queue_state()
+        if hasattr(self, "sig_log"):
+            self.sig_log.emit(f"已调用听译预设：{name}", "#a6e3a1")
+
+    def save_caption_mode_preset_from_controls(self):
+        default_name = getattr(self, "caption_mode_preset_combo", None).currentText() if getattr(self, "caption_mode_preset_combo", None) else ""
+        if is_built_in_caption_mode_preset(default_name):
+            default_name = ""
+        name, ok = QInputDialog.getText(self, "保存听译预设", "预设名称：", text=default_name)
+        name = str(name or "").strip()
+        if not ok or not name:
+            return
+        if is_built_in_caption_mode_preset(name):
+            QMessageBox.information(self, "内置预设", "内置预设不能覆盖，请换一个自己的名称。")
+            return
+        mode = self._build_chunk_mode_from_params() if hasattr(self, "chunk_strategy_combo") else self.chunk_mode.currentText()
+        cfg = caption_mode_config_from_values(
+            mode,
+            self.timing_mode.currentText() if hasattr(self, "timing_mode") else "",
+            self.chunk_strategy_combo.currentData() if hasattr(self, "chunk_strategy_combo") else "",
+            self.fixed_chunk_words_combo.currentData() if hasattr(self, "fixed_chunk_words_combo") else 1,
+            self.smart_min_words_spin.value() if hasattr(self, "smart_min_words_spin") else 4,
+            self.smart_max_words_spin.value() if hasattr(self, "smart_max_words_spin") else 7,
+        )
+        save_caption_mode_preset(name, cfg)
+        self.refresh_caption_mode_preset_combo(name)
+        self._capture_current_queue_state()
+        if hasattr(self, "sig_log"):
+            self.sig_log.emit(f"听译预设已保存：{name}", "#a6e3a1")
+
+    def delete_caption_mode_preset_from_controls(self):
+        combo = getattr(self, "caption_mode_preset_combo", None)
+        if combo is None:
+            return
+        name = combo.currentText()
+        if not name or is_built_in_caption_mode_preset(name):
+            QMessageBox.information(self, "内置预设", "内置听译预设不能删除。")
+            return
+        if delete_caption_mode_preset(name):
+            self.refresh_caption_mode_preset_combo()
+            self._capture_current_queue_state()
+            if hasattr(self, "sig_log"):
+                self.sig_log.emit(f"听译预设已删除：{name}", "#a6e3a1")
+
+    def _ensure_chunk_mode_option(self, mode):
+        if not mode or not hasattr(self, "chunk_mode"):
+            return
+        if self.chunk_mode.findText(mode) < 0:
+            self.chunk_mode.addItem(mode)
+
+    def _chunk_fixed_count_for_mode(self, mode):
+        if is_exact_single_word_chunk_mode(mode):
+            return 1
+        return fixed_word_count_for_chunk_mode(mode)
+
+    def _chunk_range_for_mode(self, mode):
+        min_words, max_words = narrative_chunk_word_bounds(mode)
+        if max_words > 0:
+            return min_words, max_words
+        min_words, max_words = smart_transcription_word_bounds(mode)
+        if max_words > 0:
+            return min_words, max_words
+        text = str(mode or "")
+        match = re.search(r"(\d+)\s*-\s*(\d+)", text)
+        if match:
+            left, right = int(match.group(1)), int(match.group(2))
+            return max(1, min(left, right)), min(30, max(left, right))
+        if "约10" in text or "10" in text:
+            return 8, 12
+        return 4, 7
+
+    def _sync_chunk_controls_from_mode(self, mode):
+        if not hasattr(self, "chunk_strategy_combo"):
+            return
+        self._syncing_chunk_controls = True
+        fixed_count = self._chunk_fixed_count_for_mode(mode)
+        if fixed_count > 0:
+            self.chunk_strategy_combo.setCurrentIndex(1)
+            idx = self.fixed_chunk_words_combo.findData(fixed_count)
+            if idx < 0:
+                self.fixed_chunk_words_combo.addItem(f"{fixed_count}词", fixed_count)
+                idx = self.fixed_chunk_words_combo.findData(fixed_count)
+            self.fixed_chunk_words_combo.setCurrentIndex(max(0, idx))
+        else:
+            self.chunk_strategy_combo.setCurrentIndex(0)
+            min_words, max_words = self._chunk_range_for_mode(mode)
+            self.smart_min_words_spin.setValue(min_words)
+            self.smart_max_words_spin.setValue(max_words)
+        self._syncing_chunk_controls = False
+        self._select_caption_mode_preset_for_mode(mode)
+        self._refresh_chunk_param_controls()
+
+    def _refresh_chunk_param_controls(self):
+        if not hasattr(self, "chunk_strategy_combo"):
+            return
+        fixed_mode = self.chunk_strategy_combo.currentData() == "fixed"
+        self.fixed_chunk_words_combo.setEnabled(fixed_mode)
+        self.smart_min_words_spin.setEnabled(not fixed_mode)
+        self.smart_max_words_spin.setEnabled(not fixed_mode)
+        if hasattr(self, "chunk_param_preview"):
+            self.chunk_param_preview.setText(f"实际听译模式: {self._effective_chunk_mode()}")
+
+    def _build_chunk_mode_from_params(self):
+        if not hasattr(self, "chunk_strategy_combo"):
+            return self.chunk_mode.currentText() if hasattr(self, "chunk_mode") else ""
+        preset = self.chunk_mode.currentText()
+        if self.chunk_strategy_combo.currentData() == "fixed":
+            return make_fixed_chunk_mode_label(self.fixed_chunk_words_combo.currentData() or 1)
+        min_words = self.smart_min_words_spin.value()
+        max_words = self.smart_max_words_spin.value()
+        if self._chunk_fixed_count_for_mode(preset) == 0 and self._chunk_range_for_mode(preset) == (min_words, max_words):
+            return preset
+        return make_smart_chunk_mode_label(min_words, max_words, preset)
+
+    def _effective_chunk_mode(self):
+        if not hasattr(self, "chunk_mode"):
+            return ""
+        if hasattr(self, "chunk_strategy_combo"):
+            mode = self._build_chunk_mode_from_params()
+            self._ensure_chunk_mode_option(mode)
+            return mode
+        return self.chunk_mode.currentText()
+
+    def _apply_chunk_mode_from_params(self):
+        if getattr(self, "_syncing_chunk_controls", False):
+            return
+        mode = self._build_chunk_mode_from_params()
+        self._syncing_chunk_controls = True
+        self._ensure_chunk_mode_option(mode)
+        self.chunk_mode.setCurrentText(mode)
+        self._syncing_chunk_controls = False
+        self._select_caption_mode_preset_for_mode(mode)
+        self._refresh_chunk_param_controls()
+        self._capture_current_queue_state()
+
+    def _on_chunk_param_change(self, *args):
+        self._apply_chunk_mode_from_params()
+
+    def _on_chunk_min_words_change(self, value):
+        if getattr(self, "_syncing_chunk_controls", False):
+            return
+        if value > self.smart_max_words_spin.value():
+            self.smart_max_words_spin.setValue(value)
+        self._apply_chunk_mode_from_params()
+
+    def _on_chunk_max_words_change(self, value):
+        if getattr(self, "_syncing_chunk_controls", False):
+            return
+        if value < self.smart_min_words_spin.value():
+            self.smart_min_words_spin.setValue(value)
+        self._apply_chunk_mode_from_params()
+
+    def _on_chunk_mode_change(self, text):
+        if getattr(self, "_syncing_chunk_controls", False):
+            self._refresh_chunk_param_controls()
+            return
+        self._sync_chunk_controls_from_mode(text)
+        self._capture_current_queue_state()
 
     def _clear_table_rows(self):
         if not hasattr(self, "table_layout"):
@@ -1131,10 +1434,19 @@ class BatchView(QWidget):
             self.lbl_input.setText(self.input_dir or "未选择")
             self.lbl_output.setText(f"当前输出路径: {self.output_dir}" if self.output_dir else "当前输出路径: 未选择 (将默认存放在原视频同目录)")
             self.lbl_project_output.setText(f"批量建工程目录: {self.project_output_dir}" if self.project_output_dir else "批量建工程目录: 未选择（默认当前工作区/批量工程_时间）")
-            for combo, key in ((self.audio_mode, "audio_mode"), (self.performance_mode, "performance_mode"), (self.preset_combo, "preset_name"), (self.chunk_mode, "chunk_mode"), (self.timing_mode, "timing_mode")):
+            for combo, key in ((self.audio_mode, "audio_mode"), (self.performance_mode, "performance_mode"), (self.preset_combo, "preset_name"), (self.timing_mode, "timing_mode")):
                 value = state.get(key, "")
+                if key == "performance_mode" and value == "标准画质":
+                    continue
                 if value:
                     combo.setCurrentText(value)
+            chunk_value = state.get("chunk_mode", "")
+            if chunk_value:
+                self._ensure_chunk_mode_option(chunk_value)
+                self.chunk_mode.setCurrentText(chunk_value)
+                self._sync_chunk_controls_from_mode(chunk_value)
+            else:
+                self._sync_chunk_controls_from_mode(self.chunk_mode.currentText())
             if hasattr(self, "signature_preset_combo"):
                 sig_name = state.get("signature_preset_name", "")
                 sig_idx = self.signature_preset_combo.findData(sig_name, Qt.ItemDataRole.UserRole)
@@ -1154,6 +1466,7 @@ class BatchView(QWidget):
             self._set_smart_queue_groups(state.get("smart_queue_groups", []))
             self._set_smart_queue_mode(state.get("smart_queue_mode", "cycle"))
             self._set_smart_queue_cut_mode(state.get("smart_queue_cut_mode", "single"))
+            self._set_smart_queue_sequence_start(state.get("smart_queue_sequence_start", "auto"))
             if hasattr(self, "chk_smart_queue"):
                 self.chk_smart_queue.blockSignals(True)
                 self.chk_smart_queue.setChecked(bool(state.get("smart_queue_enabled", False)))
@@ -1718,6 +2031,80 @@ class BatchView(QWidget):
         combo.setCurrentIndex(idx if idx >= 0 else 0)
         combo.blockSignals(False)
 
+    def _smart_queue_sequence_start_value(self, group):
+        return f"name:{str(group.get('name', '')).strip()}"
+
+    def _smart_queue_sequence_start_name(self, key):
+        key = str(key or "auto")
+        if key.startswith("name:"):
+            return key[5:].strip()
+        return "" if key == "auto" else key.strip()
+
+    def _smart_queue_sequence_start_key(self, state=None):
+        if isinstance(state, dict):
+            return str(state.get("smart_queue_sequence_start", "auto") or "auto")
+        combo = getattr(self, "smart_queue_sequence_start_combo", None)
+        if combo is not None and combo.count():
+            return str(combo.currentData(Qt.ItemDataRole.UserRole) or "auto")
+        return str(getattr(self, "smart_queue_sequence_start", "auto") or "auto")
+
+    def _smart_queue_sequence_start_combo_index(self, combo, key):
+        key = str(key or "auto")
+        for idx in range(combo.count()):
+            data = str(combo.itemData(idx, Qt.ItemDataRole.UserRole) or "auto")
+            if data == key:
+                return idx
+        target_name = self._smart_queue_sequence_start_name(key)
+        if target_name:
+            for idx in range(combo.count()):
+                data = str(combo.itemData(idx, Qt.ItemDataRole.UserRole) or "auto")
+                if self._smart_queue_sequence_start_name(data) == target_name:
+                    return idx
+        return 0
+
+    def _set_smart_queue_sequence_start(self, key):
+        self.smart_queue_sequence_start = str(key or "auto")
+        combo = getattr(self, "smart_queue_sequence_start_combo", None)
+        if combo is None:
+            return
+        idx = self._smart_queue_sequence_start_combo_index(combo, self.smart_queue_sequence_start)
+        combo.blockSignals(True)
+        combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+        self.smart_queue_sequence_start = str(combo.currentData(Qt.ItemDataRole.UserRole) or "auto")
+
+    def _smart_queue_sequence_start_group(self, groups, key=None):
+        target_name = self._smart_queue_sequence_start_name(key if key is not None else self._smart_queue_sequence_start_key())
+        if not target_name:
+            return None
+        for group in self._normalize_smart_queue_groups(groups):
+            if group.get("name", "") == target_name and self._normalize_batch_assembly_paths(group.get("paths", [])):
+                return group
+        return None
+
+    def _smart_queue_sequence_start_label(self, groups=None, key=None):
+        source_groups = self._current_smart_queue_groups() if groups is None else groups
+        group = self._smart_queue_sequence_start_group(source_groups, key)
+        return str(group.get("name", "")) if group else ""
+
+    def _refresh_smart_queue_sequence_start_options(self, groups):
+        combo = getattr(self, "smart_queue_sequence_start_combo", None)
+        if combo is None:
+            return
+        current_key = str(getattr(self, "smart_queue_sequence_start", "auto") or "auto")
+        if combo.count():
+            current_key = str(combo.currentData(Qt.ItemDataRole.UserRole) or current_key or "auto")
+        active_groups = self._active_smart_queue_groups(groups)
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("开头自动", userData="auto")
+        for group in active_groups:
+            name = str(group.get("name", "")).strip()
+            combo.addItem(f"固定开头：{name}", userData=self._smart_queue_sequence_start_value(group))
+        combo.setCurrentIndex(self._smart_queue_sequence_start_combo_index(combo, current_key))
+        self.smart_queue_sequence_start = str(combo.currentData(Qt.ItemDataRole.UserRole) or "auto")
+        combo.blockSignals(False)
+
     def _smart_queue_cut_label(self, mode=None, group_count=0):
         mode = mode or self._smart_queue_cut_mode()
         if mode == "auto":
@@ -1875,16 +2262,24 @@ class BatchView(QWidget):
         enabled_hint = f" (\u542f\u7528 {len(active_groups)}/{len(filled_groups)} \u4e2a\u6709\u7d20\u6750\u7ec4)" if len(active_groups) != len(filled_groups) else ""
         mode = {"cycle": "\u52fe\u9009\u7ec4\u8f6e\u6362", "random": "\u968f\u673a\u4e3b\u4f53", "match": "\u5173\u952e\u8bcd\u5339\u914d"}.get(self._smart_queue_mode(), "\u52fe\u9009\u7ec4\u8f6e\u6362")
         cut_label = self._smart_queue_cut_label(group_count=len(active_groups))
+        start_label = self._smart_queue_sequence_start_label(active_groups) if self._smart_queue_cut_mode() == "sequence" else ""
+        if start_label:
+            cut_label = f"{cut_label} · 开头{start_label}"
         return f"{mode} / {cut_label}: " + " / ".join(parts) + suffix + enabled_hint
 
     def _refresh_smart_queue_controls(self, *_):
         groups = self._current_smart_queue_groups() if hasattr(self, "smart_queue_groups") else []
         active_groups = self._active_smart_queue_groups(groups)
+        self._refresh_smart_queue_sequence_start_options(groups)
         self._rebuild_smart_queue_group_options(groups)
         enabled = bool(getattr(self, "chk_smart_queue", None) and self.chk_smart_queue.isChecked())
         for widget in (getattr(self, "smart_queue_mode_combo", None), getattr(self, "smart_queue_cut_combo", None), getattr(self, "btn_clear_smart_queue", None)):
             if widget is not None:
                 widget.setEnabled(bool(groups))
+        sequence_start_enabled = bool(active_groups) and self._smart_queue_cut_mode() == "sequence"
+        for widget in (getattr(self, "lbl_smart_queue_sequence_start", None), getattr(self, "smart_queue_sequence_start_combo", None)):
+            if widget is not None:
+                widget.setEnabled(sequence_start_enabled)
         for widget in (
             getattr(self, "btn_add_smart_queue_group", None),
             getattr(self, "btn_import_smart_queue_folder", None),
@@ -2039,11 +2434,11 @@ class BatchView(QWidget):
                         return group
         return groups[row_index % len(groups)]
 
-    def _smart_queue_group_order(self, groups, row, row_index, rng, mode):
+    def _smart_queue_group_order(self, groups, row, row_index, rng, mode, sequence_start_key="auto"):
         groups = [group for group in self._normalize_smart_queue_groups(groups) if self._normalize_batch_assembly_paths(group.get("paths", []))]
         if not groups:
             return []
-        selected = self._select_smart_queue_group(groups, row, row_index, rng, mode)
+        selected = self._smart_queue_sequence_start_group(groups, sequence_start_key) or self._select_smart_queue_group(groups, row, row_index, rng, mode)
         if not selected:
             return groups
         selected_name = selected.get("name", "")
@@ -2058,11 +2453,11 @@ class BatchView(QWidget):
             ordered = [head] + rest
         return ordered
 
-    def _smart_queue_groups_for_cut(self, groups, row, row_index, rng, select_mode, cut_mode):
-        ordered = self._smart_queue_group_order(groups, row, row_index, rng, select_mode)
+    def _smart_queue_groups_for_cut(self, groups, row, row_index, rng, select_mode, cut_mode, sequence_start_key="auto"):
+        cut_mode = cut_mode if cut_mode in {"auto", "single", "parallel", "cross", "sequence"} else "auto"
+        ordered = self._smart_queue_group_order(groups, row, row_index, rng, select_mode, sequence_start_key if cut_mode == "sequence" else "auto")
         if not ordered:
             return []
-        cut_mode = cut_mode if cut_mode in {"auto", "single", "parallel", "cross", "sequence"} else "auto"
         if cut_mode == "auto":
             if len(ordered) >= 3:
                 cut_mode = "cross"
@@ -2553,13 +2948,29 @@ class BatchView(QWidget):
     def batch_subtitle_y(self):
         return float(self.global_subtitle_y_spin.value()) if hasattr(self, "global_subtitle_y_spin") else 25.0
 
-    def subtitle_render_scale(self, mode_text=None):
-        mode = mode_text or (self.performance_mode.currentText() if hasattr(self, "performance_mode") else "标准画质")
-        if "极速" in mode:
-            return 1.0
+    def batch_export_quality_mode(self, mode_text=None):
+        mode = mode_text or (self.performance_mode.currentText() if hasattr(self, "performance_mode") else "极限速度")
+        if "标准" in mode:
+            return "标准高清"
         if "轻量" in mode:
-            return min(float(SUBTITLE_SUPERSAMPLE), 1.25)
-        return float(SUBTITLE_SUPERSAMPLE)
+            return "清晰快速"
+        return "极速出片"
+
+    def batch_render_profile(self, mode_text=None):
+        return export_render_profile(
+            self.batch_export_quality_mode(mode_text),
+            default_scale=SUBTITLE_SUPERSAMPLE,
+            default_event_fps=subtitle_event_fps(),
+            default_continuous_fps=subtitle_continuous_fps(),
+        )
+
+    def batch_encoder_quality(self, mode_text=None):
+        mode = mode_text or (self.performance_mode.currentText() if hasattr(self, "performance_mode") else "极限速度")
+        return "batch" if "标准" in mode else "batch_fast"
+
+    def subtitle_render_scale(self, mode_text=None):
+        profile = self.batch_render_profile(mode_text)
+        return float(profile.get("render_scale", SUBTITLE_SUPERSAMPLE) or SUBTITLE_SUPERSAMPLE)
 
     def open_paste_dialog(self, auto_add=False):
         dialog = QDialog(self)
@@ -2987,6 +3398,15 @@ class BatchView(QWidget):
         self.smart_queue_cut_combo.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 8px; font-weight: bold; border-radius: 5px;")
         self.smart_queue_cut_combo.currentIndexChanged.connect(lambda *_: (self._refresh_smart_queue_controls(), self._capture_current_queue_state()))
         smart_cut_row.addWidget(self.smart_queue_cut_combo)
+        self.lbl_smart_queue_sequence_start = QLabel("开头:", styleSheet="color:#a6adc8; font-weight:900; border:none;")
+        smart_cut_row.addWidget(self.lbl_smart_queue_sequence_start)
+        self.smart_queue_sequence_start_combo = QComboBox()
+        self.smart_queue_sequence_start_combo.addItem("开头自动", userData="auto")
+        self.smart_queue_sequence_start_combo.setFixedWidth(168)
+        self.smart_queue_sequence_start_combo.setToolTip("只在平续剪辑生效：指定第一段先用哪个主体组；后续段继续按轮换/随机/匹配排序。")
+        self.smart_queue_sequence_start_combo.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 5px 8px; font-weight: bold; border-radius: 5px;")
+        self.smart_queue_sequence_start_combo.currentIndexChanged.connect(lambda *_: (self._set_smart_queue_sequence_start(self._smart_queue_sequence_start_key()), self._refresh_smart_queue_controls(), self._capture_current_queue_state()))
+        smart_cut_row.addWidget(self.smart_queue_sequence_start_combo)
         smart_cut_row.addStretch()
         smart_body_layout.addLayout(smart_cut_row)
 
@@ -3716,6 +4136,7 @@ class BatchView(QWidget):
         smart_enabled = bool(state.get("smart_queue_enabled", False)) and bool(smart_groups)
         smart_mode = self._smart_queue_mode(state)
         smart_cut_mode = self._smart_queue_cut_mode(state)
+        smart_sequence_start = self._smart_queue_sequence_start_key(state)
         used_assembly_combos = {}
         used_smart_queue_clips = {}
         rng = random.Random(f"{state.get('name', 'queue')}|{datetime.now().timestamp()}")
@@ -3727,7 +4148,7 @@ class BatchView(QWidget):
             row_text = (row.get("text", "") or "").strip()
             if not self._row_has_batch_content(row):
                 continue
-            smart_groups_for_task = self._smart_queue_groups_for_cut(smart_groups, row, i, rng, smart_mode, smart_cut_mode) if smart_enabled else []
+            smart_groups_for_task = self._smart_queue_groups_for_cut(smart_groups, row, i, rng, smart_mode, smart_cut_mode, smart_sequence_start) if smart_enabled else []
             smart_group_name = self._smart_queue_group_names_label(smart_groups_for_task, smart_cut_mode)
             active_assembly_paths = [path for group in smart_groups_for_task for path in self._normalize_batch_assembly_paths(group.get("paths", []))] if smart_groups_for_task else assembly_paths
             selected_count = self._smart_assembly_count(active_assembly_paths, audio_path=row_audio) if assembly_mode == "smart" else assembly_count
@@ -3764,7 +4185,7 @@ class BatchView(QWidget):
                     "pos_y": float(row.get("pos_y", state.get("subtitle_y", 25.0)) or 25.0),
                     "queue_name": state.get("name", "队列"),
                     "output_dir": state.get("output_dir", ""),
-                    "chunk_mode": state.get("chunk_mode", self.chunk_mode.currentText()),
+                    "chunk_mode": state.get("chunk_mode", self._effective_chunk_mode()),
                     "timing_mode": state.get("timing_mode", self.timing_mode.currentText()),
                     "preset_style": preset_style,
                     "signature": copy.deepcopy(signature),
@@ -3824,7 +4245,7 @@ class BatchView(QWidget):
                     "pos_y": preset_pos_y,
                     "queue_name": f"{state.get('name', '队列')} / {package_name}",
                     "output_dir": state.get("output_dir", ""),
-                    "chunk_mode": state.get("chunk_mode", self.chunk_mode.currentText()),
+                    "chunk_mode": state.get("chunk_mode", self._effective_chunk_mode()),
                     "timing_mode": state.get("timing_mode", self.timing_mode.currentText()),
                     "preset_style": preset_style,
                     "signature": copy.deepcopy(signature),
@@ -3862,7 +4283,7 @@ class BatchView(QWidget):
                 "pos_y": preset_pos_y,
                 "queue_name": state.get("name", "队列"),
                 "output_dir": state.get("output_dir", ""),
-                "chunk_mode": state.get("chunk_mode", self.chunk_mode.currentText()),
+                "chunk_mode": state.get("chunk_mode", self._effective_chunk_mode()),
                 "timing_mode": state.get("timing_mode", self.timing_mode.currentText()),
                 "preset_style": preset_style,
                 "signature": copy.deepcopy(signature),
@@ -4143,7 +4564,7 @@ class BatchView(QWidget):
         self.refresh_signature_presets()
         project_dir = self._resolve_project_output_dir()
         preset_style = self._load_selected_preset_style()
-        c_mode = self.chunk_mode.currentText()
+        c_mode = self._effective_chunk_mode()
         timing_mode = self.timing_mode.currentText()
         default_signature = self._load_selected_signature_config()
         for task in tasks:
@@ -4503,11 +4924,13 @@ class BatchView(QWidget):
             sub["pos_x"] = pos_x
             sub["pos_y"] = pos_y
             sub["track"] = sub.get("track", 1)
+        preserve_caption_blocks = chunk_mode_preserves_caption_blocks(c_mode)
         subs_data, _ = rebalance_subtitle_layout(
             subs_data,
             fallback_style=preset_style,
             default_pos=(pos_x, pos_y),
-            force_standard_box=True
+            force_standard_box=True,
+            allow_split=not preserve_caption_blocks,
         )
 
         video_clip_sequence, _ = self._build_video_clip_sequence(video_paths, content_dur)
@@ -4524,6 +4947,9 @@ class BatchView(QWidget):
             "v_volume": v_volume,
             "a_volume": a_volume,
             "music_volume": music_volume,
+            "video_mask_enabled": False,
+            "video_mask_color": "#000000",
+            "video_mask_alpha": 35,
             "music_dur": music_dur,
             "music_match_duration": content_dur if has_music else 0.0,
             "music_loop": bool(has_music),
@@ -4566,7 +4992,7 @@ class BatchView(QWidget):
         if not words:
             raise Exception("没有可用的文案或 AI 打轴结果")
 
-        return self.process_words(words, c_mode, timing_mode)
+        return self.process_words(words, c_mode, timing_mode, clip_end=total_dur)
 
     def _transcribe_words(self, target_path):
         temp_audio = os.path.join(tempfile.gettempdir(), f"sh_project_build_{threading.get_ident()}.mp3")
@@ -4753,8 +5179,8 @@ class BatchView(QWidget):
         out_dir = task.get("output_dir") or self.output_dir or os.path.dirname(v_path)
         out_path = self._unique_output_path(out_dir, self._task_output_stem(task))
 
-        c_mode = self.chunk_mode.currentText()
-        timing_mode = self.timing_mode.currentText()
+        c_mode = task.get("chunk_mode") or self._effective_chunk_mode()
+        timing_mode = task.get("timing_mode") or self.timing_mode.currentText()
 
         self.sig_table_row_status.emit(task["idx"], "🔄 正在渲染", "#f9e2af")
         self.sig_progress.emit(0)
@@ -4770,7 +5196,7 @@ class BatchView(QWidget):
             custom_text = task["text"]
             t_idx = task["idx"]
             a_mode = task.get("a_mode", "🔈 原声20% + 配音")
-            performance_mode = task.get("performance_mode", self.performance_mode.currentText() if hasattr(self, "performance_mode") else "标准画质")
+            performance_mode = task.get("performance_mode", self.performance_mode.currentText() if hasattr(self, "performance_mode") else "极限速度")
             signature = task.get("signature", {})
 
             self.sig_log.emit(f"▶ 开始装配视频: {os.path.basename(v_path)}", "#89b4fa")
@@ -4789,28 +5215,36 @@ class BatchView(QWidget):
 
             self.sig_progress.emit(10)
             self.sig_log.emit("  [2/4] \u6309\u4f18\u5148\u7ea7\u547c\u53eb AI \u542c\u8bd1\u670d\u52a1...", "#cdd6f4")
-            clean_words = transcribe_audio_words(
-                temp_audio,
-                progress=lambda msg, color="#cdd6f4": self.sig_log.emit(f"  {msg}", color),
-                provider_order=provider_order,
+            media_duration = float(get_exact_duration(temp_audio) or 0.0)
+            fallback_end = media_duration if media_duration > 0 else None
+            clean_words = normalize_word_timestamps(
+                transcribe_audio_words(
+                    temp_audio,
+                    progress=lambda msg, color="#cdd6f4": self.sig_log.emit(f"  {msg}", color),
+                    provider_order=provider_order,
+                ),
+                fallback_start=0.0,
+                fallback_end=fallback_end,
             )
 
             if use_custom_text:
                 self.sig_log.emit("  [2.5/4] 检测到手工文案，正在把文案对齐到 AI 时间轴...", "#a6e3a1")
                 clean_words = self._align_user_text_to_ai_words(clean_words, custom_text)
 
-            subs_data = self.process_words(clean_words, c_mode, timing_mode)
+            subs_data = self.process_words(clean_words, c_mode, timing_mode, clip_end=fallback_end)
             row_custom_x = task.get("pos_x", 0.0)
             row_custom_y = task.get("pos_y", 25.0) # 👑 应用你调整好的独立高度参数
             for sub in subs_data:
                 sub["style"] = task.get("preset_style", self.preset_style).copy()
                 sub["pos_x"] = row_custom_x
                 sub["pos_y"] = row_custom_y        # 👑 强制覆盖
+            preserve_caption_blocks = chunk_mode_preserves_caption_blocks(c_mode)
             subs_data, _ = rebalance_subtitle_layout(
                 subs_data,
                 fallback_style=task.get("preset_style", self.preset_style),
                 default_pos=(row_custom_x, row_custom_y),
-                force_standard_box=True
+                force_standard_box=True,
+                allow_split=not preserve_caption_blocks,
             )
 
             self.sig_progress.emit(30)
@@ -4827,23 +5261,64 @@ class BatchView(QWidget):
             content_dur = self._content_total_duration(v_dur, a_dur, a_mode)
             total_dur = content_dur + render_tail_padding_seconds()
 
+            quality_profile = self.batch_render_profile(performance_mode)
+            quality_mode = str(quality_profile.get("mode") or self.batch_export_quality_mode(performance_mode))
+            render_subs_data = [simplify_subtitle_for_export(sub, quality_mode) for sub in subs_data]
+            signature_render = simplify_signature_for_export(signature, quality_mode)
+            render_scale = float(quality_profile.get("render_scale", SUBTITLE_SUPERSAMPLE) or SUBTITLE_SUPERSAMPLE)
+            event_fps = int(quality_profile.get("event_fps", subtitle_event_fps()) or subtitle_event_fps())
+            continuous_fps = int(quality_profile.get("continuous_fps", subtitle_continuous_fps()) or subtitle_continuous_fps())
+
             with sync_playwright() as p:
                 browser = launch_render_browser(p)
-                render_scale = self.subtitle_render_scale(performance_mode)
-                render_w = int(proj_w * render_scale)
-                render_h = int(proj_h * render_scale)
+                render_w = max(160, int(proj_w * render_scale))
+                render_h = max(160, int(proj_h * render_scale))
                 page = browser.new_page(viewport={"width": render_w, "height": render_h}, device_scale_factor=1)
-                page.set_content("<html><body style='background:transparent;'></body></html>")
+                bundled_font_css = font_face_css()
+                shell_html = f"""<!DOCTYPE html>
+                <html>
+                <head>
+                    <style>
+                        {bundled_font_css}
+                        html, body {{
+                            margin: 0; padding: 0; width: 100vw; height: 100vh; overflow: hidden;
+                            background: transparent; display: flex; justify-content: center; align-items: center;
+                            -webkit-text-size-adjust: 100%; text-size-adjust: 100%;
+                            -webkit-font-smoothing: antialiased;
+                            -moz-osx-font-smoothing: grayscale;
+                            text-rendering: optimizeLegibility;
+                        }}
+                        #scale-wrapper {{
+                            width: 100vw; height: 100vh; position: absolute; left: 0; top: 0;
+                            transform-origin: center center;
+                        }}
+                    </style>
+                </head>
+                <body>
+                    <div id="scale-wrapper"></div>
+                </body>
+                </html>"""
+                page.set_content(shell_html)
+                page.evaluate("() => document.fonts && document.fonts.ready ? document.fonts.ready.then(() => true) : true")
                 page.screenshot(path=blank_path, omit_background=True, scale="css")
 
                 with open(concat_path, "w", encoding="utf-8") as f_concat:
                     frame_idx = 0
+                    reused_frame_count = 0
                     last_concat_file = blank_path
+                    last_html_subs = None
+                    last_frame_path = ""
                     extra_styles = []
-                    if isinstance(signature, dict) and signature.get("enabled") and str(signature.get("text", "")).strip():
-                        extra_styles.append(signature.get("style", {}))
-                    frame_schedule = build_subtitle_frame_schedule(subs_data, total_dur, extra_styles=extra_styles)
-                    self.sig_log.emit(f"  ⚡ 字幕渲染采样: {len(frame_schedule)} 段，{performance_mode} x{render_scale:g}", "#89b4fa")
+                    if isinstance(signature_render, dict) and signature_render.get("enabled") and str(signature_render.get("text", "")).strip():
+                        extra_styles.append(signature_render.get("style", {}))
+                    frame_schedule = build_subtitle_frame_schedule(
+                        render_subs_data,
+                        total_dur,
+                        extra_styles=extra_styles,
+                        event_fps=event_fps,
+                        continuous_fps=continuous_fps,
+                    )
+                    self.sig_log.emit(f"  ⚡ 字幕渲染采样: {len(frame_schedule)} 段，{performance_mode} / {quality_profile.get('summary', '')}", "#89b4fa")
 
                     def write_subtitle_frame(path, duration):
                         nonlocal last_concat_file
@@ -4852,28 +5327,40 @@ class BatchView(QWidget):
                         last_concat_file = path
 
                     for current_time, frame_duration in frame_schedule:
-                        active_subs = active_subtitles_for_frame(subs_data, current_time, frame_duration)
-                        signature_html = render_signature_html(signature, current_time, proj_w, proj_h)
+                        active_subs = active_subtitles_for_frame(render_subs_data, current_time, frame_duration)
+                        signature_html = render_signature_html(signature_render, current_time, proj_w, proj_h)
                         if not active_subs and not signature_html:
                             write_subtitle_frame(blank_path, frame_duration)
                             continue
 
                         html_subs = signature_html
                         for s, sub_time in active_subs:
-                            px = s.get("pos_x", 0.0); py = s.get("pos_y", 25.0)
-                            base_css = f"position: absolute; left: calc(50% + {px}%); top: calc(50% + {py}%); transform: translate(-50%, -50%); z-index: 10; width: max-content; max-width: 92%;"
+                            px = s.get("pos_x", 0.0)
+                            py = s.get("pos_y", 25.0)
+                            trk = s.get("track", 1)
+                            z_idx = 10 if trk == 0 else 5
+                            base_css = f"position: absolute; left: calc(50% + {px}%); top: calc(50% + {py}%); transform: translate(-50%, -50%); z-index: {z_idx}; width: max-content; max-width: 92%;"
                             sub_html = render_subtitle_html(s, sub_time, proj_w, proj_h)
                             html_subs += f"<div style='{base_css}'>{sub_html}</div>\n"
 
-                        # 👑 全局抗锯齿平滑渲染参数
-                        html_content = f"<!DOCTYPE html><html><head><style>html, body {{ margin: 0; padding: 0; width: 100vw; height: 100vh; overflow: hidden; background: transparent; display: flex; justify-content: center; align-items: center; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }} #scale-wrapper {{ width: 100vw; height: 100vh; position: absolute; left: 0; top: 0; filter: drop-shadow(0px 0px 0px transparent); }}</style></head><body><div id='scale-wrapper'>{html_subs}</div></body></html>"
-                        page.set_content(html_content)
+                        if last_frame_path and html_subs == last_html_subs:
+                            write_subtitle_frame(last_frame_path, frame_duration)
+                            reused_frame_count += 1
+                            continue
+
+                        page.evaluate(
+                            "(html) => { const wrapper = document.getElementById('scale-wrapper'); if (wrapper) wrapper.innerHTML = html; }",
+                            html_subs,
+                        )
                         frame_path = os.path.join(temp_dir, f"f_{frame_idx}.png").replace("\\", "/")
                         page.screenshot(path=frame_path, omit_background=True, scale="css")
                         write_subtitle_frame(frame_path, frame_duration)
+                        last_html_subs = html_subs
+                        last_frame_path = frame_path
                         frame_idx += 1
 
                     f_concat.write(ffconcat_file_entry(last_concat_file))
+                    self.sig_log.emit(f"  ⚡ 字幕截图: 实际生成 {frame_idx} 张，复用 {reused_frame_count} 段。", "#89b4fa")
 
             self.sig_progress.emit(70)
 
@@ -4900,7 +5387,7 @@ class BatchView(QWidget):
             music_gain = max(0.0, min(1.0, float(task.get("music_volume", self.music_volume_percent()) or 0) / 100.0))
             render_profile = get_render_profile()
             encoder_label = render_profile.get("encoder_label") or render_profile.get("encoder", "CPU x264")
-            video_args = build_video_encoder_args(render_profile, quality="batch")
+            video_args = build_video_encoder_args(render_profile, quality=self.batch_encoder_quality(performance_mode))
             self.sig_log.emit(f"  ⚙️ 渲染配置: {encoder_label}", "#89b4fa")
 
             args = ["-y", "-f", "concat", "-safe", "0", "-i", v_loop_path, "-f", "concat", "-safe", "0", "-i", concat_path]
@@ -5023,8 +5510,10 @@ class BatchView(QWidget):
     def _align_user_text_to_ai_words(self, ai_words, raw_text):
         return align_reference_text_to_timestamps(ai_words, raw_text)
 
-    def process_words(self, words, mode, timing_mode=None):
-        words = normalize_word_timestamps(words)
+    def process_words(self, words, mode, timing_mode=None, clip_end=None):
+        words = normalize_word_timestamps(words, fallback_start=0.0, fallback_end=clip_end) if clip_end else normalize_word_timestamps(words)
+        if is_full_text_chunk_mode(mode):
+            return build_full_text_subtitle(words, end=clip_end)
         NON_END_WORDS = self._load_nlp_dict()
         subs = []; curr = {"words": []}; puncts = ['.', '!', '?', ',', '，', '。', '！', '？']
         timing_mode = timing_mode or "J Cut (字幕稍后收尾)"
@@ -5034,6 +5523,8 @@ class BatchView(QWidget):
         precise_chunk_mode = exact_single_word or fixed_count > 0
         narrative_min_words, narrative_max_words = narrative_chunk_word_bounds(mode)
         narrative_merge_words = narrative_chunk_merge_words(mode)
+        smart_transcription_mode = is_smart_transcription_chunk_mode(mode)
+        smart_min_words, smart_max_words = smart_transcription_word_bounds(mode)
 
         for i, w in enumerate(words):
             if not curr["words"]: curr["start"] = w["start"]
@@ -5048,10 +5539,13 @@ class BatchView(QWidget):
             silence_gap = next_start - curr["end"]
             curr_dur = curr["end"] - curr["start"]
             narrative_block = narrative_max_words > 0
-            tiktok_smart = "智能听译" in mode or "4-6" in mode or "4-7" in mode
+            tiktok_smart = smart_transcription_mode
+            tiktok_min_words = smart_min_words or 4
+            tiktok_max_words = smart_max_words or 7
 
             smart_short = "智能重点" in mode or "3-4词为主" in mode
             natural_short = "自然短句" in mode or "1-4" in mode
+            long_chunk_block = chunk_mode_preserves_caption_blocks(mode) and not narrative_block
             fixed_count = 0
             if not natural_short and not smart_short and not tiktok_smart and not narrative_block:
                 if "短句快速" in mode or "1-3" in mode:
@@ -5091,14 +5585,15 @@ class BatchView(QWidget):
                     len(curr["words"]) >= narrative_max_words
                 )
             elif tiktok_smart:
+                word_count = len(curr["words"])
                 is_break = (
-                    silence_gap > 0.8 or
-                    (has_punct and len(curr["words"]) >= 4) or
-                    (silence_gap > 0.46 and len(curr["words"]) >= 3) or
-                    (silence_gap > 0.28 and len(curr["words"]) >= 4) or
-                    (is_key_word and len(curr["words"]) >= 5 and (silence_gap > 0.14 or curr_dur > 1.55)) or
-                    len(curr["words"]) >= 7 or
-                    (len(curr["words"]) >= 6 and curr_dur > 2.35)
+                    (silence_gap > 0.8 and word_count >= tiktok_min_words) or
+                    (has_punct and word_count >= tiktok_min_words) or
+                    (silence_gap > 0.46 and word_count >= tiktok_min_words) or
+                    (silence_gap > 0.28 and word_count >= tiktok_min_words) or
+                    (is_key_word and word_count >= min(tiktok_max_words, max(tiktok_min_words + 1, 5)) and (silence_gap > 0.14 or curr_dur > 1.55)) or
+                    word_count >= tiktok_max_words or
+                    (word_count >= min(tiktok_max_words, max(tiktok_min_words + 1, 6)) and curr_dur > max(2.35, tiktok_min_words * 0.34))
                 )
             elif smart_short:
                 long_slot = (len(subs) + int(float(curr.get("start", 0.0)) * 10)) % 5 == 3
@@ -5119,6 +5614,16 @@ class BatchView(QWidget):
                     (silence_gap > 0.30 and len(curr["words"]) >= 2) or
                     len(curr["words"]) >= 4 or
                     (len(curr["words"]) >= 3 and curr_dur > 1.35)
+                )
+            elif long_chunk_block:
+                long_block_max = max(8, pacing_merge_word_limit_for_chunk_mode(mode))
+                long_block_min = max(6, long_block_max - 3)
+                is_break = (
+                    (silence_gap > 0.8 and len(curr["words"]) >= long_block_min) or
+                    (has_punct and len(curr["words"]) >= long_block_min) or
+                    (silence_gap > 0.42 and len(curr["words"]) >= long_block_min) or
+                    len(curr["words"]) >= long_block_max or
+                    (len(curr["words"]) >= max(6, long_block_max - 2) and curr_dur > 3.2)
                 )
             elif sound_aligned:
                 is_break = (
@@ -5150,7 +5655,7 @@ class BatchView(QWidget):
                 is_break = False
 
             if is_break:
-                if sound_aligned and len(curr["words"]) >= 6:
+                if (long_chunk_block or sound_aligned) and len(curr["words"]) >= 6:
                     mid = len(curr["words"]) // 2
                     curr["words"][mid]["text"] = "\n" + curr["words"][mid]["text"].lstrip()
                 curr["text"] = format_subtitle_text_spacing(" ".join([x["text"] for x in curr["words"]]))
@@ -5159,7 +5664,7 @@ class BatchView(QWidget):
                 subs.append(curr); curr = {"words": []}
 
         if curr["words"]:
-            if sound_aligned and len(curr["words"]) >= 6:
+            if (long_chunk_block or sound_aligned) and len(curr["words"]) >= 6:
                 mid = len(curr["words"]) // 2
                 curr["words"][mid]["text"] = "\n" + curr["words"][mid]["text"].lstrip()
             curr["text"] = format_subtitle_text_spacing(" ".join([x["text"] for x in curr["words"]]))
@@ -5169,6 +5674,8 @@ class BatchView(QWidget):
 
         if not precise_chunk_mode and (narrative_block or "长句" in mode or "约10" in mode):
             subs = merge_single_word_subtitle_segments(subs, max_merged_words=narrative_merge_words if narrative_block else 14)
+        if smart_transcription_mode:
+            subs = merge_short_subtitle_segments(subs, min_words=smart_min_words or 4, max_merged_words=smart_max_words or 7)
 
         subs = self._apply_timing_mode(subs, timing_mode)
         pacing_merge_words = pacing_merge_word_limit_for_chunk_mode(mode)

@@ -122,6 +122,49 @@ def ffmpeg_canvas_source(proj_w, proj_h, duration, label="canvas") -> str:
     return f"color=c=black:s={proj_w}x{proj_h}:d={duration:.3f},format=rgba[{label}]"
 
 
+def re_match_hex_color(value) -> bool:
+    text = str(value or "")
+    if len(text) != 7 or not text.startswith("#"):
+        return False
+    return all(ch in "0123456789ABCDEFabcdef" for ch in text[1:])
+
+
+def normalize_hex_color(value, fallback="#000000") -> str:
+    text = str(value or "").strip().upper()
+    if not text.startswith("#"):
+        text = f"#{text}"
+    if re_match_hex_color(text):
+        return text
+    fallback = str(fallback or "#000000").strip().upper()
+    if not fallback.startswith("#"):
+        fallback = f"#{fallback}"
+    return fallback if re_match_hex_color(fallback) else "#000000"
+
+
+def ffmpeg_color_value(value, fallback="#000000") -> str:
+    return f"0x{normalize_hex_color(value, fallback)[1:]}"
+
+
+def ffmpeg_video_mask_filter(input_label, output_label, proj_w, proj_h, duration, color="#000000", alpha=0, mask_label=None) -> str:
+    try:
+        alpha = max(0.0, min(100.0, float(alpha or 0.0)))
+    except Exception:
+        alpha = 0.0
+    if alpha <= 0:
+        return f"[{input_label}]null[{output_label}]"
+    proj_w = _positive_int(proj_w)
+    proj_h = _positive_int(proj_h)
+    try:
+        duration = max(0.001, float(duration or 0.001))
+    except Exception:
+        duration = 0.001
+    mask_label = mask_label or f"{output_label}_mask"
+    return (
+        f"color=c={ffmpeg_color_value(color)}@{alpha / 100.0:.4f}:s={proj_w}x{proj_h}:d={duration:.3f},format=rgba[{mask_label}];"
+        f"[{input_label}][{mask_label}]overlay=0:0:eof_action=pass:format=auto[{output_label}]"
+    )
+
+
 def ffmpeg_layer_scale_filter(scale=1.0, canvas_w=None, canvas_h=None, fit="cover") -> str:
     try:
         scale = max(0.01, float(scale or 1.0))

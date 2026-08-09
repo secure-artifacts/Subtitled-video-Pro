@@ -1,5 +1,6 @@
 import copy
 import os
+import random
 import sys
 import tempfile
 import types
@@ -17,6 +18,7 @@ import render_pipeline_model
 import timeline_model
 import timeline_interaction
 import caption_presets
+import caption_rewrite
 import subtitle_render_utils
 from playback_group import PlayerGroupController, stop_timer
 from preview_frame_retry import PreviewFrameRetryPolicy
@@ -54,7 +56,7 @@ from preview_proxy import (
     preview_proxy_is_ready,
     preview_source_for_clip,
 )
-from render_timing import active_subtitles_for_frame, build_subtitle_frame_schedule, quantize_sample_time, render_tail_padding_seconds
+from render_timing import active_subtitles_at_time, active_subtitles_for_frame, build_subtitle_frame_schedule, quantize_sample_time, render_tail_padding_seconds
 
 
 def _install_pyqt_test_stubs():
@@ -113,11 +115,14 @@ try:
         align_reference_text_to_timestamps,
         format_subtitle_text_spacing,
         merge_single_word_subtitle_segments,
+        merge_short_subtitle_segments,
         normalize_scripture_quote_text,
         normalize_word_timestamps,
         protect_fast_subtitle_pacing,
         rebalance_subtitle_layout,
         render_subtitle_html,
+        normalize_random_text_palette,
+        normalize_random_text_font_pool,
         should_defer_subtitle_break_for_readability,
         tokenize_display_text,
     )
@@ -134,6 +139,8 @@ except ModuleNotFoundError as exc:
         protect_fast_subtitle_pacing,
         rebalance_subtitle_layout,
         render_subtitle_html,
+        normalize_random_text_palette,
+        normalize_random_text_font_pool,
         should_defer_subtitle_break_for_readability,
         tokenize_display_text,
     )
@@ -186,6 +193,15 @@ class ProjectSchemaTests(unittest.TestCase):
             self.assertEqual(result["subs_data"], source["subs_data"])
             self.assertEqual(result["timeline"], source["timeline"])
 
+    def test_edit_room_schema_includes_video_mask_defaults(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = ensure_project_schema({}, os.path.join(temp_dir, "Mask.scomp"))
+            edit_state = result["room_state"]["edit_room"]
+
+            self.assertFalse(edit_state["video_mask_enabled"])
+            self.assertEqual(edit_state["video_mask_color"], "#000000")
+            self.assertEqual(edit_state["video_mask_alpha"], 35)
+
     def test_project_folder_scan_excludes_local_asset_and_hidden_dirs(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             os.makedirs(os.path.join(temp_dir, "Campaign"))
@@ -208,13 +224,154 @@ class ChunkModeConfigTests(unittest.TestCase):
         with open(os.path.join(root_dir, "room_batch.py"), "r", encoding="utf-8") as f:
             batch_source = f.read()
 
-        self.assertIn("智能听译 (4-7词，适配双行按词)", edit_source)
-        self.assertIn("智能听译 (4-7词，适配双行按词)", batch_source)
-        self.assertIn("REFERENCE_NARRATIVE_CHUNK_MODE", edit_source)
-        self.assertIn("REFERENCE_NARRATIVE_CHUNK_MODE", batch_source)
-        self.assertIn("is_reference_narrative_chunk_mode", edit_source)
+        self.assertIn("self.chunk_mode.addItems(chunk_mode_options())", edit_source)
+        self.assertIn("self.chunk_mode.addItems(chunk_mode_options())", batch_source)
+        self.assertIn("is_smart_transcription_chunk_mode", edit_source)
+        self.assertIn("is_smart_transcription_chunk_mode", batch_source)
+        self.assertIn("smart_transcription_word_bounds", edit_source)
+        self.assertIn("smart_transcription_word_bounds", batch_source)
+        self.assertIn("make_fixed_chunk_mode_label", batch_source)
+        self.assertIn("make_smart_chunk_mode_label", batch_source)
+        self.assertIn("self.chunk_strategy_combo", batch_source)
+        self.assertIn("self._effective_chunk_mode()", batch_source)
+        self.assertIn('task.get("chunk_mode") or self._effective_chunk_mode()', batch_source)
         self.assertIn("tiktok_smart", batch_source)
 
+
+    def test_project_caption_mode_dialog_can_trigger_ai_rewrite_path(self):
+        root_dir = os.path.dirname(os.path.dirname(__file__))
+        with open(os.path.join(root_dir, "room_project.py"), "r", encoding="utf-8") as f:
+            project_source = f.read()
+
+        self.assertIn("rewrite_now_check", project_source)
+        self.assertIn("dialog.should_rewrite_now()", project_source)
+        self.assertIn("_apply_selected_reel_caption_rewrites", project_source)
+        self.assertIn("rewrite_project_subtitles", project_source)
+
+    def test_project_panel_exposes_batch_video_mask_tool(self):
+        root_dir = os.path.dirname(os.path.dirname(__file__))
+        with open(os.path.join(root_dir, "room_project.py"), "r", encoding="utf-8") as f:
+            project_source = f.read()
+
+        self.assertIn("VideoMaskConfigDialog", project_source)
+        self.assertIn("btn_video_mask_selected", project_source)
+        self.assertIn("apply_video_mask_to_selected_reels_dialog", project_source)
+        self.assertIn("normalize_project_video_mask_config", project_source)
+
+    def test_style_preset_save_keeps_animation_fields_for_batch(self):
+        root_dir = os.path.dirname(os.path.dirname(__file__))
+        with open(os.path.join(root_dir, "room_edit.py"), "r", encoding="utf-8") as f:
+            edit_source = f.read()
+        with open(os.path.join(root_dir, "room_batch.py"), "r", encoding="utf-8") as f:
+            batch_source = f.read()
+
+        self.assertIn('self._apply_styles_to_targets("params")', edit_source)
+        self.assertIn('style_data.update(copy.deepcopy(clip.get("style", {})))', edit_source)
+        self.assertIn('"anim_type"', edit_source)
+        self.assertIn('"font_motion"', edit_source)
+        self.assertIn('"text_reveal_mode"', edit_source)
+        self.assertIn('"full_roll_window_height"', edit_source)
+        self.assertIn("base_style.update(preset_style)", batch_source)
+
+    def test_smart_queue_sequence_cut_can_pin_opening_group(self):
+        root_dir = os.path.dirname(os.path.dirname(__file__))
+        with open(os.path.join(root_dir, "room_batch.py"), "r", encoding="utf-8") as f:
+            batch_source = f.read()
+
+        self.assertIn('"smart_queue_sequence_start"', batch_source)
+        self.assertIn("self.smart_queue_sequence_start_combo", batch_source)
+        self.assertIn("_smart_queue_sequence_start_group", batch_source)
+        self.assertIn('sequence_start_key if cut_mode == "sequence" else "auto"', batch_source)
+        self.assertIn("smart_sequence_start = self._smart_queue_sequence_start_key(state)", batch_source)
+
+    def test_smart_queue_sequence_start_moves_fixed_group_to_front(self):
+        try:
+            from room_batch import BatchView
+        except Exception as exc:  # pragma: no cover - only for environments without UI deps
+            self.skipTest(f"room_batch unavailable: {exc}")
+
+        view = BatchView.__new__(BatchView)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            def media(name):
+                path = os.path.join(temp_dir, name)
+                with open(path, "wb") as f:
+                    f.write(b"placeholder")
+                return path
+
+            groups = [
+                {"name": "Opening", "paths": [media("opening.mp4")], "enabled": True},
+                {"name": "Kids", "paths": [media("kids.mp4")], "enabled": True},
+                {"name": "Elder", "paths": [media("elder.mp4")], "enabled": True},
+            ]
+
+            sequence_order = view._smart_queue_groups_for_cut(
+                groups, {}, 0, random.Random(7), "random", "sequence", "name:Kids"
+            )
+            self.assertEqual(sequence_order[0]["name"], "Kids")
+            self.assertEqual({group["name"] for group in sequence_order}, {"Opening", "Kids", "Elder"})
+
+            parallel_order = view._smart_queue_groups_for_cut(
+                groups, {}, 0, random.Random(7), "cycle", "parallel", "name:Kids"
+            )
+            self.assertEqual([group["name"] for group in parallel_order], ["Opening", "Kids"])
+
+    def test_full_text_chunk_mode_generates_single_caption_block(self):
+        words = [
+            {"word": "Dear", "start": 0.0, "end": 0.2},
+            {"word": "God,", "start": 0.2, "end": 0.4},
+            {"word": "please", "start": 0.4, "end": 0.7},
+            {"word": "help", "start": 0.7, "end": 1.0},
+        ]
+
+        subtitles = caption_rewrite.generate_subtitles_from_words(words, caption_presets.FULL_TEXT_CHUNK_MODE, clip_end=3.5)
+
+        self.assertEqual(len(subtitles), 1)
+        self.assertEqual(subtitles[0]["text"], "Dear God, please help")
+        self.assertEqual(len(subtitles[0]["words"]), 4)
+        self.assertEqual(subtitles[0]["start"], 0.0)
+        self.assertEqual(subtitles[0]["end"], 3.5)
+
+    def test_headless_caption_generation_honors_custom_smart_bounds(self):
+        words = [
+            {"word": "One", "start": 0.0, "end": 0.2},
+            {"word": "two", "start": 0.2, "end": 0.4},
+            {"word": "three", "start": 0.4, "end": 0.6},
+            {"word": "four", "start": 0.6, "end": 0.8},
+            {"word": "five", "start": 0.8, "end": 1.0},
+            {"word": "six", "start": 1.0, "end": 1.2},
+            {"word": "seven", "start": 1.2, "end": 1.4},
+            {"word": "eight", "start": 1.4, "end": 1.6},
+            {"word": "nine", "start": 1.6, "end": 1.8},
+            {"word": "ten", "start": 1.8, "end": 2.0},
+        ]
+
+        subtitles = caption_rewrite.generate_subtitles_from_words(
+            words,
+            caption_presets.make_smart_chunk_mode_label(5, 9),
+            "对齐声音 (按停顿)",
+            fill_subtitle_gaps=False,
+        )
+
+        self.assertEqual(len(subtitles[0]["words"]), 9)
+        self.assertEqual(len(subtitles[1]["words"]), 1)
+
+    def test_project_and_edit_chunk_controls_share_custom_bounds(self):
+        mode = caption_presets.make_smart_chunk_mode_label(5, 9)
+        self.assertEqual(caption_presets.smart_transcription_word_bounds(mode), (5, 9))
+        self.assertEqual(caption_presets.pacing_merge_word_limit_for_chunk_mode(mode), 9)
+
+        root_dir = os.path.dirname(os.path.dirname(__file__))
+        with open(os.path.join(root_dir, "room_project.py"), "r", encoding="utf-8") as f:
+            project_source = f.read()
+        with open(os.path.join(root_dir, "room_edit.py"), "r", encoding="utf-8") as f:
+            edit_source = f.read()
+
+        self.assertIn('edit_state["chunk_mode"] = chunk_mode', project_source)
+        self.assertIn("dialog.selected_chunk_mode()", project_source)
+        self.assertIn("self._ensure_chunk_mode_option(chunk_value)", edit_source)
+        self.assertGreaterEqual(edit_source.count("self._sync_chunk_controls_from_mode(chunk_value)"), 2)
+        self.assertIn("self.smart_min_words_spin.setValue(min_words)", edit_source)
+        self.assertIn("self.smart_max_words_spin.setValue(max_words)", edit_source)
 
     def test_reference_narrative_block_preset_is_available(self):
         presets = caption_presets.built_in_style_presets()
@@ -246,8 +403,25 @@ class ChunkModeConfigTests(unittest.TestCase):
 
         self.assertTrue(caption_presets.is_exact_single_word_chunk_mode("1\u5b57"))
         self.assertEqual(caption_presets.pacing_merge_word_limit_for_chunk_mode("2\u5b57"), 0)
+        self.assertEqual(caption_presets.narrative_chunk_word_bounds("\u7d2f\u8ba1\u53d9\u4e8b12\u8bcd"), (8, 12))
+        self.assertEqual(caption_presets.narrative_chunk_word_bounds("\u7d2f\u79ef\u53d9\u4e8b\u5757 (14-18\u8bcd\u6e05\u5c4f)"), (14, 18))
+        self.assertEqual(caption_presets.pacing_merge_word_limit_for_chunk_mode("0516\u7d2f\u8ba1\u53d9\u4e8b12\u8bcd"), 12)
+        self.assertEqual(caption_presets.pacing_merge_word_limit_for_chunk_mode("\u7d2f\u79ef\u53d9\u4e8b\u5757 (14-18\u8bcd\u6e05\u5c4f)"), 18)
+        self.assertEqual(caption_presets.pacing_merge_word_limit_for_chunk_mode("\u53cc\u884c\u5927\u6bb5 (\u7ea610\u5b57)"), 12)
+        self.assertTrue(caption_presets.chunk_mode_preserves_caption_blocks("\u7d2f\u8ba1\u53d9\u4e8b12\u8bcd"))
+        self.assertTrue(caption_presets.chunk_mode_preserves_caption_blocks("\u53cc\u884c\u5927\u6bb5 (\u7ea610\u5b57)"))
         self.assertEqual(caption_presets.pacing_merge_word_limit_for_chunk_mode("\u667a\u80fd\u91cd\u70b9\u77ed\u53e5 (3-4\u8bcd\u4e3a\u4e3b)"), 4)
         self.assertEqual(caption_presets.pacing_merge_word_limit_for_chunk_mode("\u667a\u80fd\u542c\u8bd1 (4-7\u8bcd)"), 7)
+        self.assertIn(caption_presets.make_fixed_chunk_mode_label(2), caption_presets.chunk_mode_options())
+        self.assertEqual(caption_presets.fixed_word_count_for_chunk_mode(caption_presets.make_fixed_chunk_mode_label(2)), 2)
+        self.assertTrue(caption_presets.is_smart_transcription_chunk_mode(caption_presets.make_smart_chunk_mode_label(5, 9)))
+        self.assertEqual(caption_presets.smart_transcription_word_bounds(caption_presets.make_smart_chunk_mode_label(5, 9)), (5, 9))
+        self.assertEqual(caption_presets.pacing_merge_word_limit_for_chunk_mode(caption_presets.make_smart_chunk_mode_label(5, 9)), 9)
+        self.assertIn(caption_presets.FULL_TEXT_CHUNK_MODE, caption_presets.chunk_mode_options())
+        self.assertTrue(caption_presets.is_full_text_chunk_mode(caption_presets.FULL_TEXT_CHUNK_MODE))
+        self.assertEqual(caption_presets.pacing_merge_word_limit_for_chunk_mode(caption_presets.FULL_TEXT_CHUNK_MODE), 0)
+        self.assertTrue(caption_presets.chunk_mode_preserves_caption_blocks(caption_presets.FULL_TEXT_CHUNK_MODE))
+        self.assertEqual(caption_presets.narrative_chunk_word_bounds("\u7d2f\u79ef\u53d9\u4e8b\u5757 (10-15\u8bcd\u6e05\u5c4f)"), (10, 15))
 
     def test_edit_timeline_controller_interfaces_are_present(self):
         root_dir = os.path.dirname(os.path.dirname(__file__))
@@ -307,6 +481,28 @@ class RenderTimingTests(unittest.TestCase):
         self.assertEqual(schedule[0][0], 0.0)
         self.assertAlmostEqual(sum(duration for _, duration in schedule), 0.5, places=3)
 
+    def test_full_text_roll_sampling_stops_after_word_locked_motion(self):
+        with mock.patch.dict(os.environ, {"SUBTITLE_CONTINUOUS_FPS": "10"}, clear=False):
+            schedule = build_subtitle_frame_schedule(
+                [
+                    {
+                        "start": 0.0,
+                        "end": 6.0,
+                        "text": "hello amen",
+                        "words": [
+                            {"text": "hello", "start": 0.0, "end": 1.0},
+                            {"text": "amen", "start": 1.0, "end": 2.0},
+                        ],
+                        "style": {"anim_type": "full_text_roll", "full_roll_lock_to_words": True},
+                    }
+                ],
+                6.0,
+            )
+
+        late_motion_samples = [start for start, _ in schedule if 2.1 < start < 5.9]
+        self.assertFalse(late_motion_samples)
+        self.assertAlmostEqual(sum(duration for _, duration in schedule), 6.0, places=3)
+
     def test_subtitle_start_sampling_does_not_round_before_start(self):
         sub = {"start": 1.2344, "end": 2.0, "text": "visible"}
 
@@ -325,6 +521,85 @@ class RenderTimingTests(unittest.TestCase):
         self.assertEqual(len(active), 1)
         self.assertIs(active[0][0], sub)
         self.assertAlmostEqual(active[0][1], 0.010, places=3)
+
+    def test_split_screen_layout_keeps_recent_captions_in_slots(self):
+        style = {
+            "layout_mode": "split_screen",
+            "split_screen_count": 3,
+            "split_screen_pos_y_1": 16.0,
+            "split_screen_pos_y_2": 48.0,
+            "split_screen_pos_y_3": 82.0,
+        }
+        subtitles = [
+            {"start": 0.0, "end": 1.0, "text": "one", "track": 1, "style": copy.deepcopy(style)},
+            {"start": 1.0, "end": 2.0, "text": "two", "track": 1, "style": copy.deepcopy(style)},
+            {"start": 2.0, "end": 3.0, "text": "three", "track": 1, "style": copy.deepcopy(style)},
+            {"start": 3.0, "end": 4.0, "text": "four", "track": 1, "style": copy.deepcopy(style)},
+        ]
+
+        active = active_subtitles_at_time(subtitles, 2.5)
+        self.assertEqual([item[0]["text"] for item in active], ["one", "two", "three"])
+        self.assertEqual([item[0]["_source_idx"] for item in active], [0, 1, 2])
+        self.assertEqual([item[0]["pos_y"] for item in active], [16.0, 48.0, 82.0])
+        self.assertLess(active[0][1], subtitles[0]["end"])
+
+        shifted = active_subtitles_at_time(subtitles, 3.2)
+        self.assertEqual([item[0]["text"] for item in shifted], ["two", "three", "four"])
+        self.assertEqual([item[0]["pos_y"] for item in shifted], [16.0, 48.0, 82.0])
+
+    def test_smart_layout_pool_can_enable_split_screen_retention(self):
+        style = {
+            "layout_mode": "smart_caption",
+            "smart_layout_pool": "split_screen",
+            "split_screen_count": 3,
+            "split_screen_pos_x_1": -18.0,
+            "split_screen_pos_y_1": 15.0,
+            "split_screen_pos_x_2": 0.0,
+            "split_screen_pos_y_2": 50.0,
+            "split_screen_pos_x_3": 18.0,
+            "split_screen_pos_y_3": 85.0,
+        }
+        subtitles = [
+            {"start": 0.0, "end": 1.0, "text": "one", "track": 1, "style": copy.deepcopy(style)},
+            {"start": 1.0, "end": 2.0, "text": "two", "track": 1, "style": copy.deepcopy(style)},
+            {"start": 2.0, "end": 3.0, "text": "three", "track": 1, "style": copy.deepcopy(style)},
+        ]
+
+        active = active_subtitles_at_time(subtitles, 2.5)
+
+        self.assertEqual([item[0]["text"] for item in active], ["one", "two", "three"])
+        self.assertEqual([item[0]["pos_x"] for item in active], [-18.0, 0.0, 18.0])
+        self.assertEqual([item[0]["pos_y"] for item in active], [15.0, 50.0, 85.0])
+
+    def test_split_screen_group_cycle_restarts_after_full_group(self):
+        style = {
+            "layout_mode": "split_screen",
+            "split_screen_count": 3,
+            "split_screen_cycle_mode": True,
+            "split_screen_pos_y_1": 16.0,
+            "split_screen_pos_y_2": 48.0,
+            "split_screen_pos_y_3": 82.0,
+        }
+        subtitles = [
+            {"start": 0.0, "end": 1.0, "text": "one", "track": 1, "style": copy.deepcopy(style)},
+            {"start": 1.0, "end": 2.0, "text": "two", "track": 1, "style": copy.deepcopy(style)},
+            {"start": 2.0, "end": 3.0, "text": "three", "track": 1, "style": copy.deepcopy(style)},
+            {"start": 3.0, "end": 4.0, "text": "four", "track": 1, "style": copy.deepcopy(style)},
+            {"start": 4.0, "end": 5.0, "text": "five", "track": 1, "style": copy.deepcopy(style)},
+        ]
+
+        first_group = active_subtitles_at_time(subtitles, 2.5)
+        self.assertEqual([item[0]["text"] for item in first_group], ["one", "two", "three"])
+        self.assertEqual([item[0].get("_split_screen_slot") for item in first_group], [1, 2, 3])
+
+        restarted = active_subtitles_at_time(subtitles, 3.2)
+        self.assertEqual([item[0]["text"] for item in restarted], ["four"])
+        self.assertEqual([item[0].get("_split_screen_slot") for item in restarted], [1])
+        self.assertEqual([item[0]["pos_y"] for item in restarted], [16.0])
+
+        second_slot = active_subtitles_at_time(subtitles, 4.2)
+        self.assertEqual([item[0]["text"] for item in second_slot], ["four", "five"])
+        self.assertEqual([item[0].get("_split_screen_slot") for item in second_slot], [1, 2])
 
 
 class RenderRangeTests(unittest.TestCase):
@@ -392,6 +667,20 @@ class RenderCanvasLayerTests(unittest.TestCase):
         self.assertIn("duration 1.250", entry)
         self.assertIn("inpoint 0.500", inout)
         self.assertIn("outpoint 2.750", inout)
+
+    def test_video_mask_filter_overlays_normalized_color(self):
+        chain = render_pipeline_model.ffmpeg_video_mask_filter(
+            "bg", "masked", 1080, 1920, 3.2, color="#123abc", alpha=35
+        )
+
+        self.assertIn("color=c=0x123ABC@0.3500:s=1080x1920:d=3.200", chain)
+        self.assertIn("[bg][masked_mask]overlay=0:0:eof_action=pass:format=auto[masked]", chain)
+
+    def test_video_mask_filter_passthrough_when_transparent(self):
+        self.assertEqual(
+            render_pipeline_model.ffmpeg_video_mask_filter("bg", "out", 1080, 1920, 3.2, alpha=0),
+            "[bg]null[out]",
+        )
 
 
 class PreviewProxyTests(unittest.TestCase):
@@ -672,6 +961,57 @@ class TimelineInteractionTests(unittest.TestCase):
         self.assertIn("01:02.0", label)
         self.assertIn("03.5s", label)
 
+    def test_retime_subtitle_clip_extending_end_keeps_word_audio_times(self):
+        subtitle = {
+            "start": 0.0,
+            "end": 2.0,
+            "style": {"text_reveal_mode": "word_voice"},
+            "words": [
+                {"text": "God", "start": 0.0, "end": 0.5},
+                {"text": "knows", "start": 1.0, "end": 1.4},
+            ],
+        }
+
+        result = timeline_interaction.retime_subtitle_clip(subtitle, 0.0, 5.0)
+
+        self.assertEqual(result["mode"], "resize")
+        self.assertEqual(subtitle["end"], 5.0)
+        self.assertEqual([(w["start"], w["end"]) for w in subtitle["words"]], [(0.0, 0.5), (1.0, 1.4)])
+
+    def test_retime_subtitle_clip_pure_move_shifts_word_audio_times(self):
+        subtitle = {
+            "start": 1.0,
+            "end": 3.0,
+            "words": [
+                {"text": "God", "start": 1.2, "end": 1.7},
+                {"text": "knows", "start": 2.0, "end": 2.4},
+            ],
+        }
+
+        result = timeline_interaction.retime_subtitle_clip(subtitle, 2.5, 4.5)
+
+        self.assertEqual(result["mode"], "move")
+        self.assertAlmostEqual(subtitle["words"][0]["start"], 2.7)
+        self.assertAlmostEqual(subtitle["words"][1]["end"], 3.9)
+
+    def test_retime_subtitle_clip_all_reveal_stretches_words_on_resize(self):
+        subtitle = {
+            "start": 0.0,
+            "end": 2.0,
+            "style": {"text_reveal_mode": "all"},
+            "words": [
+                {"text": "God", "start": 0.0, "end": 0.5},
+                {"text": "knows", "start": 1.0, "end": 1.4},
+            ],
+        }
+
+        result = timeline_interaction.retime_subtitle_clip(subtitle, 0.0, 4.0)
+
+        self.assertEqual(result["mode"], "stretch_resize")
+        self.assertAlmostEqual(subtitle["words"][0]["end"], 1.0)
+        self.assertAlmostEqual(subtitle["words"][1]["start"], 2.0)
+        self.assertAlmostEqual(subtitle["words"][1]["end"], 2.8)
+
 
 class PlaybackClockTests(unittest.TestCase):
     def test_start_resets_when_already_at_end(self):
@@ -898,6 +1238,25 @@ class SubtitleActivityTests(unittest.TestCase):
 
         self.assertEqual(payload[0]["htmlText"], "fit:1080x1920")
 
+    def test_active_subtitle_payload_uses_split_screen_slots(self):
+        style = {"layout_mode": "split_screen", "split_screen_count": 3, "split_screen_pos_y_1": 16, "split_screen_pos_y_2": 48, "split_screen_pos_y_3": 82}
+        subtitles = [
+            {"start": 0.0, "end": 1.0, "text": "one", "style": copy.deepcopy(style)},
+            {"start": 1.0, "end": 2.0, "text": "two", "style": copy.deepcopy(style)},
+            {"start": 2.0, "end": 3.0, "text": "three", "style": copy.deepcopy(style)},
+        ]
+
+        payload = active_subtitle_payload(
+            subtitles,
+            2.5,
+            1080,
+            render_html=lambda sub, time_sec, width: f"{sub['text']}@{time_sec:.3f}",
+        )
+
+        self.assertEqual([item["idx"] for item in payload], [0, 1, 2])
+        self.assertEqual([item["pos_y"] for item in payload], [16.0, 48.0, 82.0])
+        self.assertTrue(payload[0]["htmlText"].startswith("one@0.998"))
+
     def test_active_subtitle_range_is_inclusive_and_tolerant(self):
         subtitle = {"start": "1.0", "end": "2.0"}
 
@@ -984,6 +1343,101 @@ class SubtitleRenderUtilsTests(unittest.TestCase):
         self.assertIn("color: #FFFFFF", html)
         self.assertNotIn("color: #FF3B30", html)
 
+    def test_split_screen_layout_renders_with_standard_inner_layout(self):
+        sub = {
+            "start": 0.0,
+            "end": 2.0,
+            "text": "faith stays visible",
+            "style": {"layout_mode": "split_screen", "use_hl": False, "size": 90, "max_lines": 2},
+        }
+
+        html = render_subtitle_html(sub, 0.5, 1080)
+
+        self.assertIn("Faith", html)
+        self.assertIn("Visible", html)
+
+    def test_smart_random_text_color_uses_enabled_palette_stably(self):
+        sub = {
+            "start": 0.0,
+            "end": 3.0,
+            "text": "mercy carries us",
+            "words": [
+                {"text": "mercy", "start": 0.0, "end": 0.7},
+                {"text": "carries", "start": 0.7, "end": 1.4},
+                {"text": "us", "start": 1.4, "end": 2.0},
+            ],
+            "style": {
+                "anim_type": "none",
+                "text_reveal_mode": "all",
+                "text_color_mode": "smart_random",
+                "text_random_palette": [
+                    {"color": "#FF0000", "enabled": True},
+                    {"color": "#0000FF", "enabled": False},
+                ],
+                "color_txt": "#FFFFFF",
+                "use_hl": False,
+                "size": 90,
+            },
+        }
+
+        html_a = render_subtitle_html(copy.deepcopy(sub), 1.0, 1080)
+        html_b = render_subtitle_html(copy.deepcopy(sub), 1.0, 1080)
+
+        self.assertEqual(html_a, html_b)
+        self.assertIn("color: #FF0000", html_a)
+        self.assertNotIn("#0000FF", html_a)
+
+    def test_random_text_palette_normalizes_defaults_and_disabled_colors(self):
+        palette = normalize_random_text_palette([
+            {"color": "ff9f0a", "enabled": False},
+            {"color": "not-a-color", "enabled": True},
+        ])
+
+        self.assertEqual(palette, [{"color": "#FF9F0A", "enabled": False}])
+
+    def test_smart_random_font_uses_enabled_pool_stably(self):
+        sub = {
+            "start": 0.0,
+            "end": 2.0,
+            "text": "faith moves",
+            "words": [
+                {"text": "faith", "start": 0.0, "end": 0.8},
+                {"text": "moves", "start": 0.8, "end": 1.6},
+            ],
+            "style": {
+                "anim_type": "none",
+                "text_reveal_mode": "all",
+                "font": "Noto Sans SC",
+                "font_random_mode": "smart_random",
+                "font_random_strategy": "rotate",
+                "font_random_pool": [
+                    {"font": "Arial", "enabled": True},
+                    {"font": "Times New Roman", "enabled": True},
+                    {"font": "Courier New", "enabled": False},
+                ],
+                "use_hl": False,
+                "size": 90,
+            },
+        }
+
+        html_a = render_subtitle_html(copy.deepcopy(sub), 0.5, 1080)
+        html_b = render_subtitle_html(copy.deepcopy(sub), 0.5, 1080)
+
+        self.assertEqual(html_a, html_b)
+        self.assertIn("font-family: 'Arial'", html_a)
+        self.assertIn("font-family: 'Times New Roman'", html_a)
+        self.assertNotIn("Courier New", html_a)
+
+    def test_random_font_pool_normalizes_names_and_enabled_flags(self):
+        pool = normalize_random_text_font_pool([
+            {"font": "Arial", "enabled": False},
+            {"family": "Arial", "enabled": True},
+            {"name": "Inter", "enabled": True},
+            {"font": "", "enabled": True},
+        ])
+
+        self.assertEqual(pool, [{"font": "Arial", "enabled": False}, {"font": "Inter", "enabled": True}])
+
     def test_highlight_style_variants_render_distinct_effects(self):
         base = {
             "start": 0.0,
@@ -1016,6 +1470,90 @@ class SubtitleRenderUtilsTests(unittest.TestCase):
         frame_html = render_subtitle_html(frame, 0.5, 1080)
         self.assertIn("box-shadow: 0 0 0", frame_html)
         self.assertIn("255, 0, 80", frame_html)
+
+    def test_full_text_roll_renders_clipped_window_and_holds_after_words(self):
+        sub = {
+            "start": 0.0,
+            "end": 6.0,
+            "text": "hello amen",
+            "words": [
+                {"text": "hello", "start": 0.0, "end": 1.0},
+                {"text": "amen", "start": 1.0, "end": 2.0},
+            ],
+            "style": {
+                "anim_type": "full_text_roll",
+                "full_roll_window_height": 44,
+                "full_roll_start_y": 30,
+                "full_roll_end_y": -10,
+                "full_roll_feather": 8,
+                "full_roll_lock_to_words": True,
+                "use_hl": False,
+                "inactive_alpha": 100,
+            },
+        }
+
+        start_html = render_subtitle_html(sub, 0.0, 1080)
+        hold_html = render_subtitle_html(sub, 5.5, 1080)
+
+        self.assertIn("sub-full-roll-window", start_html)
+        self.assertIn("height: 44.000vh", start_html)
+        self.assertIn("translateY(30.000vh)", start_html)
+        self.assertIn("black 8.000%", start_html)
+        self.assertIn("translateY(-10.000vh)", hold_html)
+
+    def test_voice_word_reveal_hides_future_words_but_keeps_layout_text(self):
+        sub = {
+            "start": 0.0,
+            "end": 3.0,
+            "text": "hello amen",
+            "words": [
+                {"text": "hello", "start": 0.0, "end": 0.8},
+                {"text": "amen", "start": 2.0, "end": 2.6},
+            ],
+            "style": {
+                "anim_type": "none",
+                "text_reveal_mode": "word_voice",
+                "voice_reveal_fade": 0.0,
+                "inactive_alpha": 100,
+                "use_hl": False,
+            },
+        }
+
+        mid_html = render_subtitle_html(sub, 1.0, 1080)
+        late_html = render_subtitle_html(sub, 2.1, 1080)
+
+        self.assertIn("Hello", mid_html)
+        self.assertIn("Amen", mid_html)
+        self.assertIn("opacity: 0.000", mid_html)
+        self.assertGreaterEqual(late_html.count("opacity: 1.000"), 2)
+
+    def test_voice_line_reveal_starts_whole_line_from_first_word_time(self):
+        sub = {
+            "start": 0.0,
+            "end": 4.0,
+            "text": "first line\nsecond line",
+            "words": [
+                {"text": "first", "start": 0.0, "end": 0.4},
+                {"text": "line", "start": 0.4, "end": 0.8},
+                {"text": "\nsecond", "start": 2.0, "end": 2.4},
+                {"text": "line", "start": 2.4, "end": 2.8},
+            ],
+            "style": {
+                "anim_type": "none",
+                "text_reveal_mode": "line_voice",
+                "voice_reveal_fade": 0.0,
+                "inactive_alpha": 100,
+                "use_hl": False,
+            },
+        }
+
+        before_second_line = render_subtitle_html(sub, 1.0, 1080)
+        after_second_line = render_subtitle_html(sub, 2.2, 1080)
+
+        self.assertIn("<br>", before_second_line)
+        self.assertIn("Second", before_second_line)
+        self.assertGreaterEqual(before_second_line.count("opacity: 0.000"), 2)
+        self.assertGreaterEqual(after_second_line.count("opacity: 1.000"), 3)
 
     def test_canva_fit_background_auto_scales_to_canvas_resolution(self):
         sub = {
@@ -1299,6 +1837,23 @@ class SubtitleTimingTests(unittest.TestCase):
             self.assertGreaterEqual(prev["end"], prev["start"] + 0.18)
             self.assertGreaterEqual(curr["start"], prev["end"] + 0.009)
 
+    def test_rebalance_can_preserve_long_caption_blocks(self):
+        words = [
+            {"text": f"word{i}", "start": i * 0.1, "end": i * 0.1 + 0.08}
+            for i in range(18)
+        ]
+        subs = [{"text": " ".join(w["text"] for w in words), "start": 0.0, "end": 1.8, "track": 1, "words": words}]
+        style = {"layout_mode": "standard", "size": 120, "box_width": 30, "max_lines": 1}
+
+        split_result, split_stats = rebalance_subtitle_layout(subs, fallback_style=style, allow_split=True)
+        preserved, preserved_stats = rebalance_subtitle_layout(subs, fallback_style=style, allow_split=False)
+
+        self.assertGreater(len(split_result), 1)
+        self.assertGreater(split_stats["split"], 0)
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(preserved_stats["split"], 0)
+        self.assertEqual(len(preserved[0]["words"]), 18)
+
     def test_readability_break_guard_keeps_orphan_words_with_next_phrase(self):
         self.assertTrue(
             should_defer_subtitle_break_for_readability(
@@ -1347,6 +1902,19 @@ class SubtitleTimingTests(unittest.TestCase):
         self.assertEqual(merged[0]["text"], "God sees your burden")
         self.assertEqual(len(merged[0]["words"]), 4)
 
+
+    def test_merge_short_subtitle_segments_enforces_four_to_seven_word_range(self):
+        subs = [
+            {"text": "God sees", "start": 0.0, "end": 0.5, "track": 1, "words": [{"text": "God", "start": 0.0, "end": 0.2}, {"text": "sees", "start": 0.2, "end": 0.5}]},
+            {"text": "your heart", "start": 1.1, "end": 1.6, "track": 1, "words": [{"text": "your", "start": 1.1, "end": 1.3}, {"text": "heart", "start": 1.3, "end": 1.6}]},
+            {"text": "today", "start": 1.7, "end": 2.0, "track": 1, "words": [{"text": "today", "start": 1.7, "end": 2.0}]},
+            {"text": "amen", "start": 2.1, "end": 2.4, "track": 1, "words": [{"text": "amen", "start": 2.1, "end": 2.4}]},
+        ]
+
+        merged = merge_short_subtitle_segments(subs, min_words=4, max_merged_words=7)
+
+        self.assertEqual([item["text"] for item in merged], ["God sees your heart today amen"])
+        self.assertEqual(len(merged[0]["words"]), 6)
 
     def test_fast_subtitle_pacing_merges_tiny_segments(self):
         subs = [

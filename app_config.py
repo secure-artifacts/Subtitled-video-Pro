@@ -19,6 +19,18 @@ PREVIEW_PROXY_RESOLUTION_OPTIONS = [
     "流畅 540p",
     "清晰 720p",
 ]
+DEFAULT_PREVIEW_EFFECT_QUALITY = "自动流畅"
+PREVIEW_EFFECT_QUALITY_OPTIONS = [
+    "效果完整",
+    "自动流畅",
+    "极速轻量",
+]
+DEFAULT_EXPORT_RENDER_QUALITY = "极速出片"
+EXPORT_RENDER_QUALITY_OPTIONS = [
+    "标准高清",
+    "清晰快速",
+    "极速出片",
+]
 PREVIEW_PROXY_RESOLUTION_PROFILES = {
     "极速 360p": {"height": 360, "fps": 18, "crf": 30},
     "流畅 540p": {"height": 540, "fps": 24, "crf": 26},
@@ -61,6 +73,32 @@ def set_preview_proxy_resolution(value):
     save_app_config(config)
     return value
 
+
+
+def get_preview_effect_quality():
+    value = str(load_app_config().get("preview_effect_quality") or DEFAULT_PREVIEW_EFFECT_QUALITY).strip()
+    return value if value in PREVIEW_EFFECT_QUALITY_OPTIONS else DEFAULT_PREVIEW_EFFECT_QUALITY
+
+
+def set_preview_effect_quality(value):
+    value = value if value in PREVIEW_EFFECT_QUALITY_OPTIONS else DEFAULT_PREVIEW_EFFECT_QUALITY
+    config = load_app_config()
+    config["preview_effect_quality"] = value
+    save_app_config(config)
+    return value
+
+
+def get_export_render_quality():
+    value = str(load_app_config().get("export_render_quality") or DEFAULT_EXPORT_RENDER_QUALITY).strip()
+    return value if value in EXPORT_RENDER_QUALITY_OPTIONS else DEFAULT_EXPORT_RENDER_QUALITY
+
+
+def set_export_render_quality(value):
+    value = value if value in EXPORT_RENDER_QUALITY_OPTIONS else DEFAULT_EXPORT_RENDER_QUALITY
+    config = load_app_config()
+    config["export_render_quality"] = value
+    save_app_config(config)
+    return value
 
 def preview_proxy_settings(value=None):
     value = value if value in PREVIEW_PROXY_RESOLUTION_OPTIONS else get_preview_proxy_resolution()

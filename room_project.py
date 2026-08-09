@@ -15,20 +15,40 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
     QMessageBox, QFrame, QScrollArea, QGridLayout, QInputDialog, QGraphicsDropShadowEffect, QSplitter,
     QFileDialog, QDialog, QComboBox, QTextEdit, QLineEdit, QDialogButtonBox, QFormLayout,
-    QMenu, QAbstractItemView
+    QMenu, QAbstractItemView, QSpinBox, QCheckBox, QProgressDialog, QApplication, QColorDialog
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QUrl, QMimeData, QTimer
-from PyQt6.QtGui import QPixmap, QCursor, QFont, QIcon, QDesktopServices, QDrag
+from PyQt6.QtGui import QPixmap, QCursor, QFont, QFontDatabase, QFontInfo, QIcon, QDesktopServices, QDrag, QColor
 
 from project_io import create_reel, load_project, get_project_folders, get_project_folder_paths, get_reels_in_folder, save_project, sync_project_assets_to_project_dir
 from ui_components import default_signature_config, normalize_signature_config
 from project_ui_kit import ProjectMetrics, compact_project_grid_columns, project_card_width
 from media_probe import get_exact_duration, get_video_stream_duration
 from app_config import load_app_config, save_app_config
-from app_storage import read_json_file, resolve_user_file
-from font_assets import font_package_entries_for_families
-from font_registry import is_safe_font
-from caption_presets import REFERENCE_NARRATIVE_CHUNK_MODE, merge_built_in_style_presets
+from app_storage import read_json_file, resolve_user_file, write_json_file
+from render_pipeline_model import normalize_hex_color
+from font_assets import font_asset_summary, font_package_entries_for_families
+from font_registry import is_safe_font, safe_font_names
+from caption_rewrite import rewrite_project_subtitles
+from caption_presets import (
+    chunk_mode_options,
+    fixed_word_count_for_chunk_mode,
+    is_exact_single_word_chunk_mode,
+    make_fixed_chunk_mode_label,
+    make_smart_chunk_mode_label,
+    merge_built_in_style_presets,
+    narrative_chunk_word_bounds,
+    smart_transcription_word_bounds,
+)
+from caption_mode_presets import (
+    caption_mode_config_from_values,
+    caption_mode_final_chunk,
+    delete_caption_mode_preset,
+    is_built_in_caption_mode_preset,
+    load_caption_mode_presets,
+    normalize_caption_mode_preset,
+    save_caption_mode_preset,
+)
 from workspace_config import (
     CLOUD_LINK_MODE_COLLAB,
     CLOUD_LINK_MODE_COPY,
@@ -70,6 +90,7 @@ PROJECT_FOLDER_CARD_HEIGHT = 184
 PROJECT_ACTION_CARD_HEIGHT = 154
 PROJECT_STYLE_PRESETS_FILE = resolve_user_file("style_presets.json", legacy_root=os.getcwd(), kind="config")
 PROJECT_SIGNATURE_PRESETS_FILE = resolve_user_file("signature_presets.json", legacy_root=os.getcwd(), kind="config")
+PROJECT_TITLE_PRESETS_FILE = resolve_user_file("title_caption_presets.json", legacy_root=os.getcwd(), kind="config")
 PROJECT_STYLE_POSITION_KEY = "__position__"
 PROJECT_MEDIA_EXTS = (".mp4", ".mov", ".webm", ".jpg", ".jpeg", ".png")
 PROJECT_AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
@@ -78,19 +99,863 @@ PROJECT_MUSIC_ASSIGN_MODES = (
     ("随机分配", "random"),
     ("固定第一首", "first"),
 )
-PROJECT_CHUNK_MODES = [
-    "短句快速 (1-3字)",
-    "智能重点短句 (3-4词为主)",
-    "智能听译 (4-7词，适配双行按词)",
-    REFERENCE_NARRATIVE_CHUNK_MODE,
-    "自然短句 (1-4词)",
-    "双词节奏 (2词/句)",
-    "三词短句 (3词/句)",
-    "四词短句 (4词/句)",
-    "双行大段 (约10字，智能折行)",
-    "单字轰炸 (1字/句)",
-]
+PROJECT_CHUNK_MODES = chunk_mode_options()
 PROJECT_TIMING_MODES = ["L Cut (字幕提前进入)", "J Cut (字幕稍后收尾)", "对齐声音 (按停顿)"]
+
+def _project_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "enable", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "off", "disable", "disabled"}:
+        return False
+    return bool(value)
+
+
+def normalize_project_video_mask_config(raw=None):
+    raw = raw or {}
+    enabled = _project_bool(raw.get("video_mask_enabled", raw.get("enabled", False)), False)
+    color = normalize_hex_color(raw.get("video_mask_color", raw.get("color", "#000000")), "#000000")
+    try:
+        alpha = int(round(float(raw.get("video_mask_alpha", raw.get("alpha", 35)) or 0)))
+    except Exception:
+        alpha = 35
+    alpha = max(0, min(100, alpha))
+    return {
+        "video_mask_enabled": bool(enabled),
+        "video_mask_color": color,
+        "video_mask_alpha": alpha,
+    }
+
+
+class CaptionModeConfigDialog(QDialog):
+    def __init__(self, parent=None, reel_count=0, current_chunk_mode="", current_timing_mode=""):
+        super().__init__(parent)
+        self.setWindowTitle("批量听译模式")
+        self.setMinimumWidth(520)
+        self._updating = False
+        self.base_chunk_mode = current_chunk_mode or ""
+        self.presets = {}
+        self._temporary_preset_names = set()
+
+        layout = QVBoxLayout(self)
+        title = QLabel(f"将统一设置 {int(reel_count or 0)} 个 Reel 的后续 AI 听译 / 重新打轴规则")
+        title.setWordWrap(True)
+        title.setStyleSheet("color:#f9e2af; font-weight:bold; padding-bottom:6px;")
+        layout.addWidget(title)
+
+        form = QFormLayout()
+        preset_row = QHBoxLayout()
+        self.preset_combo = QComboBox()
+        self.save_preset_btn = QPushButton("保存")
+        self.delete_preset_btn = QPushButton("删除")
+        self.save_preset_btn.setToolTip("把当前固定/智能词数、时间贴合保存成自己的听译模式预设。")
+        self.delete_preset_btn.setToolTip("删除自己保存的听译模式预设；内置预设不会被删除。")
+        preset_row.addWidget(self.preset_combo, stretch=1)
+        preset_row.addWidget(self.save_preset_btn)
+        preset_row.addWidget(self.delete_preset_btn)
+        form.addRow("听译预设", preset_row)
+
+        self.kind_combo = QComboBox()
+        self.kind_combo.addItems(["智能范围模式", "固定字数模式"])
+        form.addRow("分段方式", self.kind_combo)
+
+        self.fixed_words_combo = QComboBox()
+        for count in range(1, 13):
+            self.fixed_words_combo.addItem(f"{count}词/句", count)
+        form.addRow("固定字数", self.fixed_words_combo)
+
+        range_row = QHBoxLayout()
+        self.min_words_spin = QSpinBox()
+        self.min_words_spin.setRange(1, 30)
+        self.min_words_spin.setValue(4)
+        self.max_words_spin = QSpinBox()
+        self.max_words_spin.setRange(1, 30)
+        self.max_words_spin.setValue(7)
+        range_row.addWidget(QLabel("最小"))
+        range_row.addWidget(self.min_words_spin)
+        range_row.addWidget(QLabel("最大"))
+        range_row.addWidget(self.max_words_spin)
+        form.addRow("智能词数范围", range_row)
+
+        self.timing_combo = QComboBox()
+        self.timing_combo.addItems(["保持原时间模式"] + PROJECT_TIMING_MODES)
+        if current_timing_mode:
+            timing_idx = self.timing_combo.findText(current_timing_mode)
+            if timing_idx >= 0:
+                self.timing_combo.setCurrentIndex(timing_idx)
+        form.addRow("时间贴合", self.timing_combo)
+        layout.addLayout(form)
+
+        self.preview_label = QLabel("")
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setStyleSheet("background:#181825; color:#cdd6f4; border:1px solid #313244; border-radius:8px; padding:10px;")
+        layout.addWidget(self.preview_label)
+
+        hint = QLabel("建议：单个词/2词用固定模式；4-7、5-9、8-12、14-18 用智能范围。预设负责一键填值，下方数值才是最终可控参数。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#a6adc8; padding-top:4px;")
+        layout.addWidget(hint)
+
+        self.rewrite_now_check = QCheckBox("立即启动 AI 听译重写字幕（覆盖现有字幕）")
+        self.rewrite_now_check.setChecked(True)
+        self.rewrite_now_check.setStyleSheet("color:#f9e2af; font-weight:bold; padding:4px 0;")
+        layout.addWidget(self.rewrite_now_check)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._refresh_preset_combo(current_chunk_mode, current_timing_mode)
+        self.preset_combo.currentTextChanged.connect(self._apply_preset)
+        self.save_preset_btn.clicked.connect(self.save_current_preset)
+        self.delete_preset_btn.clicked.connect(self.delete_current_preset)
+        self.kind_combo.currentIndexChanged.connect(self._sync_controls)
+        self.fixed_words_combo.currentIndexChanged.connect(self._sync_controls)
+        self.min_words_spin.valueChanged.connect(self._on_min_words_changed)
+        self.max_words_spin.valueChanged.connect(self._on_max_words_changed)
+        self.timing_combo.currentTextChanged.connect(self._sync_controls)
+        if self.preset_combo.count():
+            self._apply_preset(self.preset_combo.currentText())
+        else:
+            self._apply_config(caption_mode_config_from_values(current_chunk_mode, current_timing_mode))
+
+    def _fixed_count_for_mode(self, mode):
+        if is_exact_single_word_chunk_mode(mode):
+            return 1
+        return fixed_word_count_for_chunk_mode(mode)
+
+    def _range_for_mode(self, mode):
+        min_words, max_words = narrative_chunk_word_bounds(mode)
+        if max_words > 0:
+            return min_words, max_words
+        min_words, max_words = smart_transcription_word_bounds(mode)
+        if max_words > 0:
+            return min_words, max_words
+        text = str(mode or "")
+        match = re.search(r"(\d+)\s*-\s*(\d+)", text)
+        if match:
+            left, right = int(match.group(1)), int(match.group(2))
+            return max(1, min(left, right)), min(30, max(left, right))
+        if "约10" in text or "10" in text:
+            return 8, 12
+        return 4, 7
+
+    def _refresh_preset_combo(self, current_chunk_mode="", current_timing_mode="", current_name=""):
+        self.presets = load_caption_mode_presets()
+        self._temporary_preset_names = set()
+        selected_name = current_name
+        current_chunk_mode = str(current_chunk_mode or "").strip()
+        if current_chunk_mode and not selected_name:
+            for name, cfg in self.presets.items():
+                if normalize_caption_mode_preset(cfg).get("chunk_mode") == current_chunk_mode:
+                    selected_name = name
+                    break
+            if not selected_name:
+                selected_name = f"当前设置 · {current_chunk_mode[:28]}"
+                self.presets[selected_name] = caption_mode_config_from_values(current_chunk_mode, current_timing_mode)
+                self._temporary_preset_names.add(selected_name)
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        for name in self.presets.keys():
+            self.preset_combo.addItem(name)
+        if selected_name:
+            idx = self.preset_combo.findText(selected_name)
+            if idx >= 0:
+                self.preset_combo.setCurrentIndex(idx)
+        self.preset_combo.blockSignals(False)
+
+    def _apply_config(self, raw):
+        cfg = normalize_caption_mode_preset(raw)
+        self._updating = True
+        self.base_chunk_mode = cfg.get("chunk_mode", "")
+        if cfg.get("strategy") == "fixed":
+            self.kind_combo.setCurrentIndex(1)
+            idx = self.fixed_words_combo.findData(cfg.get("fixed_words", 1) or 1)
+            if idx < 0:
+                self.fixed_words_combo.addItem(f"{cfg.get('fixed_words', 1)}词/句", cfg.get("fixed_words", 1))
+                idx = self.fixed_words_combo.findData(cfg.get("fixed_words", 1) or 1)
+            self.fixed_words_combo.setCurrentIndex(max(0, idx))
+        else:
+            self.kind_combo.setCurrentIndex(0)
+            self.min_words_spin.setValue(int(cfg.get("min_words", 4) or 4))
+            self.max_words_spin.setValue(int(cfg.get("max_words", 7) or 7))
+        timing = cfg.get("timing_mode", "")
+        timing_idx = self.timing_combo.findText(timing) if timing else 0
+        self.timing_combo.setCurrentIndex(timing_idx if timing_idx >= 0 else 0)
+        self._updating = False
+        self._sync_controls()
+
+    def _apply_preset(self, name):
+        if self._updating or not name:
+            return
+        self._apply_config(self.presets.get(name, {}))
+
+    def _on_min_words_changed(self, value):
+        if value > self.max_words_spin.value():
+            self.max_words_spin.setValue(value)
+        self._sync_controls()
+
+    def _on_max_words_changed(self, value):
+        if value < self.min_words_spin.value():
+            self.min_words_spin.setValue(value)
+        self._sync_controls()
+
+    def _sync_controls(self, *args):
+        if self._updating:
+            return
+        fixed_mode = self.kind_combo.currentIndex() == 1
+        self.fixed_words_combo.setEnabled(fixed_mode)
+        self.min_words_spin.setEnabled(not fixed_mode)
+        self.max_words_spin.setEnabled(not fixed_mode)
+        self.preview_label.setText(
+            f"最终听译模式：{self.selected_chunk_mode()}\n"
+            f"时间贴合：{self.selected_timing_label()}\n"
+            f"预设：{self.preset_combo.currentText() or '未选择'}"
+        )
+
+    def _current_config(self):
+        strategy = "fixed" if self.kind_combo.currentIndex() == 1 else "smart"
+        return caption_mode_config_from_values(
+            self.base_chunk_mode,
+            self.selected_timing_mode(),
+            strategy,
+            self.fixed_words_combo.currentData() or 1,
+            self.min_words_spin.value(),
+            self.max_words_spin.value(),
+        )
+
+    def selected_chunk_mode(self):
+        return caption_mode_final_chunk(self._current_config(), self.base_chunk_mode)
+
+    def selected_timing_label(self):
+        return self.timing_combo.currentText()
+
+    def selected_timing_mode(self):
+        text = self.timing_combo.currentText()
+        if "保持" in text:
+            return ""
+        return text
+
+    def save_current_preset(self):
+        default_name = self.preset_combo.currentText()
+        if default_name in self._temporary_preset_names or is_built_in_caption_mode_preset(default_name):
+            default_name = ""
+        name, ok = QInputDialog.getText(self, "保存听译预设", "预设名称：", text=default_name)
+        name = str(name or "").strip()
+        if not ok or not name:
+            return
+        if is_built_in_caption_mode_preset(name):
+            QMessageBox.information(self, "内置预设", "内置预设不能覆盖，请换一个自己的名称。")
+            return
+        save_caption_mode_preset(name, self._current_config())
+        self._refresh_preset_combo(current_name=name)
+        self._apply_preset(name)
+
+    def delete_current_preset(self):
+        name = self.preset_combo.currentText()
+        if not name or name in self._temporary_preset_names or is_built_in_caption_mode_preset(name):
+            QMessageBox.information(self, "内置预设", "内置/当前临时预设不能删除，可以保存成自己的预设后再管理。")
+            return
+        if delete_caption_mode_preset(name):
+            self._refresh_preset_combo()
+            if self.preset_combo.count():
+                self._apply_preset(self.preset_combo.currentText())
+
+    def should_rewrite_now(self):
+        return bool(getattr(self, "rewrite_now_check", None) and self.rewrite_now_check.isChecked())
+
+class VideoMaskConfigDialog(QDialog):
+    def __init__(self, parent=None, reel_count=0, current_mask=None):
+        super().__init__(parent)
+        self.setWindowTitle("批量画面蒙版")
+        self.setMinimumWidth(430)
+        current = normalize_project_video_mask_config(current_mask or {})
+
+        layout = QVBoxLayout(self)
+        title = QLabel(f"将统一设置 {int(reel_count or 0)} 个 Reel 的全局画面蒙版")
+        title.setWordWrap(True)
+        title.setStyleSheet("color:#f9e2af; font-weight:bold; padding-bottom:6px;")
+        layout.addWidget(title)
+
+        form = QFormLayout()
+        self.enable_check = QCheckBox("启用画面蒙版叠加")
+        self.enable_check.setChecked(bool(current.get("video_mask_enabled", False)))
+        form.addRow("总开关", self.enable_check)
+
+        color_row = QHBoxLayout()
+        self.color_input = QLineEdit(current.get("video_mask_color", "#000000"))
+        self.color_input.setMaxLength(7)
+        self.color_input.setPlaceholderText("#000000")
+        self.color_input.setStyleSheet("background:#181825; color:#cdd6f4; border:1px solid #313244; border-radius:7px; padding:7px 9px;")
+        self.color_button = QPushButton("点击选色")
+        self.color_button.clicked.connect(self.pick_color)
+        color_row.addWidget(self.color_input, stretch=1)
+        color_row.addWidget(self.color_button)
+        form.addRow("蒙版颜色", color_row)
+
+        self.alpha_spin = QSpinBox()
+        self.alpha_spin.setRange(0, 100)
+        self.alpha_spin.setValue(int(current.get("video_mask_alpha", 35)))
+        self.alpha_spin.setSuffix(" %")
+        form.addRow("透明度", self.alpha_spin)
+        layout.addLayout(form)
+
+        self.preview_label = QLabel("")
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setStyleSheet("background:#181825; color:#cdd6f4; border:1px solid #313244; border-radius:8px; padding:10px;")
+        layout.addWidget(self.preview_label)
+        hint = QLabel("提示：黑色 15-35% 适合压暗画面突出字幕；白色/暖色低透明度可以做柔光氛围。取消勾选会批量关闭蒙版。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#a6adc8;")
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.enable_check.stateChanged.connect(self._sync_preview)
+        self.color_input.textChanged.connect(self._sync_preview)
+        self.alpha_spin.valueChanged.connect(self._sync_preview)
+        self._sync_preview()
+
+    def pick_color(self):
+        current = normalize_hex_color(self.color_input.text(), "#000000")
+        color = QColorDialog.getColor(QColor(current), self, "选择画面蒙版颜色")
+        if color.isValid():
+            self.color_input.setText(color.name().upper())
+
+    def selected_mask(self):
+        return normalize_project_video_mask_config({
+            "video_mask_enabled": self.enable_check.isChecked(),
+            "video_mask_color": self.color_input.text(),
+            "video_mask_alpha": self.alpha_spin.value(),
+        })
+
+    def _sync_preview(self, *args):
+        mask = self.selected_mask()
+        status = "启用" if mask["video_mask_enabled"] and mask["video_mask_alpha"] > 0 else "关闭"
+        self.preview_label.setText(
+            f"最终设置：{status}\n颜色：{mask['video_mask_color']}\n透明度：{mask['video_mask_alpha']}%"
+        )
+
+
+PROJECT_TITLE_TEMPLATE_LINES = [
+    "{name}",
+    "{audio}",
+    "PLEASE LISTEN",
+    "THIS IS FOR YOU",
+    "A MESSAGE FOR YOU",
+    "DON'T SKIP THIS",
+    "WAIT FOR THE END",
+]
+
+
+PROJECT_TITLE_FONT_PRIORITY = [
+    "Anton",
+    "Bebas Neue",
+    "Abril Fatface",
+    "Archivo Black",
+    "Cinzel Black",
+    "Great Vibes",
+    "Dancing Script",
+    "Playfair Display",
+    "Bodoni Moda",
+    "Oswald",
+    "Montserrat",
+    "Poppins",
+    "Impact",
+    "TikTok Sans",
+    "Noto Sans SC",
+]
+
+def _project_int(value, default=0, minimum=None, maximum=None):
+    try:
+        result = int(round(float(value)))
+    except Exception:
+        result = int(default)
+    if minimum is not None:
+        result = max(int(minimum), result)
+    if maximum is not None:
+        result = min(int(maximum), result)
+    return result
+
+
+def _project_float(value, default=0.0, minimum=None, maximum=None):
+    try:
+        result = float(value)
+    except Exception:
+        result = float(default)
+    if minimum is not None:
+        result = max(float(minimum), result)
+    if maximum is not None:
+        result = min(float(maximum), result)
+    return result
+
+
+def default_project_title_caption_config():
+    return {
+        "source": "pool",
+        "fixed_title": "PLEASE LISTEN",
+        "title_pool": "\n".join(PROJECT_TITLE_TEMPLATE_LINES),
+        "duration_mode": "audio",
+        "duration_seconds": 6,
+        "replace_existing": True,
+        "font": "TikTok Sans",
+        "font_weight": "900",
+        "size": 78,
+        "color_txt": "#FFFFFF",
+        "stroke_width": 4,
+        "stroke_color": "#000000",
+        "pos_x": 0,
+        "pos_y": -34,
+        "max_lines": 2,
+        "box_width": 86,
+        "uppercase": True,
+    }
+
+
+def normalize_project_title_caption_config(raw=None):
+    cfg = default_project_title_caption_config()
+    if isinstance(raw, dict):
+        cfg.update(copy.deepcopy(raw))
+    cfg["source"] = str(cfg.get("source") or "pool")
+    if cfg["source"] not in {"pool", "fixed", "project", "audio"}:
+        cfg["source"] = "pool"
+    cfg["duration_mode"] = str(cfg.get("duration_mode") or "audio")
+    if cfg["duration_mode"] not in {"audio", "project", "fixed"}:
+        cfg["duration_mode"] = "audio"
+    cfg["fixed_title"] = str(cfg.get("fixed_title") or "").strip() or "PLEASE LISTEN"
+    cfg["title_pool"] = str(cfg.get("title_pool") or "").strip() or "\n".join(PROJECT_TITLE_TEMPLATE_LINES)
+    cfg["duration_seconds"] = _project_float(cfg.get("duration_seconds"), 6.0, 0.2, 600.0)
+    cfg["replace_existing"] = _project_bool(cfg.get("replace_existing"), True)
+    cfg["font"] = str(cfg.get("font") or "TikTok Sans").strip() or "TikTok Sans"
+    cfg["font_weight"] = str(cfg.get("font_weight") or "900").strip()
+    if cfg["font_weight"] not in {"400", "700", "900"}:
+        cfg["font_weight"] = "900"
+    cfg["size"] = _project_int(cfg.get("size"), 78, 12, 260)
+    cfg["color_txt"] = normalize_hex_color(cfg.get("color_txt"), "#FFFFFF")
+    cfg["stroke_width"] = _project_int(cfg.get("stroke_width"), 4, 0, 24)
+    cfg["stroke_color"] = normalize_hex_color(cfg.get("stroke_color"), "#000000")
+    cfg["pos_x"] = _project_int(cfg.get("pos_x"), 0, -80, 80)
+    cfg["pos_y"] = _project_int(cfg.get("pos_y"), -34, -90, 90)
+    cfg["max_lines"] = _project_int(cfg.get("max_lines"), 2, 1, 4)
+    cfg["box_width"] = _project_int(cfg.get("box_width"), 86, 24, 100)
+    cfg["uppercase"] = _project_bool(cfg.get("uppercase"), True)
+    return cfg
+
+
+def built_in_project_title_caption_presets():
+    base = default_project_title_caption_config()
+    top = copy.deepcopy(base)
+    bottom = copy.deepcopy(base)
+    bottom.update({"pos_y": 34, "size": 70})
+    gold = copy.deepcopy(base)
+    gold.update({"color_txt": "#F6C14A", "stroke_color": "#6F3A05", "stroke_width": 3, "pos_y": -30})
+    return {
+        "顶部白字标题": top,
+        "底部白字标题": bottom,
+        "金色标题": gold,
+    }
+
+
+def project_title_caption_style(config):
+    cfg = normalize_project_title_caption_config(config)
+    return {
+        "size": cfg["size"],
+        "font": cfg["font"],
+        "font_weight": cfg["font_weight"],
+        "font_style": "normal",
+        "color_txt": cfg["color_txt"],
+        "color_hl": cfg["color_txt"],
+        "bg_mode": "none",
+        "bg_color": "#000000",
+        "bg_alpha": 0,
+        "stroke_width": cfg["stroke_width"],
+        "stroke_color": cfg["stroke_color"],
+        "stroke_o_width": 0,
+        "stroke_o_color": "#000000",
+        "stroke_softness": 0,
+        "shadow_x": 0,
+        "shadow_y": 5,
+        "shadow_blur": 10,
+        "shadow_color": "#000000",
+        "shadow_alpha": 55,
+        "line_height": 1.06,
+        "text_align": "center",
+        "text_transform": "uppercase" if cfg["uppercase"] else "none",
+        "letter_spacing": 0,
+        "word_spacing": 0,
+        "layout_mode": "standard",
+        "layout_variant": "auto",
+        "box_layout": "fixed",
+        "box_width": float(cfg["box_width"]),
+        "box_height": 0.0,
+        "max_lines": cfg["max_lines"],
+        "anim_type": "none",
+        "font_motion": "none",
+        "hl_motion": "stable",
+        "hl_style": "none",
+        "use_hl": False,
+        "inactive_alpha": 100,
+        "pop_speed": 0.12,
+        "pop_bounce": 112,
+        "text_texture": "none",
+        "text_3d_enable": False,
+    }
+
+
+class _TitleFormatMap(dict):
+    def __missing__(self, key):
+        return "{" + str(key) + "}"
+
+
+class TitleCaptionConfigDialog(QDialog):
+    def __init__(self, parent=None, reel_count=0, presets=None):
+        super().__init__(parent)
+        self.setWindowTitle("批量标题字幕")
+        self.setMinimumWidth(560)
+        self._updating = False
+        self.presets = presets or built_in_project_title_caption_presets()
+
+        layout = QVBoxLayout(self)
+        title = QLabel(f"给 {int(reel_count or 0)} 个 Reel 生成标题字幕条，默认时长自动匹配配音/音频长度")
+        title.setWordWrap(True)
+        title.setStyleSheet("color:#f9e2af; font-weight:bold; padding-bottom:6px;")
+        layout.addWidget(title)
+
+        preset_row = QHBoxLayout()
+        self.preset_combo = QComboBox()
+        self._refresh_preset_combo()
+        self.save_preset_btn = QPushButton("保存预设")
+        self.delete_preset_btn = QPushButton("删除预设")
+        preset_row.addWidget(QLabel("标题预设"))
+        preset_row.addWidget(self.preset_combo, stretch=1)
+        preset_row.addWidget(self.save_preset_btn)
+        preset_row.addWidget(self.delete_preset_btn)
+        layout.addLayout(preset_row)
+
+        form = QFormLayout()
+        self.source_combo = QComboBox()
+        self.source_combo.addItem("标题池随机", "pool")
+        self.source_combo.addItem("固定标题", "fixed")
+        self.source_combo.addItem("工程/Reel 名称", "project")
+        self.source_combo.addItem("音频文件名", "audio")
+        form.addRow("标题来源", self.source_combo)
+
+        self.fixed_title_input = QLineEdit("PLEASE LISTEN")
+        self.fixed_title_input.setPlaceholderText("固定标题文字")
+        form.addRow("固定标题", self.fixed_title_input)
+
+        self.title_pool_edit = QTextEdit()
+        self.title_pool_edit.setFixedHeight(92)
+        self.title_pool_edit.setPlaceholderText("一行一个标题；支持 {name} / {audio} / {index}")
+        self.title_pool_edit.setPlainText("\n".join(PROJECT_TITLE_TEMPLATE_LINES))
+        form.addRow("随机标题池", self.title_pool_edit)
+
+        duration_row = QHBoxLayout()
+        self.duration_combo = QComboBox()
+        self.duration_combo.addItem("匹配音频/配音时长", "audio")
+        self.duration_combo.addItem("匹配工程时长", "project")
+        self.duration_combo.addItem("固定秒数", "fixed")
+        self.duration_seconds_spin = QSpinBox()
+        self.duration_seconds_spin.setRange(1, 600)
+        self.duration_seconds_spin.setValue(6)
+        self.duration_seconds_spin.setSuffix(" 秒")
+        duration_row.addWidget(self.duration_combo, stretch=1)
+        duration_row.addWidget(self.duration_seconds_spin)
+        form.addRow("字幕条时长", duration_row)
+
+        font_row = QHBoxLayout()
+        self.font_combo = QComboBox()
+        self.font_combo.setEditable(True)
+        self.font_combo.addItems(self._title_font_names())
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(12, 260)
+        self.size_spin.setValue(78)
+        self.size_spin.setSuffix(" px")
+        font_row.addWidget(self.font_combo, stretch=1)
+        font_row.addWidget(self.size_spin)
+        form.addRow("字体 / 大小", font_row)
+
+        self.font_weight_combo = QComboBox()
+        self.font_weight_combo.addItem("黑体 900（爆款标题）", "900")
+        self.font_weight_combo.addItem("加粗 700", "700")
+        self.font_weight_combo.addItem("常规 400（保留字体味道）", "400")
+        form.addRow("字重", self.font_weight_combo)
+
+        self.font_sample_label = QLabel("Aa TITLE SAMPLE")
+        self.font_sample_label.setMinimumHeight(54)
+        self.font_sample_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.font_sample_label.setStyleSheet("background:#11111b; color:#ffffff; border:1px solid #313244; border-radius:8px; padding:8px;")
+        form.addRow("字体预览", self.font_sample_label)
+        color_row = QHBoxLayout()
+        self.text_color_input = QLineEdit("#FFFFFF")
+        self.text_color_input.setMaxLength(7)
+        self.text_color_btn = QPushButton("点击选色")
+        self.text_color_btn.clicked.connect(lambda: self.pick_color(self.text_color_input, "选择标题文字颜色"))
+        color_row.addWidget(self.text_color_input)
+        color_row.addWidget(self.text_color_btn)
+        form.addRow("文字颜色", color_row)
+
+        stroke_row = QHBoxLayout()
+        self.stroke_color_input = QLineEdit("#000000")
+        self.stroke_color_input.setMaxLength(7)
+        self.stroke_color_btn = QPushButton("点击选色")
+        self.stroke_color_btn.clicked.connect(lambda: self.pick_color(self.stroke_color_input, "选择标题描边颜色"))
+        self.stroke_width_spin = QSpinBox()
+        self.stroke_width_spin.setRange(0, 24)
+        self.stroke_width_spin.setValue(4)
+        self.stroke_width_spin.setSuffix(" px")
+        stroke_row.addWidget(self.stroke_color_input)
+        stroke_row.addWidget(self.stroke_color_btn)
+        stroke_row.addWidget(self.stroke_width_spin)
+        form.addRow("描边颜色 / 粗细", stroke_row)
+
+        pos_row = QHBoxLayout()
+        self.pos_x_spin = QSpinBox()
+        self.pos_x_spin.setRange(-80, 80)
+        self.pos_x_spin.setValue(0)
+        self.pos_x_spin.setSuffix(" %")
+        self.pos_y_spin = QSpinBox()
+        self.pos_y_spin.setRange(-90, 90)
+        self.pos_y_spin.setValue(-34)
+        self.pos_y_spin.setSuffix(" %")
+        pos_row.addWidget(QLabel("X"))
+        pos_row.addWidget(self.pos_x_spin)
+        pos_row.addWidget(QLabel("Y"))
+        pos_row.addWidget(self.pos_y_spin)
+        form.addRow("位置", pos_row)
+
+        layout_row = QHBoxLayout()
+        self.box_width_spin = QSpinBox()
+        self.box_width_spin.setRange(24, 100)
+        self.box_width_spin.setValue(86)
+        self.box_width_spin.setSuffix(" %")
+        self.max_lines_spin = QSpinBox()
+        self.max_lines_spin.setRange(1, 4)
+        self.max_lines_spin.setValue(2)
+        layout_row.addWidget(QLabel("宽度"))
+        layout_row.addWidget(self.box_width_spin)
+        layout_row.addWidget(QLabel("最多行"))
+        layout_row.addWidget(self.max_lines_spin)
+        form.addRow("容器", layout_row)
+
+        self.uppercase_check = QCheckBox("标题自动大写")
+        self.uppercase_check.setChecked(True)
+        form.addRow("大小写", self.uppercase_check)
+
+        self.replace_existing_check = QCheckBox("替换已有标题字幕条")
+        self.replace_existing_check.setChecked(True)
+        form.addRow("重复处理", self.replace_existing_check)
+        layout.addLayout(form)
+
+        self.preview_label = QLabel("")
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setStyleSheet("background:#181825; color:#cdd6f4; border:1px solid #313244; border-radius:8px; padding:10px;")
+        layout.addWidget(self.preview_label)
+
+        hint = QLabel("标题池支持变量：{name}=工程名，{audio}=音频名，{index}=选中顺序。生成后会作为普通字幕片段出现在精修时间线里。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#a6adc8;")
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        for widget in (
+            self.source_combo, self.fixed_title_input, self.title_pool_edit, self.duration_combo,
+            self.duration_seconds_spin, self.font_combo, self.font_weight_combo, self.size_spin, self.text_color_input,
+            self.stroke_color_input, self.stroke_width_spin, self.pos_x_spin, self.pos_y_spin,
+            self.box_width_spin, self.max_lines_spin, self.uppercase_check, self.replace_existing_check,
+        ):
+            if hasattr(widget, "currentIndexChanged"):
+                widget.currentIndexChanged.connect(self._sync_preview)
+            if hasattr(widget, "textChanged"):
+                widget.textChanged.connect(self._sync_preview)
+            if hasattr(widget, "valueChanged"):
+                widget.valueChanged.connect(self._sync_preview)
+            if hasattr(widget, "stateChanged"):
+                widget.stateChanged.connect(self._sync_preview)
+        self.font_combo.currentTextChanged.connect(self._sync_preview)
+        self.preset_combo.currentTextChanged.connect(self.apply_preset_name)
+        self.save_preset_btn.clicked.connect(self.save_current_preset)
+        self.delete_preset_btn.clicked.connect(self.delete_current_preset)
+        self.apply_config(default_project_title_caption_config())
+
+    def _refresh_preset_combo(self, current_name=""):
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        for name in self.presets.keys():
+            self.preset_combo.addItem(name)
+        if current_name:
+            idx = self.preset_combo.findText(current_name)
+            if idx >= 0:
+                self.preset_combo.setCurrentIndex(idx)
+        self.preset_combo.blockSignals(False)
+
+    def _title_font_names(self):
+        names = []
+        seen = set()
+
+        def add(name):
+            text = str(name or "").strip()
+            key = text.casefold()
+            if text and key not in seen:
+                seen.add(key)
+                names.append(text)
+
+        for name in PROJECT_TITLE_FONT_PRIORITY:
+            add(name)
+        try:
+            for name in font_asset_summary().get("families", []) or []:
+                add(name)
+        except Exception:
+            pass
+        try:
+            for name in safe_font_names(include_approved=True, include_open=True):
+                add(name)
+        except Exception:
+            pass
+        try:
+            for name in QFontDatabase.families():
+                if name in {"Impact", "Arial", "Segoe UI", "Microsoft YaHei"}:
+                    add(name)
+        except Exception:
+            pass
+        return names or ["TikTok Sans", "Noto Sans SC", "Arial"]
+
+    def pick_color(self, input_widget, title):
+        current = normalize_hex_color(input_widget.text(), "#FFFFFF")
+        color = QColorDialog.getColor(QColor(current), self, title)
+        if color.isValid():
+            input_widget.setText(color.name().upper())
+
+    def selected_config(self):
+        cfg = {
+            "source": self.source_combo.currentData() or "pool",
+            "fixed_title": self.fixed_title_input.text(),
+            "title_pool": self.title_pool_edit.toPlainText(),
+            "duration_mode": self.duration_combo.currentData() or "audio",
+            "duration_seconds": self.duration_seconds_spin.value(),
+            "replace_existing": self.replace_existing_check.isChecked(),
+            "font": self.font_combo.currentText(),
+            "font_weight": self.font_weight_combo.currentData() or "900",
+            "size": self.size_spin.value(),
+            "color_txt": self.text_color_input.text(),
+            "stroke_width": self.stroke_width_spin.value(),
+            "stroke_color": self.stroke_color_input.text(),
+            "pos_x": self.pos_x_spin.value(),
+            "pos_y": self.pos_y_spin.value(),
+            "box_width": self.box_width_spin.value(),
+            "max_lines": self.max_lines_spin.value(),
+            "uppercase": self.uppercase_check.isChecked(),
+        }
+        return normalize_project_title_caption_config(cfg)
+
+    def apply_config(self, raw):
+        cfg = normalize_project_title_caption_config(raw)
+        self._updating = True
+        self.source_combo.setCurrentIndex(max(0, self.source_combo.findData(cfg["source"])))
+        self.fixed_title_input.setText(cfg["fixed_title"])
+        self.title_pool_edit.setPlainText(cfg["title_pool"])
+        self.duration_combo.setCurrentIndex(max(0, self.duration_combo.findData(cfg["duration_mode"])))
+        self.duration_seconds_spin.setValue(int(round(cfg["duration_seconds"])))
+        self.font_combo.setCurrentText(cfg["font"])
+        weight_idx = self.font_weight_combo.findData(cfg["font_weight"])
+        self.font_weight_combo.setCurrentIndex(weight_idx if weight_idx >= 0 else 0)
+        self.size_spin.setValue(cfg["size"])
+        self.text_color_input.setText(cfg["color_txt"])
+        self.stroke_width_spin.setValue(cfg["stroke_width"])
+        self.stroke_color_input.setText(cfg["stroke_color"])
+        self.pos_x_spin.setValue(cfg["pos_x"])
+        self.pos_y_spin.setValue(cfg["pos_y"])
+        self.box_width_spin.setValue(cfg["box_width"])
+        self.max_lines_spin.setValue(cfg["max_lines"])
+        self.uppercase_check.setChecked(bool(cfg["uppercase"]))
+        self.replace_existing_check.setChecked(bool(cfg["replace_existing"]))
+        self._updating = False
+        self._sync_preview()
+
+    def apply_preset_name(self, name):
+        if self._updating or not name:
+            return
+        if name in self.presets:
+            self.apply_config(self.presets[name])
+
+    def save_current_preset(self):
+        name, ok = QInputDialog.getText(self, "保存标题预设", "预设名称：")
+        name = str(name or "").strip()
+        if not ok or not name:
+            return
+        saved = read_json_file(PROJECT_TITLE_PRESETS_FILE, default={})
+        if not isinstance(saved, dict):
+            saved = {}
+        saved[name] = self.selected_config()
+        write_json_file(PROJECT_TITLE_PRESETS_FILE, saved)
+        self.presets = built_in_project_title_caption_presets()
+        self.presets.update(saved)
+        self._refresh_preset_combo(name)
+
+    def delete_current_preset(self):
+        name = self.preset_combo.currentText()
+        saved = read_json_file(PROJECT_TITLE_PRESETS_FILE, default={})
+        if not isinstance(saved, dict) or name not in saved:
+            QMessageBox.information(self, "内置预设", "内置标题预设不能删除，可以另存一个自己的预设。")
+            return
+        del saved[name]
+        write_json_file(PROJECT_TITLE_PRESETS_FILE, saved)
+        self.presets = built_in_project_title_caption_presets()
+        self.presets.update(saved)
+        self._refresh_preset_combo()
+        if self.preset_combo.count():
+            self.apply_preset_name(self.preset_combo.currentText())
+
+    def _sync_preview(self, *args):
+        if self._updating:
+            return
+        cfg = self.selected_config()
+        duration_label = {
+            "audio": "匹配音频/配音时长",
+            "project": "匹配工程时长",
+            "fixed": f"固定 {int(cfg['duration_seconds'])} 秒",
+        }.get(cfg["duration_mode"], "匹配音频/配音时长")
+        source_label = {
+            "pool": "标题池随机",
+            "fixed": "固定标题",
+            "project": "工程/Reel 名称",
+            "audio": "音频文件名",
+        }.get(cfg["source"], "标题池随机")
+        self.duration_seconds_spin.setEnabled(cfg["duration_mode"] == "fixed")
+        self.fixed_title_input.setEnabled(cfg["source"] == "fixed")
+        self.title_pool_edit.setEnabled(cfg["source"] == "pool")
+        sample_font = QFont(cfg["font"])
+        sample_font.setPointSize(24)
+        weight_map = {"400": QFont.Weight.Normal, "700": QFont.Weight.Bold, "900": QFont.Weight.Black}
+        sample_font.setWeight(weight_map.get(cfg["font_weight"], QFont.Weight.Black))
+        self.font_sample_label.setFont(sample_font)
+        self.font_sample_label.setStyleSheet(
+            f"background:#11111b; color:{cfg['color_txt']}; border:1px solid #313244; border-radius:8px; "
+            f"padding:8px; font-family:'{cfg['font']}'; font-weight:{cfg['font_weight']};"
+        )
+        actual_font = QFontInfo(sample_font).family()
+        recognized = actual_font.casefold() == cfg["font"].casefold()
+        font_note = "已识别" if recognized else f"可能回退到 {actual_font}"
+        self.preview_label.setText(
+            f"来源：{source_label} / 时长：{duration_label}\n"
+            f"字体：{cfg['font']} {cfg['size']}px / 字重：{cfg['font_weight']} / {font_note}\n"
+            f"颜色：{cfg['color_txt']} / 描边：{cfg['stroke_color']} {cfg['stroke_width']}px\n"
+            f"位置：X {cfg['pos_x']}% · Y {cfg['pos_y']}% / 最多 {cfg['max_lines']} 行 / {'替换已有标题' if cfg['replace_existing'] else '保留已有标题'}"
+        )
+
+
 PROJECT_HALL_THEMES = {
     "dark_star": {
         "name": "暗色星空",
@@ -1502,7 +2367,9 @@ class ProjectView(QWidget):
         self.btn_replace_music_selected = QPushButton("批量换配乐")
         self.btn_apply_style_selected = QPushButton("套样式")
         self.btn_apply_signature_selected = QPushButton("\u6362\u7f72\u540d")
+        self.btn_title_caption_selected = QPushButton("标题字幕")
         self.btn_caption_mode_selected = QPushButton("听译模式")
+        self.btn_video_mask_selected = QPushButton("画面蒙版")
         self.btn_move_selected = QPushButton("移动选中")
         self.btn_trash_selected = QPushButton("删除选中")
         self.btn_open_trash = QPushButton("垃圾桶")
@@ -1510,8 +2377,10 @@ class ProjectView(QWidget):
         self.btn_replace_music_selected.setToolTip("给选中的 Reel 批量替换配乐，可一次选择多首并顺序循环或随机分配。")
         self.btn_apply_style_selected.setToolTip("把一个字幕样式预设批量应用到选中 Reel 的现有字幕和默认样式。")
         self.btn_apply_signature_selected.setToolTip("\u7ed9\u9009\u4e2d\u7684 Reel \u6279\u91cf\u5957\u7528\u7f72\u540d\u6a21\u677f\u3001\u53ea\u66ff\u6362\u7f72\u540d\u6587\u5b57\uff0c\u6216\u5173\u95ed\u7f72\u540d\u3002")
+        self.btn_title_caption_selected.setToolTip("给选中的 Reel 一键生成标题字幕条；标题可随机，时长默认匹配音频/配音长度。")
         self.btn_caption_mode_selected.setToolTip("批量修改选中 Reel 的听译断句模式和时间模式，方便统一调度。")
-        for btn in (self.btn_audit_folder, self.btn_audit_workspace, self.btn_safe_fonts, self.btn_replace_video_selected, self.btn_replace_music_selected, self.btn_apply_style_selected, self.btn_apply_signature_selected, self.btn_caption_mode_selected, self.btn_move_selected, self.btn_trash_selected, self.btn_open_trash):
+        self.btn_video_mask_selected.setToolTip("给选中的 Reel 批量启用/关闭全局画面蒙版，并统一颜色与透明度。")
+        for btn in (self.btn_audit_folder, self.btn_audit_workspace, self.btn_safe_fonts, self.btn_replace_video_selected, self.btn_replace_music_selected, self.btn_apply_style_selected, self.btn_apply_signature_selected, self.btn_title_caption_selected, self.btn_caption_mode_selected, self.btn_video_mask_selected, self.btn_move_selected, self.btn_trash_selected, self.btn_open_trash):
             btn.setStyleSheet("background-color: #313244; color: #cdd6f4; border: none; border-radius: 8px; padding: 8px 12px; font-weight: bold;")
         self.btn_audit_folder.clicked.connect(self.show_current_folder_audit)
         self.btn_audit_workspace.clicked.connect(self.show_workspace_audit)
@@ -1520,7 +2389,9 @@ class ProjectView(QWidget):
         self.btn_replace_music_selected.clicked.connect(self.replace_selected_reels_music_dialog)
         self.btn_apply_style_selected.clicked.connect(self.apply_style_to_selected_reels_dialog)
         self.btn_apply_signature_selected.clicked.connect(self.apply_signature_to_selected_reels_dialog)
+        self.btn_title_caption_selected.clicked.connect(self.apply_title_caption_to_selected_reels_dialog)
         self.btn_caption_mode_selected.clicked.connect(self.update_selected_reels_caption_modes_dialog)
+        self.btn_video_mask_selected.clicked.connect(self.apply_video_mask_to_selected_reels_dialog)
         self.btn_move_selected.clicked.connect(self.move_selected_reels_dialog)
         self.btn_trash_selected.clicked.connect(self.delete_selected_reels)
         self.btn_open_trash.clicked.connect(self.open_trash_folder)
@@ -1532,7 +2403,9 @@ class ProjectView(QWidget):
         tools_row.addWidget(self.btn_replace_music_selected)
         tools_row.addWidget(self.btn_apply_style_selected)
         tools_row.addWidget(self.btn_apply_signature_selected)
+        tools_row.addWidget(self.btn_title_caption_selected)
         tools_row.addWidget(self.btn_caption_mode_selected)
+        tools_row.addWidget(self.btn_video_mask_selected)
         tools_row.addWidget(self.btn_move_selected)
         tools_row.addWidget(self.btn_trash_selected)
         tools_row.addWidget(self.btn_open_trash)
@@ -1788,7 +2661,9 @@ class ProjectView(QWidget):
             getattr(self, "btn_replace_music_selected", None),
             getattr(self, "btn_apply_style_selected", None),
             getattr(self, "btn_apply_signature_selected", None),
+            getattr(self, "btn_title_caption_selected", None),
             getattr(self, "btn_caption_mode_selected", None),
+            getattr(self, "btn_video_mask_selected", None),
             getattr(self, "btn_move_selected", None),
             getattr(self, "btn_trash_selected", None),
             getattr(self, "btn_open_trash", None),
@@ -3551,6 +4426,197 @@ class ProjectView(QWidget):
             lambda order, reel_path: self._apply_signature_to_reel(reel_path, mode, preset_signature, replacement_text),
         )
         self._finish_selected_reel_batch_update(success, errors, "批量换署名完成")
+
+    def _load_project_title_presets(self):
+        presets = built_in_project_title_caption_presets()
+        saved = read_json_file(PROJECT_TITLE_PRESETS_FILE, default={})
+        if isinstance(saved, dict):
+            presets.update(saved)
+        return presets
+
+    def _plain_stem_title(self, value, fallback="TITLE"):
+        text = os.path.splitext(os.path.basename(str(value or "")))[0]
+        text = re.sub(r"^[\s\d._-]+", "", text)
+        text = re.sub(r"[_-]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text or fallback
+
+    def _title_caption_context(self, project, reel_path, order):
+        edit_state = project.get("room_state", {}).get("edit_room", {}) if isinstance(project, dict) else {}
+        audio_path = edit_state.get("audio_path", "") or project.get("media_files", {}).get("audio_path", "")
+        project_name = project.get("project_name") or self._plain_stem_title(reel_path, "TITLE")
+        return _TitleFormatMap({
+            "name": self._plain_stem_title(project_name, project_name),
+            "reel": self._plain_stem_title(reel_path, project_name),
+            "audio": self._plain_stem_title(audio_path, project_name),
+            "index": str(int(order or 0) + 1),
+        })
+
+    def _render_title_caption_text(self, config, project, reel_path, order):
+        cfg = normalize_project_title_caption_config(config)
+        context = self._title_caption_context(project, reel_path, order)
+        if cfg["source"] == "fixed":
+            template = cfg["fixed_title"]
+        elif cfg["source"] == "project":
+            template = "{name}"
+        elif cfg["source"] == "audio":
+            template = "{audio}"
+        else:
+            lines = [line.strip() for line in cfg["title_pool"].splitlines() if line.strip()]
+            template = random.choice(lines) if lines else "{name}"
+        try:
+            text = str(template).format_map(context)
+        except Exception:
+            text = str(template or "")
+        text = re.sub(r"\s+", " ", text).strip()
+        return text or context.get("name", "TITLE")
+
+    def _project_duration_for_title_caption(self, edit_state):
+        candidates = []
+        try:
+            candidates.append(float(edit_state.get("duration", 0.0) or 0.0))
+        except Exception:
+            pass
+        for clip in edit_state.get("video_clips", []) or []:
+            if isinstance(clip, dict):
+                try:
+                    candidates.append(float(clip.get("end", 0.0) or 0.0))
+                except Exception:
+                    pass
+        for sub in edit_state.get("subs_data", []) or []:
+            if isinstance(sub, dict):
+                try:
+                    candidates.append(float(sub.get("end", 0.0) or 0.0))
+                except Exception:
+                    pass
+        return max([value for value in candidates if value > 0.0] or [10.0])
+
+    def _title_caption_time_range(self, config, project):
+        cfg = normalize_project_title_caption_config(config)
+        edit_state = project.get("room_state", {}).get("edit_room", {}) if isinstance(project, dict) else {}
+        if cfg["duration_mode"] == "fixed":
+            return 0.0, max(0.2, float(cfg["duration_seconds"]))
+        if cfg["duration_mode"] == "audio":
+            audio_path = edit_state.get("audio_path", "") or project.get("media_files", {}).get("audio_path", "")
+            a_trim = edit_state.get("a_trim") or []
+            try:
+                start = float(a_trim[0] or 0.0) if len(a_trim) >= 1 else 0.0
+            except Exception:
+                start = 0.0
+            try:
+                end = float(a_trim[1] or start) if len(a_trim) >= 2 else start
+            except Exception:
+                end = start
+            if end <= start and audio_path and os.path.exists(audio_path):
+                dur = float(get_exact_duration(audio_path) or 0.0)
+                if dur > 0:
+                    end = start + dur
+            if end > start:
+                return max(0.0, start), max(start + 0.2, end)
+        return 0.0, max(0.2, self._project_duration_for_title_caption(edit_state))
+
+    def _apply_title_caption_to_reel(self, reel_path, config, order=0):
+        project = load_project(reel_path)
+        edit_state = project.setdefault("room_state", {}).setdefault("edit_room", {})
+        cfg = normalize_project_title_caption_config(config)
+        title_text = self._render_title_caption_text(cfg, project, reel_path, order)
+        start, end = self._title_caption_time_range(cfg, project)
+        title_sub = {
+            "type": "title_caption",
+            "title_caption": True,
+            "text": title_text,
+            "start": float(start),
+            "end": float(end),
+            "track": 0,
+            "pos_x": float(cfg["pos_x"]),
+            "pos_y": float(cfg["pos_y"]),
+            "style": project_title_caption_style(cfg),
+        }
+        subs = edit_state.get("subs_data")
+        if not isinstance(subs, list):
+            subs = project.get("subs_data", []) if isinstance(project.get("subs_data"), list) else []
+        subs = [copy.deepcopy(sub) for sub in subs if isinstance(sub, dict)]
+        if cfg["replace_existing"]:
+            subs = [sub for sub in subs if not (sub.get("title_caption") or sub.get("type") == "title_caption")]
+        subs.insert(0, title_sub)
+        edit_state["subs_data"] = subs
+        try:
+            edit_state["duration"] = max(float(edit_state.get("duration", 0.0) or 0.0), float(end))
+        except Exception:
+            edit_state["duration"] = float(end)
+        project["subs_data"] = copy.deepcopy(subs)
+        return save_project(reel_path, project)
+
+    def apply_title_caption_to_selected_reels_dialog(self):
+        reel_paths = self._selected_visible_reel_paths()
+        if not reel_paths:
+            return QMessageBox.information(self, "未选择", "先在工程面板里选择要生成标题字幕的 Reel。")
+        dialog = TitleCaptionConfigDialog(self, len(reel_paths), self._load_project_title_presets())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        config = dialog.selected_config()
+        mode_label = {
+            "audio": "匹配音频/配音时长",
+            "project": "匹配工程时长",
+            "fixed": f"固定 {int(config['duration_seconds'])} 秒",
+        }.get(config["duration_mode"], "匹配音频/配音时长")
+        reply = QMessageBox.question(
+            self,
+            "批量标题字幕",
+            f"将为 {len(reel_paths)} 个 Reel 生成标题字幕条。\n\n时长：{mode_label}\n字体：{config['font']} {config['size']}px\n位置：X {config['pos_x']}% / Y {config['pos_y']}%\n\n确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        success, errors = self._apply_selected_reel_updates(
+            reel_paths,
+            lambda order, reel_path: self._apply_title_caption_to_reel(reel_path, config, order),
+        )
+        self._finish_selected_reel_batch_update(success, errors, "批量标题字幕完成")
+
+    def _current_video_mask_for_reels(self, reel_paths):
+        if not reel_paths:
+            return normalize_project_video_mask_config()
+        try:
+            project = load_project(reel_paths[0])
+            edit_state = project.get("room_state", {}).get("edit_room", {})
+            return normalize_project_video_mask_config(edit_state)
+        except Exception:
+            return normalize_project_video_mask_config()
+
+    def _apply_video_mask_to_reel(self, reel_path, mask_config):
+        project = load_project(reel_path)
+        edit_state = project.setdefault("room_state", {}).setdefault("edit_room", {})
+        edit_state.update(normalize_project_video_mask_config(mask_config))
+        return save_project(reel_path, project)
+
+    def apply_video_mask_to_selected_reels_dialog(self):
+        reel_paths = self._selected_visible_reel_paths()
+        if not reel_paths:
+            return QMessageBox.information(self, "未选择", "先在工程面板里选择要批量设置画面蒙版的 Reel。")
+        if self.is_cloud_workspace() and not self.ensure_cloud_identity():
+            return
+        dialog = VideoMaskConfigDialog(self, len(reel_paths), self._current_video_mask_for_reels(reel_paths))
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        mask_config = dialog.selected_mask()
+        status = "启用" if mask_config["video_mask_enabled"] and mask_config["video_mask_alpha"] > 0 else "关闭"
+        reply = QMessageBox.question(
+            self,
+            "批量画面蒙版",
+            f"将为 {len(reel_paths)} 个 Reel 设置全局画面蒙版：\n\n状态：{status}\n颜色：{mask_config['video_mask_color']}\n透明度：{mask_config['video_mask_alpha']}%\n\n确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        success, errors = self._apply_selected_reel_updates(
+            reel_paths,
+            lambda order, reel_path: self._apply_video_mask_to_reel(reel_path, mask_config),
+        )
+        self._finish_selected_reel_batch_update(success, errors, "批量画面蒙版完成")
+
     def _update_reel_caption_modes(self, reel_path, chunk_mode, timing_mode):
         project = load_project(reel_path)
         edit_state = project.setdefault("room_state", {}).setdefault("edit_room", {})
@@ -3559,32 +4625,98 @@ class ProjectView(QWidget):
             edit_state["timing_mode"] = timing_mode
         return save_project(reel_path, project)
 
+    def _rewrite_reel_caption_modes(self, reel_path, chunk_mode, timing_mode, progress=None):
+        project = load_project(reel_path)
+        project, stats = rewrite_project_subtitles(project, chunk_mode, timing_mode, progress=progress)
+        return save_project(reel_path, project), stats
+
+    def _apply_selected_reel_caption_rewrites(self, reel_paths, chunk_mode, timing_mode):
+        success = 0
+        errors = []
+        current_path = self.project_data.get("project_path", "") if isinstance(self.project_data, dict) else ""
+        current_path_abs = os.path.normcase(os.path.abspath(current_path)) if current_path else ""
+        updated_current = False
+
+        progress_dialog = QProgressDialog("\u6b63\u5728\u51c6\u5907 AI \u542c\u8bd1\u91cd\u5199...", "\u53d6\u6d88", 0, len(reel_paths), self)
+        progress_dialog.setWindowTitle("\u6279\u91cf AI \u542c\u8bd1\u91cd\u5199")
+        progress_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress_dialog.setMinimumDuration(0)
+
+        for order, reel_path in enumerate(reel_paths):
+            if progress_dialog.wasCanceled():
+                errors.append("\u7528\u6237\u53d6\u6d88\u540e\u7eed\u4efb\u52a1")
+                break
+            name = os.path.basename(reel_path)
+            progress_dialog.setValue(order)
+            progress_dialog.setLabelText(f"{order + 1}/{len(reel_paths)}  {name}\n\u6b63\u5728\u542f\u52a8 AI \u542c\u8bd1...")
+            QApplication.processEvents()
+
+            def progress_cb(message, color="#cdd6f4", reel_name=name, index=order):
+                progress_dialog.setLabelText(f"{index + 1}/{len(reel_paths)}  {reel_name}\n{message}")
+                QApplication.processEvents()
+
+            try:
+                updated_project, _stats = self._rewrite_reel_caption_modes(reel_path, chunk_mode, timing_mode, progress=progress_cb)
+                success += 1
+                if current_path_abs and os.path.normcase(os.path.abspath(reel_path)) == current_path_abs:
+                    self.project_data = updated_project
+                    updated_current = True
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+
+        progress_dialog.setValue(len(reel_paths))
+        progress_dialog.close()
+
+        if updated_current:
+            self.sync_current_project_to_main()
+            self.sync_current_project_label()
+        if self.is_cloud_workspace():
+            try:
+                update_manifest_from_workspace(self.workspace)
+            except Exception:
+                pass
+        self.refresh_reels_grid()
+        return success, errors
+
     def update_selected_reels_caption_modes_dialog(self):
         reel_paths = self._selected_visible_reel_paths()
         if not reel_paths:
             return QMessageBox.information(self, "未选择", "先在工程面板里选择要统一听译模式的 Reel。")
-        chunk_mode, ok = QInputDialog.getItem(self, "批量听译模式", "选择断句 / 字数模式：", PROJECT_CHUNK_MODES, 2, False)
-        if not ok or not chunk_mode:
+        current_chunk_mode = ""
+        current_timing_mode = ""
+        try:
+            first_project = load_project(reel_paths[0])
+            first_state = first_project.get("room_state", {}).get("edit_room", {})
+            current_chunk_mode = first_state.get("chunk_mode", "")
+            current_timing_mode = first_state.get("timing_mode", "")
+        except Exception:
+            pass
+        dialog = CaptionModeConfigDialog(self, len(reel_paths), current_chunk_mode, current_timing_mode)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        timing_choices = ["保持原时间模式"] + PROJECT_TIMING_MODES
-        timing_mode, ok = QInputDialog.getItem(self, "批量听译模式", "选择时间模式：", timing_choices, 0, False)
-        if not ok:
-            return
-        timing_value = "" if timing_mode == "保持原时间模式" else timing_mode
+        chunk_mode = dialog.selected_chunk_mode()
+        timing_value = dialog.selected_timing_mode()
+        timing_mode = dialog.selected_timing_label()
+        rewrite_now = dialog.should_rewrite_now()
+        action_note = "会立即调用 AI 听译并覆盖现有字幕。" if rewrite_now else "只保存规则，不重写现有字幕。"
         reply = QMessageBox.question(
             self,
             "批量听译模式",
-            f"将为 {len(reel_paths)} 个 Reel 设置：\n\n断句：{chunk_mode}\n时间：{timing_mode}\n\n这会影响后续 AI 听译/重新打轴，不会擅自重写现有字幕时间轴。确定继续吗？",
+            f"将为 {len(reel_paths)} 个 Reel 设置：\n\n断句：{chunk_mode}\n时间：{timing_mode}\n\n{action_note}确定继续吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        success, errors = self._apply_selected_reel_updates(
-            reel_paths,
-            lambda order, reel_path: self._update_reel_caption_modes(reel_path, chunk_mode, timing_value),
-        )
-        self._finish_selected_reel_batch_update(success, errors, "批量听译模式完成")
+        if rewrite_now:
+            success, errors = self._apply_selected_reel_caption_rewrites(reel_paths, chunk_mode, timing_value)
+            self._finish_selected_reel_batch_update(success, errors, "批量 AI 听译重写完成")
+        else:
+            success, errors = self._apply_selected_reel_updates(
+                reel_paths,
+                lambda order, reel_path: self._update_reel_caption_modes(reel_path, chunk_mode, timing_value),
+            )
+            self._finish_selected_reel_batch_update(success, errors, "批量听译模式完成")
 
     def _apply_selected_reel_updates(self, reel_paths, updater):
         success = 0
@@ -3698,9 +4830,15 @@ class ProjectView(QWidget):
         if hasattr(self, "btn_apply_signature_selected"):
             self.btn_apply_signature_selected.setEnabled(count > 0)
             self.btn_apply_signature_selected.setText(f"\u6362\u7f72\u540d({count})" if count else "\u6362\u7f72\u540d")
+        if hasattr(self, "btn_title_caption_selected"):
+            self.btn_title_caption_selected.setEnabled(count > 0)
+            self.btn_title_caption_selected.setText(f"标题字幕({count})" if count else "标题字幕")
         if hasattr(self, "btn_caption_mode_selected"):
             self.btn_caption_mode_selected.setEnabled(count > 0)
             self.btn_caption_mode_selected.setText(f"听译模式({count})" if count else "听译模式")
+        if hasattr(self, "btn_video_mask_selected"):
+            self.btn_video_mask_selected.setEnabled(count > 0)
+            self.btn_video_mask_selected.setText(f"画面蒙版({count})" if count else "画面蒙版")
         if hasattr(self, "btn_move_selected"):
             self.btn_move_selected.setEnabled(count > 0)
         if hasattr(self, "btn_trash_selected"):

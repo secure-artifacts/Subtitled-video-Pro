@@ -9,6 +9,7 @@ import threading
 import subprocess
 import shutil
 import copy
+import time
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFrame, QProgressBar, QTextEdit, QFileDialog, QMessageBox, QDoubleSpinBox,
@@ -20,7 +21,7 @@ from PyQt6.QtGui import QPixmap, QCursor
 from core import get_ffmpeg_cmd, get_ffprobe_cmd
 from app_theme import apply_tinted_styles
 from room_theme_bridge import apply_room_theme_bridge
-from app_config import get_output_resolution, load_app_config, resolution_to_size, save_app_config
+from app_config import EXPORT_RENDER_QUALITY_OPTIONS, get_export_render_quality, get_output_resolution, load_app_config, resolution_to_size, save_app_config, set_export_render_quality
 from app_storage import read_json_file, resolve_user_file, write_json_file
 from render_config import build_video_encoder_args, get_render_profile
 from render_pipeline_model import (
@@ -31,8 +32,10 @@ from render_pipeline_model import (
     ffmpeg_exact_layer_filter,
     ffmpeg_layer_overlay_xy,
     ffmpeg_layer_scale_filter,
+    ffmpeg_video_mask_filter,
 )
-from render_timing import active_subtitles_for_frame, build_subtitle_frame_schedule, render_tail_padding_seconds, subtitle_supersample
+from render_timing import active_subtitles_for_frame, build_subtitle_frame_schedule, render_tail_padding_seconds, subtitle_continuous_fps, subtitle_event_fps, subtitle_supersample
+from render_performance import export_render_profile, simplify_signature_for_export, simplify_subtitle_for_export, summarize_project_render_cost
 from playwright.sync_api import sync_playwright
 
 from font_assets import font_face_css
@@ -435,8 +438,18 @@ class DeliverView(QWidget):
         self.active_render_duration = None
         self.active_render_range = None
         self.active_render_format = None
+        self.export_render_quality = get_export_render_quality()
         self._cpu_retry_args = []
         self._cpu_retry_attempted = False
+        self._render_total_started_at = 0.0
+        self._render_html_started_at = 0.0
+        self._render_ffmpeg_started_at = 0.0
+        self._render_html_elapsed = 0.0
+        self._render_ffmpeg_elapsed = 0.0
+        self._render_subtitle_frame_count = 0
+        self._render_frame_schedule_count = 0
+        self._render_encoder_label = ""
+        self._render_last_ffmpeg_speed = ""
         self.export_job_control = CooperativeJobControl()
         self.init_ui()
 
@@ -506,6 +519,17 @@ class DeliverView(QWidget):
         self.export_format_combo.setStyleSheet("background: #313244; color: #cdd6f4; padding: 5px; font-size: 13px; border-radius: 3px; font-weight: bold;")
         format_row.addWidget(self.export_format_combo, stretch=1)
         left_layout.addLayout(format_row)
+
+        quality_row = QHBoxLayout()
+        quality_row.addWidget(QLabel("导出性能:", styleSheet="color: #f9e2af; font-weight: bold;"))
+        self.export_quality_combo = QComboBox()
+        self.export_quality_combo.addItems(EXPORT_RENDER_QUALITY_OPTIONS)
+        self.export_quality_combo.setCurrentText(self.export_render_quality)
+        self.export_quality_combo.setToolTip("标准高清保留原截图质量；清晰快速会降低字幕透明层采样压力；极速出片用于长视频/批量先跑通。")
+        self.export_quality_combo.setStyleSheet("background: #313244; color: #cdd6f4; padding: 5px; font-size: 13px; border-radius: 3px; font-weight: bold;")
+        self.export_quality_combo.currentTextChanged.connect(self.on_export_render_quality_changed)
+        quality_row.addWidget(self.export_quality_combo, stretch=1)
+        left_layout.addLayout(quality_row)
 
         left_layout.addWidget(QLabel("✅ 多轨道时间推演 / 混音器 / 画面缩放\n底层核心已全量挂载！", styleSheet="color: #89b4fa; margin-top: 15px;"))
         batch_frame = QFrame()
@@ -752,6 +776,34 @@ class DeliverView(QWidget):
     def _render_export_format(self):
         return self.active_render_format or self._current_export_format()
 
+    def _current_export_quality(self):
+        combo = getattr(self, "export_quality_combo", None)
+        if combo is not None:
+            text = combo.currentText()
+        else:
+            text = getattr(self, "export_render_quality", "")
+        if text not in EXPORT_RENDER_QUALITY_OPTIONS:
+            text = get_export_render_quality()
+        self.export_render_quality = text
+        return text
+
+    def on_export_render_quality_changed(self, text):
+        self.export_render_quality = set_export_render_quality(text)
+        combo = getattr(self, "export_quality_combo", None)
+        if combo is not None and combo.currentText() != self.export_render_quality:
+            combo.blockSignals(True)
+            combo.setCurrentText(self.export_render_quality)
+            combo.blockSignals(False)
+        self.log_safe(f"导出性能模式: {self.export_render_quality}", "#89b4fa")
+
+    def _export_quality_profile(self):
+        return export_render_profile(
+            self._current_export_quality(),
+            default_scale=SUBTITLE_SUPERSAMPLE,
+            default_event_fps=subtitle_event_fps(),
+            default_continuous_fps=subtitle_continuous_fps(),
+        )
+
     def _is_canva_transparent_export(self, export_format=None):
         return (export_format or self._render_export_format()) == EXPORT_FORMAT_CANVA_WEBM
 
@@ -940,6 +992,67 @@ class DeliverView(QWidget):
         self.log_console.append(f"<span style='color:{color}'>{msg}</span>")
         self.log_console.verticalScrollBar().setValue(self.log_console.verticalScrollBar().maximum())
 
+    def _reset_render_perf_stats(self):
+        self._render_total_started_at = time.monotonic()
+        self._render_html_started_at = 0.0
+        self._render_ffmpeg_started_at = 0.0
+        self._render_html_elapsed = 0.0
+        self._render_ffmpeg_elapsed = 0.0
+        self._render_subtitle_frame_count = 0
+        self._render_frame_schedule_count = 0
+        self._render_encoder_label = ""
+        self._render_last_ffmpeg_speed = ""
+
+    def _log_render_cost_summary(self, project_state, design_state):
+        try:
+            summary = summarize_project_render_cost(project_state, design_state)
+            level = summary.get("level", "轻")
+            subs = summary.get("subtitle_count", 0)
+            styles = summary.get("style_count", 0)
+            score = summary.get("score", 0)
+            color = "#f9e2af" if score >= 4 else "#a6e3a1"
+            self.log_safe(f"性能体检: 复杂度 {level} / 字幕 {subs} 条 / 样式 {styles} 组 / 分数 {score}", color)
+            for note in summary.get("notes", [])[:5]:
+                self.log_safe(f"  - {note}", "#f9e2af")
+        except Exception as e:
+            self.log_safe(f"性能体检跳过: {e}", "#a6adc8")
+
+    def _log_render_perf_summary(self, exit_code):
+        try:
+            now = time.monotonic()
+            total_started = float(getattr(self, "_render_total_started_at", 0.0) or 0.0)
+            ffmpeg_started = float(getattr(self, "_render_ffmpeg_started_at", 0.0) or 0.0)
+            if ffmpeg_started:
+                self._render_ffmpeg_elapsed = max(0.0, now - ffmpeg_started)
+            total_elapsed = max(0.0, now - total_started) if total_started else 0.0
+            html_elapsed = max(0.0, float(getattr(self, "_render_html_elapsed", 0.0) or 0.0))
+            ffmpeg_elapsed = max(0.0, float(getattr(self, "_render_ffmpeg_elapsed", 0.0) or 0.0))
+            duration = max(0.001, float(getattr(self, "active_render_duration", 0.0) or self.spin_duration.value() or 0.001))
+            total_speed = duration / total_elapsed if total_elapsed > 0 else 0.0
+            ffmpeg_speed = duration / ffmpeg_elapsed if ffmpeg_elapsed > 0 else 0.0
+            frame_count = int(getattr(self, "_render_subtitle_frame_count", 0) or 0)
+            schedule_count = int(getattr(self, "_render_frame_schedule_count", 0) or 0)
+            status = "完成" if exit_code == 0 else f"失败 {exit_code}"
+            self.log_safe(
+                f"耗时统计({status}): 字幕层 {html_elapsed:.1f}s / FFmpeg {ffmpeg_elapsed:.1f}s / 总计 {total_elapsed:.1f}s / 总速度 {total_speed:.2f}x",
+                "#89b4fa" if exit_code == 0 else "#f38ba8",
+            )
+            if frame_count or schedule_count:
+                frame_rate = frame_count / html_elapsed if html_elapsed > 0 else 0.0
+                self.log_safe(f"字幕截图: 实际截图 {frame_count} 张 / 时间片 {schedule_count} 段 / 截图吞吐 {frame_rate:.1f} 张/秒", "#89b4fa")
+            if ffmpeg_elapsed > 0:
+                tail = f"，FFmpeg 报告 speed={self._render_last_ffmpeg_speed}" if getattr(self, "_render_last_ffmpeg_speed", "") else ""
+                self.log_safe(f"FFmpeg 合成速度: {ffmpeg_speed:.2f}x{tail}", "#89b4fa")
+            if exit_code == 0 and total_elapsed > 0:
+                if html_elapsed > max(4.0, ffmpeg_elapsed * 1.2):
+                    self.log_safe("慢点判断: 主要慢在字幕层截图。优先切“导出性能=清晰快速/极速出片”；软件会保留观感并自动收敛超大模糊、过厚3D和高亮拖尾。", "#f9e2af")
+                elif ffmpeg_elapsed > max(4.0, html_elapsed * 1.2):
+                    self.log_safe("慢点判断: 主要慢在 FFmpeg 合成。透明 WebM、素材解码、画面蒙版或电源平衡模式都会影响这里。", "#f9e2af")
+                else:
+                    self.log_safe("慢点判断: 字幕截图和 FFmpeg 都有耗时，属于综合负载。", "#a6adc8")
+        except Exception as e:
+            self.log_safe(f"耗时统计失败: {e}", "#a6adc8")
+
     def _cpu_render_profile(self):
         cpu_count = os.cpu_count() or 4
         return {
@@ -953,6 +1066,9 @@ class DeliverView(QWidget):
             return False
         self._cpu_retry_attempted = True
         self.log_safe("⚠️ 硬件编码失败，已自动切换 CPU x264 安全模式重试一次。", "#f9e2af")
+        self._render_encoder_label = "CPU x264 安全模式"
+        self._render_ffmpeg_started_at = time.monotonic()
+        self._render_last_ffmpeg_speed = ""
         self.render_process = QProcess(self)
         self.render_process.readyReadStandardError.connect(self.on_render_ready_read_error)
         self.render_process.finished.connect(self.on_render_finished)
@@ -1474,6 +1590,7 @@ class DeliverView(QWidget):
             self._summarize_project_state()
             self.out_file_path = self._unique_batch_output_path(project)
             self._freeze_render_job(project, self.project_state, self.design_state)
+            self._reset_render_perf_stats()
             self.progress_bar.setValue(0)
             self.log_safe(f"[{self.batch_render_index + 1}/{len(self.batch_project_paths)}] 开始渲染: {project.get('project_name', os.path.basename(project_path))}", "#f9e2af")
             self.log_safe(f"输出: {self.out_file_path}", "#89b4fa")
@@ -1597,6 +1714,7 @@ class DeliverView(QWidget):
             return
         self.out_file_path = self._normalize_export_output_path(file_path, export_format)
         self._freeze_render_job(self.project_data, self.project_state, self.design_state)
+        self._reset_render_perf_stats()
         self.btn_render.setEnabled(False)
         self.log_safe("🚀 [阶段 1/2] 启动全局时间推演引擎 (多轨道同频渲染)...", "#f9e2af")
         threading.Thread(target=self.generate_html_frames, daemon=True).start()
@@ -1605,6 +1723,9 @@ class DeliverView(QWidget):
         try:
             project_state = copy.deepcopy(self._render_project_state())
             design_state = copy.deepcopy(self._render_design_state())
+            if not getattr(self, "_render_total_started_at", 0.0):
+                self._reset_render_perf_stats()
+            self._render_html_started_at = time.monotonic()
             self.temp_dir = tempfile.mkdtemp(prefix="subtitle_render_")
             self.concat_path = os.path.join(self.temp_dir, "subs_concat.txt").replace("\\", "/")
             blank_path = os.path.join(self.temp_dir, "blank.png").replace("\\", "/")
@@ -1614,7 +1735,7 @@ class DeliverView(QWidget):
             render_range = self._current_render_range(project_state, design_state)
             render_start = float(render_range.get("start", 0.0) or 0.0)
             render_end = render_start + total_dur
-
+            self._log_render_cost_summary(project_state, design_state)
             if self._is_no_subtitle_export():
                 self.log_safe("⏭️ MP4 无字幕模式：跳过字幕层截图，直接进入视频/音频压制。", "#a6e3a1")
                 self.update_progress_safe(50)
@@ -1626,26 +1747,68 @@ class DeliverView(QWidget):
             media_path = clips[0]["path"] if clips else ""
             proj_w, proj_h = resolution_to_size(res_text, media_path, get_video_dimensions)
 
+            quality_profile = self._export_quality_profile()
+            quality_mode = str(quality_profile.get("mode") or self._current_export_quality())
+            signature_render = simplify_signature_for_export(signature, quality_mode)
+            render_subs_data = [
+                simplify_subtitle_for_export(sub, quality_mode) if isinstance(sub, dict) else sub
+                for sub in subs_data
+            ]
+            render_scale = float(quality_profile.get("render_scale", SUBTITLE_SUPERSAMPLE) or SUBTITLE_SUPERSAMPLE)
+            event_fps = int(quality_profile.get("event_fps", subtitle_event_fps()) or subtitle_event_fps())
+            continuous_fps = int(quality_profile.get("continuous_fps", subtitle_continuous_fps()) or subtitle_continuous_fps())
+            if quality_mode != "标准高清":
+                self.log_safe("保真提速: 保留字体/颜色/位置，自动收敛超大模糊、过厚3D和高亮拖尾。", "#a6e3a1")
+
             with sync_playwright() as p:
                 browser = launch_render_browser(p)
-                render_w = int(proj_w * SUBTITLE_SUPERSAMPLE)
-                render_h = int(proj_h * SUBTITLE_SUPERSAMPLE)
+                render_w = max(1, int(proj_w * render_scale))
+                render_h = max(1, int(proj_h * render_scale))
                 page = browser.new_page(viewport={"width": render_w, "height": render_h}, device_scale_factor=1)
-                page.set_content("<html><body style='background:transparent;'></body></html>")
-                page.screenshot(path=blank_path, omit_background=True, scale="css")
                 bundled_font_css = font_face_css()
+                shell_html = f"""<!DOCTYPE html>
+                <html>
+                <head>
+                    <style>
+                        {bundled_font_css}
+                        html, body {{
+                            margin: 0; padding: 0; width: 100vw; height: 100vh; overflow: hidden;
+                            background: transparent; display: flex; justify-content: center; align-items: center;
+                            -webkit-text-size-adjust: 100%; text-size-adjust: 100%;
+                            -webkit-font-smoothing: antialiased;
+                            -moz-osx-font-smoothing: grayscale;
+                            text-rendering: optimizeLegibility;
+                        }}
+                        #scale-wrapper {{
+                            width: 100vw; height: 100vh; position: absolute; left: 0; top: 0;
+                            transform-origin: center center;
+                        }}
+                    </style>
+                </head>
+                <body>
+                    <div id="scale-wrapper"></div>
+                </body>
+                </html>"""
+                page.set_content(shell_html)
+                page.evaluate("() => document.fonts && document.fonts.ready ? document.fonts.ready.then(() => true) : true")
+                page.screenshot(path=blank_path, omit_background=True, scale="css")
 
                 with open(self.concat_path, "w", encoding="utf-8") as f_concat:
                     frame_idx = 0
+                    reused_frame_count = 0
+                    last_html_subs = None
+                    last_frame_path = ""
                     last_concat_file = blank_path
                     extra_styles = []
-                    if isinstance(signature, dict) and signature.get("enabled") and str(signature.get("text", "")).strip():
-                        extra_styles.append(signature.get("style", {}))
+                    if isinstance(signature_render, dict) and signature_render.get("enabled") and str(signature_render.get("text", "")).strip():
+                        extra_styles.append(signature_render.get("style", {}))
                     frame_schedule = build_subtitle_frame_schedule(
-                        subs_data,
+                        render_subs_data,
                         render_end,
                         extra_styles=extra_styles,
                         extra_times=design_frame_times(design_state),
+                        event_fps=event_fps,
+                        continuous_fps=continuous_fps,
                     )
                     frame_schedule = [
                         (max(current_time, render_start), min(current_time + duration, render_end) - max(current_time, render_start))
@@ -1654,8 +1817,9 @@ class DeliverView(QWidget):
                     ]
                     if not frame_schedule:
                         frame_schedule = [(render_start, total_dur)]
+                    self._render_frame_schedule_count = len(frame_schedule)
                     self.log_safe(
-                        f"⚡ 字幕渲染采样: {len(frame_schedule)} 段，超采样 x{SUBTITLE_SUPERSAMPLE}",
+                        f"⚡ 字幕渲染采样: {len(frame_schedule)} 段，{quality_profile.get('summary', '')}",
                         "#89b4fa",
                     )
 
@@ -1666,9 +1830,9 @@ class DeliverView(QWidget):
                         last_concat_file = path
 
                     for current_time, frame_duration in frame_schedule:
-                        active_subs = active_subtitles_for_frame(subs_data, current_time, frame_duration)
+                        active_subs = active_subtitles_for_frame(render_subs_data, current_time, frame_duration)
                         design_html = render_design_html(design_state, current_time, proj_w, proj_h)
-                        signature_html = render_signature_html(signature, current_time, proj_w, proj_h)
+                        signature_html = render_signature_html(signature_render, current_time, proj_w, proj_h)
                         if not active_subs and not signature_html and not design_html:
                             write_subtitle_frame(blank_path, frame_duration)
                             self.update_progress_safe(int((((current_time + frame_duration) - render_start) / total_dur) * 50))
@@ -1684,43 +1848,32 @@ class DeliverView(QWidget):
                             sub_html = render_subtitle_html(s, sub_time, proj_w, proj_h)
                             html_subs += f"<div style='{base_css}'>{sub_html}</div>\n"
 
-                        # 👑 修复：增加全局抗锯齿和平滑处理
-                        html_content = f"""<!DOCTYPE html>
-                        <html>
-                        <head>
-                            <style>
-                                {bundled_font_css}
-                                html, body {{
-                                    margin: 0; padding: 0; width: 100vw; height: 100vh; overflow: hidden;
-                                    background: transparent; display: flex; justify-content: center; align-items: center;
-                                    -webkit-text-size-adjust: 100%; text-size-adjust: 100%;
-                                    -webkit-font-smoothing: antialiased;
-                                    -moz-osx-font-smoothing: grayscale;
-                                    text-rendering: optimizeLegibility;
-                                }}
-                                #scale-wrapper {{
-                                    width: 100vw; height: 100vh; position: absolute; left: 0; top: 0;
-                                    transform-origin: center center;
-                                }}
-                            </style>
-                        </head>
-                        <body>
-                            <div id="scale-wrapper">
-                                {html_subs}
-                            </div>
-                        </body>
-                        </html>"""
+                        if last_frame_path and html_subs == last_html_subs:
+                            write_subtitle_frame(last_frame_path, frame_duration)
+                            reused_frame_count += 1
+                            self.update_progress_safe(int((((current_time + frame_duration) - render_start) / total_dur) * 50))
+                            continue
 
-                        page.set_content(html_content)
+                        page.evaluate(
+                            "(html) => { const wrapper = document.getElementById('scale-wrapper'); if (wrapper) wrapper.innerHTML = html; }",
+                            html_subs,
+                        )
                         frame_path = os.path.join(self.temp_dir, f"f_{frame_idx}.png").replace("\\", "/")
                         page.screenshot(path=frame_path, omit_background=True, scale="css")
                         write_subtitle_frame(frame_path, frame_duration)
+                        last_html_subs = html_subs
+                        last_frame_path = frame_path
                         frame_idx += 1
                         self.update_progress_safe(int((((current_time + frame_duration) - render_start) / total_dur) * 50))
 
                     f_concat.write(ffconcat_file_entry(last_concat_file))
 
                 browser.close()
+            self._render_html_elapsed = max(0.0, time.monotonic() - self._render_html_started_at)
+            self._render_subtitle_frame_count = frame_idx
+            rate = frame_idx / self._render_html_elapsed if self._render_html_elapsed > 0 else 0.0
+            reuse_note = f" / 复用 {reused_frame_count} 段" if reused_frame_count else ""
+            self.log_safe(f"字幕层截图完成: {self._render_html_elapsed:.1f}s / 实际截图 {frame_idx} 张{reuse_note} / {rate:.1f} 张每秒", "#89b4fa")
             self.log_safe("✅ 多轨道推演截图完毕！准备混音与剪辑...", "#a6e3a1")
             QTimer.singleShot(0, self.start_ffmpeg_qprocess)
         except Exception as e:
@@ -1734,6 +1887,7 @@ class DeliverView(QWidget):
         clips = project_state.get("video_clips", [])
         transparent_export = self._is_canva_transparent_export()
         no_subtitle_export = self._is_no_subtitle_export()
+        quality_profile = self._export_quality_profile()
         use_subtitle_layer = not no_subtitle_export
         a_path = "" if transparent_export else project_state.get("audio_path")
         music_path = "" if transparent_export else project_state.get("music_path")
@@ -1756,12 +1910,28 @@ class DeliverView(QWidget):
         v_pos_x = self._safe_float(project_state.get("v_pos_x", 0), 0.0)
         v_pos_y = self._safe_float(project_state.get("v_pos_y", 0), 0.0)
         v_vol = project_state.get("v_volume", 100) / 100.0
+        video_mask_enabled = bool(project_state.get("video_mask_enabled", False)) and not transparent_export
+        video_mask_color = project_state.get("video_mask_color", "#000000")
+        video_mask_alpha = self._safe_float(project_state.get("video_mask_alpha", 0), 0.0) if video_mask_enabled else 0.0
         a_vol = project_state.get("a_volume", 100) / 100.0
         music_vol = project_state.get("music_volume", 35) / 100.0
 
         res_text = project_state.get("resolution") or get_output_resolution()
         media_path = clips[0]["path"] if clips else ""
         proj_w, proj_h = resolution_to_size(res_text, media_path, get_video_dimensions)
+        def video_mask_chain(input_label, output_label):
+            if not video_mask_enabled:
+                return f"[{input_label}]null[{output_label}]"
+            return ffmpeg_video_mask_filter(
+                input_label,
+                output_label,
+                proj_w,
+                proj_h,
+                target_dur,
+                color=video_mask_color,
+                alpha=video_mask_alpha,
+            )
+
         if transparent_export:
             self.log_safe("🎨 Canva 透明 WebM：跳过视频/音频轨，只编码 RGBA 透明字幕层。", "#a6e3a1")
             clips = []
@@ -1941,7 +2111,9 @@ class DeliverView(QWidget):
                 fc_parts.append(
                     f"{ffmpeg_canvas_source(proj_w, proj_h, target_dur)};"
                     f"[vcat]{video_guard}[fg];"
-                    f"[canvas][fg]overlay=x='{layer_x}':y='{layer_y}':eof_action=pass:format=auto,format=yuv420p[outv]"
+                    f"[canvas][fg]overlay=x='{layer_x}':y='{layer_y}':eof_action=pass:format=auto[bg];"
+                    f"{video_mask_chain('bg', 'masked')};"
+                    f"[masked]format=yuv420p[outv]"
                 )
             else:
                 fc_parts.append(
@@ -1949,7 +2121,8 @@ class DeliverView(QWidget):
                     f"[vcat]{video_guard}[fg];"
                     f"[canvas][fg]overlay=x='{layer_x}':y='{layer_y}':eof_action=pass:format=auto[bg];"
                     f"[{sub_idx}:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos,{sub_guard}[sub];"
-                    f"[bg][sub]overlay=0:0:eof_action=pass:format=auto,format=yuv420p[outv]"
+                    f"{video_mask_chain('bg', 'masked')};"
+                    f"[masked][sub]overlay=0:0:eof_action=pass:format=auto,format=yuv420p[outv]"
                 )
         elif video_concat_path:
             vf_scale = ffmpeg_layer_scale_filter(v_scale, proj_w, proj_h, fit="cover")
@@ -1961,7 +2134,9 @@ class DeliverView(QWidget):
                 fc_parts.append(
                     f"{ffmpeg_canvas_source(proj_w, proj_h, target_dur)};"
                     f"[{video_idx}:v]{speed_filter}{vf_scale},format=rgba,{video_guard}[fg];"
-                    f"[canvas][fg]overlay=x='{layer_x}':y='{layer_y}':eof_action=pass:format=auto,format=yuv420p[outv]"
+                    f"[canvas][fg]overlay=x='{layer_x}':y='{layer_y}':eof_action=pass:format=auto[bg];"
+                    f"{video_mask_chain('bg', 'masked')};"
+                    f"[masked]format=yuv420p[outv]"
                 )
             else:
                 fc_parts.append(
@@ -1969,7 +2144,8 @@ class DeliverView(QWidget):
                     f"[{video_idx}:v]{speed_filter}{vf_scale},format=rgba,{video_guard}[fg];"
                     f"[canvas][fg]overlay=x='{layer_x}':y='{layer_y}':eof_action=pass:format=auto[bg];"
                     f"[{sub_idx}:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos,{sub_guard}[sub];"
-                    f"[bg][sub]overlay=0:0:eof_action=pass:format=auto,format=yuv420p[outv]"
+                    f"{video_mask_chain('bg', 'masked')};"
+                    f"[masked][sub]overlay=0:0:eof_action=pass:format=auto,format=yuv420p[outv]"
                 )
         else:
             if no_subtitle_export:
@@ -2038,9 +2214,12 @@ class DeliverView(QWidget):
                 "-metadata:s:v:0", "alpha_mode=1",
                 "-auto-alt-ref", "0",
                 "-b:v", "0",
-                "-crf", "24",
-                "-deadline", "good",
-                "-cpu-used", "4",
+                "-crf", str(quality_profile.get("vp9_crf", "24")),
+                "-deadline", str(quality_profile.get("vp9_deadline", "good")),
+                "-cpu-used", str(quality_profile.get("vp9_cpu_used", "4")),
+                "-row-mt", "1",
+                "-tile-columns", str(quality_profile.get("vp9_tile_columns", "1")),
+                "-threads", str(max(2, min(8, os.cpu_count() or 4))),
                 self.out_file_path,
             ])
             self._cpu_retry_args = []
@@ -2050,15 +2229,21 @@ class DeliverView(QWidget):
             encoder_label = render_profile.get("encoder_label") or render_profile.get("encoder", "CPU x264")
             base_args = list(args)
             final_args = ["-r", "30", "-max_muxing_queue_size", "1024", "-t", str(target_dur), self.out_file_path]
-            args.extend(build_video_encoder_args(render_profile, quality="deliver"))
+            encoder_quality = "deliver_fast" if str(quality_profile.get("mode") or "") == "极速出片" else "deliver"
+            args.extend(build_video_encoder_args(render_profile, quality=encoder_quality))
             args.extend(final_args)
             if render_profile.get("encoder") != "libx264":
                 self._cpu_retry_args = (
                     base_args
-                    + build_video_encoder_args(self._cpu_render_profile(), quality="deliver")
+                    + build_video_encoder_args(self._cpu_render_profile(), quality=encoder_quality)
                     + final_args
                 )
 
+        self._render_encoder_label = encoder_label
+        if transparent_export:
+            self.log_safe("透明 WebM 使用 VP9 Alpha 编码，通常会比普通 MP4 慢很多，这是格式限制。", "#f9e2af")
+        self._render_ffmpeg_started_at = time.monotonic()
+        self._render_last_ffmpeg_speed = ""
         self.log_safe(f"⚙️ 渲染配置: {encoder_label}", "#89b4fa")
         self.log_safe("🧾 FFmpeg 参数已生成，开始压制...", "#89b4fa")
         self.render_process.start(get_ffmpeg_cmd(), args)
@@ -2066,6 +2251,9 @@ class DeliverView(QWidget):
     def on_render_ready_read_error(self):
         err_out = str(self.render_process.readAllStandardError(), encoding="utf-8", errors="ignore")
         time_match = re.search(r"time=(\d+:\d+:\d+\.\d+)", err_out)
+        speed_match = re.search(r"speed=\s*([0-9.]+x|N/A)", err_out)
+        if speed_match:
+            self._render_last_ffmpeg_speed = speed_match.group(1)
         if time_match:
             time_str = time_match.group(1)
             h, m, s = map(float, time_str.split(":"))
@@ -2145,6 +2333,7 @@ class DeliverView(QWidget):
         if exit_code != 0:
             if self._retry_render_with_cpu():
                 return
+        self._log_render_perf_summary(exit_code)
         try:
             shutil.rmtree(self.temp_dir)
         except Exception:

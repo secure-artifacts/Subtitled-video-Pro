@@ -1,3 +1,5 @@
+from render_timing import active_subtitles_at_time
+
 def safe_float(value, default=0.0):
     try:
         return float(value)
@@ -23,19 +25,24 @@ def active_subtitle_payload(
 ):
     active_cache = set(active_cache or set())
     payload = []
-    for idx, subtitle in enumerate(subtitles or []):
-        if not isinstance(subtitle, dict) or not is_active_subtitle(subtitle, time_sec):
+    source_index_by_id = {id(subtitle): idx for idx, subtitle in enumerate(subtitles or []) if isinstance(subtitle, dict)}
+    for subtitle, sample_time in active_subtitles_at_time(subtitles or [], time_sec):
+        if not isinstance(subtitle, dict):
             continue
+        try:
+            idx = int(subtitle.get("_source_idx", source_index_by_id.get(id(subtitle), -1)))
+        except Exception:
+            idx = source_index_by_id.get(id(subtitle), -1)
         style = subtitle.get("style", {}) if isinstance(subtitle.get("style", {}), dict) else {}
         html_text = ""
         if render_html:
             if project_height is None:
-                html_text = render_html(subtitle, time_sec, project_width)
+                html_text = render_html(subtitle, sample_time, project_width)
             else:
                 try:
-                    html_text = render_html(subtitle, time_sec, project_width, project_height)
+                    html_text = render_html(subtitle, sample_time, project_width, project_height)
                 except TypeError:
-                    html_text = render_html(subtitle, time_sec, project_width)
+                    html_text = render_html(subtitle, sample_time, project_width)
         payload.append(
             {
                 "idx": idx,

@@ -829,6 +829,48 @@ def _apply_balanced_breaks(words, line_capacity, max_lines, style=None):
     return rebuilt
 
 
+def merge_short_subtitle_segments(subtitles, *, min_words=4, max_merged_words=7):
+    items = [copy.deepcopy(s) for s in (subtitles or []) if isinstance(s, dict)]
+    if len(items) <= 1:
+        return items
+    min_words = max(1, int(min_words or 1))
+    max_merged_words = max(min_words, int(max_merged_words or min_words))
+
+    changed = True
+    while changed:
+        changed = False
+        result = []
+        idx = 0
+        while idx < len(items):
+            current = items[idx]
+            current_words = _subtitle_word_count(current)
+            if current_words >= min_words:
+                result.append(current)
+                idx += 1
+                continue
+
+            if idx + 1 < len(items) and int(current.get("track", 1)) == int(items[idx + 1].get("track", 1)):
+                combined_words = current_words + _subtitle_word_count(items[idx + 1])
+                if combined_words <= max_merged_words:
+                    result.append(_merge_subtitle_segments(current, items[idx + 1]))
+                    idx += 2
+                    changed = True
+                    continue
+
+            if result and int(result[-1].get("track", 1)) == int(current.get("track", 1)):
+                combined_words = _subtitle_word_count(result[-1]) + current_words
+                if combined_words <= max_merged_words:
+                    result[-1] = _merge_subtitle_segments(result[-1], current)
+                    idx += 1
+                    changed = True
+                    continue
+
+            result.append(current)
+            idx += 1
+        items = result
+    return items
+
+
 def _readable_subtitle_duration(subtitle, min_seconds=FAST_SUBTITLE_READABLE_MIN_SECONDS, min_word_seconds=FAST_WORD_VISUAL_MIN_SECONDS):
     word_count = max(1, _subtitle_word_count(subtitle))
     return max(float(min_seconds), min(1.15, word_count * float(min_word_seconds) + 0.16))
@@ -900,6 +942,8 @@ def subtitle_layout_capacity(style, proj_w=1080):
     max_lines = max(1, min(5, int(style.get("max_lines", 2) or 2)))
     line_capacity = max(3.5, (float(proj_w) * width_pct / 100.0) / size * 0.92)
     layout_mode = style.get("layout_mode", "standard")
+    if layout_mode == "split_screen":
+        layout_mode = "standard"
     if layout_mode == "contrast":
         try:
             emphasis_scale = max(100.0, float(style.get("emphasis_scale", 145) or 145)) / 100.0
@@ -923,6 +967,8 @@ def rebalance_subtitle_layout(subs, fallback_style=None, default_pos=(0.0, 25.0)
         style = copy.deepcopy(fallback_style)
         style.update(copy.deepcopy(base.get("style", {})))
         layout_mode = style.get("layout_mode", "standard")
+        if layout_mode == "split_screen":
+            layout_mode = "standard"
         is_standard = layout_mode == "standard"
         is_reflowable = layout_mode in ("standard", "contrast")
         if force_standard_box and is_standard:
@@ -1035,6 +1081,121 @@ def hex_to_rgb(hex_color):
     if len(hex_color) == 6:
         return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
     return (255, 255, 255)
+
+
+DEFAULT_RANDOM_TEXT_COLORS = (
+    "#FF3B30",
+    "#FF9F0A",
+    "#FFD60A",
+    "#32D74B",
+    "#00E5FF",
+    "#4D96FF",
+    "#FF4FD8",
+)
+
+
+def _normalize_render_hex_color(value, fallback=None):
+    raw = str(value or "").strip()
+    if raw and not raw.startswith("#"):
+        raw = f"#{raw}"
+    if re.fullmatch(r"#[0-9A-Fa-f]{6}", raw):
+        return raw.upper()
+    return fallback
+
+
+def normalize_random_text_palette(palette):
+    if palette is None:
+        raw_items = [{"color": color, "enabled": True} for color in DEFAULT_RANDOM_TEXT_COLORS]
+    elif isinstance(palette, str):
+        raw_items = [item.strip() for item in palette.split(",") if item.strip()]
+    elif isinstance(palette, dict):
+        raw_items = palette.get("colors") or palette.get("palette") or []
+    else:
+        try:
+            raw_items = list(palette)
+        except TypeError:
+            raw_items = []
+
+    normalized = []
+    for item in raw_items:
+        enabled = True
+        color_value = item
+        if isinstance(item, dict):
+            color_value = item.get("color") or item.get("value") or item.get("hex")
+            enabled = bool(item.get("enabled", True))
+        color = _normalize_render_hex_color(color_value)
+        if color:
+            normalized.append({"color": color, "enabled": enabled})
+    return normalized
+
+
+def stable_random_text_color(palette, word_idx, word_text, subtitle_text="", fallback="#FFFFFF"):
+    colors = [item["color"] for item in normalize_random_text_palette(palette) if item.get("enabled")]
+    if not colors:
+        return _normalize_render_hex_color(fallback, "#FFFFFF") or "#FFFFFF"
+    seed = f"{subtitle_text}|{word_idx}|{word_text}"
+    score = 0
+    for pos, char in enumerate(seed):
+        score = (score * 131 + ord(char) + pos + 17) % 2147483647
+    return colors[score % len(colors)]
+
+
+
+DEFAULT_RANDOM_TEXT_FONTS = (
+    "Noto Sans SC",
+    "Inter",
+    "Montserrat",
+    "Poppins",
+    "Oswald",
+    "Playfair Display",
+    "Bebas Neue",
+)
+
+
+def normalize_random_text_font_pool(pool):
+    if pool is None:
+        raw_items = [{"font": font, "enabled": True} for font in DEFAULT_RANDOM_TEXT_FONTS]
+    elif isinstance(pool, str):
+        raw_items = [item.strip() for item in pool.split(",") if item.strip()]
+    elif isinstance(pool, dict):
+        raw_items = pool.get("fonts") or pool.get("pool") or []
+    else:
+        try:
+            raw_items = list(pool)
+        except TypeError:
+            raw_items = []
+
+    normalized = []
+    seen = set()
+    for item in raw_items:
+        enabled = True
+        font_value = item
+        if isinstance(item, dict):
+            font_value = item.get("font") or item.get("family") or item.get("name")
+            enabled = bool(item.get("enabled", True))
+        font_name = str(font_value or "").strip()
+        if not font_name:
+            continue
+        key = font_name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({"font": font_name, "enabled": enabled})
+    return normalized
+
+
+def stable_random_text_font(pool, word_idx, word_text, subtitle_text="", fallback="Arial", strategy="rotate"):
+    fonts = [item["font"] for item in normalize_random_text_font_pool(pool) if item.get("enabled")]
+    if not fonts:
+        return str(fallback or "Arial").strip() or "Arial"
+    strategy = str(strategy or "rotate").strip().lower()
+    if strategy in ("rotate", "cycle", "alternate", "headline_rotate"):
+        return fonts[int(word_idx or 0) % len(fonts)]
+    seed = f"{subtitle_text}|{word_idx}|{word_text}"
+    score = 0
+    for pos, char in enumerate(seed):
+        score = (score * 131 + ord(char) + pos + 17) % 2147483647
+    return fonts[score % len(fonts)]
 
 def get_exact_duration(file_path):
     return media_probe.get_exact_duration(file_path)
@@ -1192,7 +1353,15 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
     style = sub.get("style", sub)
     c_txt = style.get("color_txt", "#FFFFFF")
     c_hl = style.get("color_hl", "#FFFFFF")
+    text_color_mode = str(style.get("text_color_mode", "single") or "single").strip().lower()
+    text_random_palette = normalize_random_text_palette(style.get("text_random_palette"))
+    text_random_enabled = text_color_mode in ("smart_random", "smart", "random") and any(item.get("enabled") for item in text_random_palette)
+    text_random_seed = str(sub.get("text") or "")
     f_fam = style.get("font", "Arial")
+    font_random_mode = str(style.get("font_random_mode", "single") or "single").strip().lower()
+    font_random_pool = normalize_random_text_font_pool(style.get("font_random_pool"))
+    font_random_strategy = str(style.get("font_random_strategy", "rotate") or "rotate").strip().lower()
+    font_random_enabled = font_random_mode in ("smart_random", "smart", "random") and any(item.get("enabled") for item in font_random_pool)
     f_weight = str(style.get("font_weight", "700") or "700")
     f_style = str(style.get("font_style", "normal") or "normal")
 
@@ -1240,6 +1409,8 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
     letter_spacing = style.get("letter_spacing", 0)
     word_spacing = style.get("word_spacing", 0)
     layout_mode = style.get("layout_mode", "standard")
+    if layout_mode == "split_screen":
+        layout_mode = style.get("split_screen_inner_layout", "standard") or "standard"
     layout_variant = style.get("layout_variant", "auto")
     layout_pattern_raw = str(style.get("layout_pattern", "auto") or "auto")
     layout_layer_pattern_raw = str(style.get("layout_layer_pattern", "auto") or "auto")
@@ -1283,6 +1454,28 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
     pop_speed = max(0.05, float(style.get("pop_speed", 0.18)))
     pop_bounce = max(100, int(style.get("pop_bounce", 128)))
     inactive_alpha = int(style.get("inactive_alpha", 100)) / 100.0
+    text_reveal_mode = str(style.get("text_reveal_mode", "all") or "all").strip().lower()
+    text_reveal_mode = {
+        "word": "word_voice",
+        "voice_word": "word_voice",
+        "word_voice": "word_voice",
+        "line": "line_voice",
+        "voice_line": "line_voice",
+        "line_voice": "line_voice",
+        "all": "all",
+        "none": "all",
+    }.get(text_reveal_mode, text_reveal_mode)
+    if text_reveal_mode not in ("all", "word_voice", "line_voice"):
+        text_reveal_mode = "all"
+    voice_reveal_active = text_reveal_mode in ("word_voice", "line_voice")
+    voice_reveal_fade = max(0.0, min(0.60, _safe_float(style.get("voice_reveal_fade", 0.06), 0.06)))
+    if voice_reveal_active:
+        inactive_alpha = 0.0
+    full_roll_window_height = max(8.0, min(100.0, _safe_float(style.get("full_roll_window_height", 42), 42)))
+    full_roll_start_y = max(-120.0, min(120.0, _safe_float(style.get("full_roll_start_y", 28), 28)))
+    full_roll_end_y = max(-120.0, min(120.0, _safe_float(style.get("full_roll_end_y", -18), -18)))
+    full_roll_feather = max(0.0, min(45.0, _safe_float(style.get("full_roll_feather", 10), 10)))
+    full_roll_lock_to_words = bool(style.get("full_roll_lock_to_words", True))
 
     box_width = float(style.get("box_width", 0))
     box_height = float(style.get("box_height", 0) or 0)
@@ -1340,6 +1533,14 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
 
     content_indices = [i for i, ww in enumerate(words) if _clean_word_text(ww)]
     content_center = (content_indices[0] + content_indices[-1]) / 2.0 if content_indices else (len(words) - 1) / 2.0
+    full_roll_progress = clip_progress
+    if anim_type == "full_text_roll" and full_roll_lock_to_words and content_indices:
+        word_starts = [_safe_float(words[i].get("start", clip_start), clip_start) for i in content_indices]
+        word_ends = [_safe_float(words[i].get("end", clip_start), clip_start) for i in content_indices]
+        roll_start_time = max(clip_start, min(word_starts or [clip_start]))
+        roll_end_time = min(clip_end, max(word_ends or [clip_end]))
+        roll_end_time = max(roll_start_time + 0.05, roll_end_time)
+        full_roll_progress = clamp01((current_time - roll_start_time) / max(0.05, roll_end_time - roll_start_time))
     typewriter_word_order = {}
     typewriter_reveal_starts = {}
     typewriter_word_interval = pop_speed
@@ -1798,6 +1999,22 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
             line_i += 1
         word_line_indices[word_idx] = line_i
     holy_line_count = line_i + 1
+    line_reveal_starts = {}
+    if text_reveal_mode == "line_voice":
+        for word_idx in content_indices:
+            line_idx = word_line_indices.get(word_idx, 0)
+            w_start = _safe_float(words[word_idx].get("start", clip_start), clip_start)
+            if line_idx not in line_reveal_starts:
+                line_reveal_starts[line_idx] = w_start
+            else:
+                line_reveal_starts[line_idx] = min(line_reveal_starts[line_idx], w_start)
+
+    def _voice_reveal_start_for(word_idx):
+        if text_reveal_mode == "line_voice":
+            return line_reveal_starts.get(word_line_indices.get(word_idx, 0), clip_start)
+        if text_reveal_mode == "word_voice":
+            return _safe_float(words[word_idx].get("start", clip_start), clip_start)
+        return clip_start
 
     html_words_fg = []
     html_words_bg = []
@@ -1818,9 +2035,10 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         typewriter_local_p = 1.0
         if typewriter_motion:
             typewriter_reveal_start = _typewriter_reveal_start_for(idx)
-            if current_time < typewriter_reveal_start:
+            if current_time < typewriter_reveal_start and not voice_reveal_active:
                 continue
-            typewriter_local_p = ease_out_cubic((current_time - typewriter_reveal_start) / typewriter_intro_duration)
+            if current_time >= typewriter_reveal_start:
+                typewriter_local_p = ease_out_cubic((current_time - typewriter_reveal_start) / typewriter_intro_duration)
 
         inserted_break = False
         if has_newline and idx > 0:
@@ -1835,6 +2053,12 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
                 html_words_bg.append("<br>")
 
         clean_txt = _style_display_text(clean_txt, style)
+        word_text_color = c_txt
+        if text_random_enabled:
+            word_text_color = stable_random_text_color(text_random_palette, idx, clean_txt, text_random_seed, c_txt)
+        word_font_family = f_fam
+        if font_random_enabled:
+            word_font_family = stable_random_text_font(font_random_pool, idx, clean_txt, text_random_seed, f_fam, font_random_strategy)
 
         w_start = float(w.get("start", 0))
         w_end = float(w.get("end", w_start + 0.5))
@@ -1848,7 +2072,11 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         else:
             holy_speed = min(holy_speed, max(0.55, clip_dur * 0.62))
 
-        if anim_type == "holy_breath":
+        if voice_reveal_active:
+            voice_reveal_start = _voice_reveal_start_for(idx)
+            word_started = current_time >= voice_reveal_start
+            t = current_time - voice_reveal_start
+        elif anim_type == "holy_breath":
             line_delay = min(0.70, 0.38 + max(0.0, pop_speed - 0.18) * 0.18)
             if holy_line_count > 1:
                 line_delay = min(line_delay, max(0.12, clip_dur * 0.32 / max(1, holy_line_count - 1)))
@@ -1967,6 +2195,12 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
 
         if anim_type in ("wipe_right", "word_wipe"):
             current_opacity = 1.0
+        if voice_reveal_active:
+            if not is_active:
+                current_opacity = 0.0
+            elif voice_reveal_fade > 0:
+                reveal_opacity = ease_out_cubic(t / voice_reveal_fade)
+                current_opacity = min(current_opacity, reveal_opacity)
         if anim_type == "word_wipe":
             hidden_pct = max(0.0, 100.0 - word_reveal_pct)
             current_clip_css = f"-webkit-clip-path: inset(0 {hidden_pct:.3f}% 0 0); clip-path: inset(0 {hidden_pct:.3f}% 0 0);"
@@ -2214,6 +2448,7 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         hl_skew_transform = f" skewX({hl_bg_skew:.3f}deg)" if is_current and skewable_highlight and abs(hl_bg_skew) > 0.01 else ""
         word_base = (
             f"font-size: {layout_font_scale:.3f}em; "
+            f"font-family: {_css_font_stack(word_font_family)}; "
             f"transform: perspective(720px) translate({current_translate_x_em:.3f}em, {current_translate_em:.3f}em) scale({current_scale:.3f}) rotateY({current_rotate_y_deg:.3f}deg) rotateX({current_rotate_x_deg:.3f}deg){hl_skew_transform}; "
             f"transform-origin: center center; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); "
             f"letter-spacing: calc({ls_vw} + {vw(current_letter_extra)}); "
@@ -2230,7 +2465,7 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
                 chr_, chg, chb = hex_to_rgb(c_hl)
                 fill_color = f"rgba({chr_}, {chg}, {chb}, {hl_trail_alpha:.3f})"
         else:
-            fill_color = c_txt
+            fill_color = word_text_color
         if anim_type == "holy_breath" and is_holy_final_word and use_hl:
             fill_color = c_hl
         texture_css = ""
@@ -2692,6 +2927,22 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         final_html = f"""
         <div class='sub-box' style='{outer_box_style}'>
             <div style="{inner_transform} width: 100%;"><div style="{wrapper_css}">{inner_html_fg}</div></div>
+        </div>
+        """
+
+    if anim_type == "full_text_roll":
+        roll_y = full_roll_start_y + (full_roll_end_y - full_roll_start_y) * full_roll_progress
+        roll_mask_css = ""
+        if full_roll_feather > 0:
+            roll_mask_css = (
+                f"-webkit-mask-image: linear-gradient(to bottom, transparent 0%, black {full_roll_feather:.3f}%, black {100.0 - full_roll_feather:.3f}%, transparent 100%); "
+                f"mask-image: linear-gradient(to bottom, transparent 0%, black {full_roll_feather:.3f}%, black {100.0 - full_roll_feather:.3f}%, transparent 100%);"
+            )
+        final_html = f"""
+        <div class='sub-full-roll-window' style='position: relative; width: 100%; height: {full_roll_window_height:.3f}vh; overflow: hidden; display: flex; align-items: flex-start; justify-content: center; pointer-events: none; {roll_mask_css}'>
+            <div class='sub-full-roll-inner' style='width: 100%; transform: translateY({roll_y:.3f}vh); transform-origin: center top; will-change: transform;'>
+                {final_html}
+            </div>
         </div>
         """
 

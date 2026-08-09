@@ -104,7 +104,7 @@ def _backfill_edit_room_from_legacy_fields(merged, source):
     if not edit_state.get("music_asset_rel_path") and media_files.get("music_asset_rel_path"):
         edit_state["music_asset_rel_path"] = media_files.get("music_asset_rel_path", "")
 
-    for key in ("duration", "resolution", "v_scale", "v_volume", "a_volume", "music_volume", "music_dur", "music_match_duration", "music_loop", "chunk_mode", "timing_mode", "fill_subtitle_gaps"):
+    for key in ("duration", "resolution", "v_scale", "v_volume", "a_volume", "music_volume", "video_mask_enabled", "video_mask_color", "video_mask_alpha", "music_dur", "music_match_duration", "music_loop", "chunk_mode", "timing_mode", "fill_subtitle_gaps"):
         if key in source and source.get(key) not in (None, ""):
             try:
                 current_duration = float(str(edit_state.get("duration", 0) or 0).replace(",", "."))
@@ -247,6 +247,7 @@ def _base_project_data(path, project_type, project_name):
                 "a_trim": [0.0, 0.0], "audio_source_in": 0.0,
                 "duration": 10.0, "resolution": get_output_resolution(),
                 "v_scale": 100, "v_volume": 100, "a_volume": 100, "music_volume": 35,
+                "video_mask_enabled": False, "video_mask_color": "#000000", "video_mask_alpha": 35,
                 "music_dur": 0.0, "music_match_duration": 0.0, "music_loop": True,
                 "chunk_mode": "双行大段 (约10字，智能折行)",
                 "timing_mode": "J Cut (字幕稍后收尾)",
