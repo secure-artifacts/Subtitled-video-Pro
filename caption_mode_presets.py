@@ -4,9 +4,11 @@ import os
 from app_storage import read_json_file, resolve_user_file, write_json_file
 from caption_presets import (
     COMPACT_NARRATIVE_CHUNK_MODE,
+    FULL_TEXT_CHUNK_MODE,
     REFERENCE_NARRATIVE_CHUNK_MODE,
     fixed_word_count_for_chunk_mode,
     is_exact_single_word_chunk_mode,
+    is_full_text_chunk_mode,
     make_fixed_chunk_mode_label,
     make_smart_chunk_mode_label,
     narrative_chunk_word_bounds,
@@ -36,6 +38,8 @@ def caption_mode_fixed_count(mode):
 
 
 def caption_mode_word_range(mode):
+    if is_full_text_chunk_mode(mode):
+        return 0, 0
     min_words, max_words = narrative_chunk_word_bounds(mode)
     if max_words > 0:
         return min_words, max_words
@@ -49,6 +53,15 @@ def caption_mode_config_from_values(chunk_mode="", timing_mode="", strategy="", 
     chunk_mode = str(chunk_mode or "").strip() or make_smart_chunk_mode_label(min_words or 4, max_words or 7)
     strategy = str(strategy or "").strip().lower()
     fixed_count = caption_mode_fixed_count(chunk_mode)
+    if is_full_text_chunk_mode(chunk_mode) or strategy in {"full", "full_text", "flat", "tile", "tiled"}:
+        return {
+            "chunk_mode": FULL_TEXT_CHUNK_MODE,
+            "timing_mode": str(timing_mode or "").strip(),
+            "strategy": "full_text",
+            "fixed_words": 0,
+            "min_words": 0,
+            "max_words": 0,
+        }
     if strategy not in {"fixed", "smart"}:
         strategy = "fixed" if fixed_count > 0 else "smart"
     if strategy == "fixed":
@@ -89,6 +102,8 @@ def normalize_caption_mode_preset(raw=None):
 
 def caption_mode_final_chunk(config, base_mode=""):
     cfg = normalize_caption_mode_preset(config)
+    if cfg["strategy"] == "full_text":
+        return FULL_TEXT_CHUNK_MODE
     if cfg["strategy"] == "fixed":
         return make_fixed_chunk_mode_label(cfg["fixed_words"] or 1)
     base = str(base_mode or cfg.get("chunk_mode") or "").strip()
@@ -105,6 +120,8 @@ def built_in_caption_mode_presets():
         "4词 · 短句": caption_mode_config_from_values(make_fixed_chunk_mode_label(4), "对齐声音 (按停顿)", "fixed", 4),
         "智能 4-7词 · 默认双行": caption_mode_config_from_values("智能听译 (4-7词，适配双行按词)", "对齐声音 (按停顿)", "smart", min_words=4, max_words=7),
         "智能 5-9词 · 稳定叙述": caption_mode_config_from_values("智能听译 (5-9词，自定义)", "对齐声音 (按停顿)", "smart", min_words=5, max_words=9),
+        "平铺听译 · 全文显示": caption_mode_config_from_values(FULL_TEXT_CHUNK_MODE, "对齐声音 (按停顿)", "full_text"),
+        "全部打轴 · 整篇文字": caption_mode_config_from_values(FULL_TEXT_CHUNK_MODE, "对齐声音 (按停顿)", "full_text"),
         "累计叙事 8-12词": caption_mode_config_from_values(COMPACT_NARRATIVE_CHUNK_MODE, "对齐声音 (按停顿)", "smart", min_words=8, max_words=12),
         "累计叙事 14-18词": caption_mode_config_from_values(REFERENCE_NARRATIVE_CHUNK_MODE, "对齐声音 (按停顿)", "smart", min_words=14, max_words=18),
     }

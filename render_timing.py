@@ -283,6 +283,15 @@ def _subtitle_words(sub, start, end):
     return [w for w in words if _clean_word_text(w)]
 
 
+def _scene_light_enabled(style):
+    if not isinstance(style, dict):
+        return False
+    value = style.get("scene_light_enable", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+    return bool(value)
+
+
 def _needs_continuous_sampling(style):
     anim_type = style.get("anim_type", "pop")
     font_motion = style.get("font_motion", "none")
@@ -320,6 +329,8 @@ def _needs_word_boundary_sampling(style):
         return True
     if str(style.get("font_motion", "none") or "none") in {"typewriter_left", "dynamic_reflow"}:
         return True
+    if _scene_light_enabled(style):
+        return True
     return False
 
 
@@ -356,10 +367,19 @@ def build_subtitle_frame_schedule(subs_data, total_duration, extra_styles=None, 
         pop_speed = max(0.05, float(style.get("pop_speed", 0.18) or 0.18))
         hl_motion = style.get("hl_motion", "stable")
         use_hl = bool(style.get("use_hl", True))
+        scene_light = _scene_light_enabled(style)
+        scene_light_decay = max(0.05, min(1.20, _bounded_time(style.get("scene_light_decay", 0.30), 0.0, 2.0)))
+        scene_light_trigger = str(style.get("scene_light_trigger", "word") or "word").strip().lower()
         word_visual_min = max(0.04, min(0.40, _bounded_time(style.get("word_visual_min_seconds", FAST_WORD_VISUAL_MIN_SECONDS), 0.0, 1.0)))
 
         _add_time(times, start, total_duration)
         _add_time(times, end, total_duration)
+        # Exported subtitle layers must have a minimum active sampling rate.
+        # Some imported/batch captions do not carry reliable word timings, and
+        # segment-only sampling can make the rendered subtitle layer disappear or
+        # feel frozen even while preview looks correct.
+        if _subtitle_words(sub, start, end):
+            _add_range_samples(times, start, end, event_fps, total_duration)
         if sub_index in split_visual_ends:
             visual_end = _bounded_time(split_visual_ends[sub_index], 0.0, total_duration)
             if visual_end > end:
@@ -406,6 +426,10 @@ def build_subtitle_frame_schedule(subs_data, total_duration, extra_styles=None, 
 
             if use_hl and hl_motion in ("pop", "push"):
                 _add_range_samples(times, w_start, min(visual_end, w_start + 0.35), event_fps, total_duration)
+
+            if scene_light:
+                light_fps = max(event_fps, 14 if scene_light_trigger in {"char", "character", "letter"} else 10)
+                _add_range_samples(times, w_start, min(end, w_start + scene_light_decay), light_fps, total_duration)
 
     ordered = sorted(t for t in times if 0.0 <= t <= total_duration)
     schedule = []

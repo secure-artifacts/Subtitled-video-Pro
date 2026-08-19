@@ -62,3 +62,6 @@ _backup*/
 *.avi
 *.srt
 *.ass
+# Local diagnostics and extracted analysis frames
+/analysis_frames/
+/diagnostics/

@@ -39,7 +39,7 @@ from render_performance import export_render_profile, simplify_signature_for_exp
 from playwright.sync_api import sync_playwright
 
 from font_assets import font_face_css
-from ui_components import design_frame_times, get_exact_duration, get_video_dimensions, get_video_stream_duration, render_design_html, render_signature_html, render_subtitle_html
+from ui_components import design_frame_times, get_exact_duration, get_video_dimensions, get_video_stream_duration, render_design_html, render_signature_html, render_scene_light_html, render_subtitle_html
 from project_io import load_project, get_project_folder_paths, get_reels_in_folder
 from workspace_config import WORKSPACE_MODE_CLOUD, get_active_workspace, get_workspace_config
 from project_audit import audit_project, format_project_audit_report
@@ -111,6 +111,27 @@ def atempo_chain(speed):
         speed /= 0.5
     parts.append(f"atempo={speed:.3f}")
     return ",".join(parts)
+
+
+def audio_stereo_width_value(value):
+    try:
+        return max(0, min(100, int(float(value or 0))))
+    except Exception:
+        return 0
+
+
+def ffmpeg_audio_stereo_widen_filter(input_label, output_label, width):
+    width = audio_stereo_width_value(width)
+    # 轻量 Haas/声场加宽：先保证立体声，再用 stereowiden 做可控延迟与反馈，最后限幅防爆音。
+    delay = 8.0 + width * 0.22
+    feedback = min(0.48, 0.08 + width * 0.004)
+    crossfeed = max(0.05, 0.34 - width * 0.0024)
+    output = str(output_label or "aout_stereo").strip("[]")
+    return (
+        f"{input_label}aformat=channel_layouts=stereo,"
+        f"stereowiden=delay={delay:.1f}:feedback={feedback:.3f}:crossfeed={crossfeed:.3f}:drymix=0.800,"
+        f"alimiter=limit=0.96[{output}]"
+    )
 
 
 class ProjectPickCard(QFrame):
@@ -709,6 +730,34 @@ class DeliverView(QWidget):
         except Exception:
             return default
 
+    def _quad_grid_config(self, state=None):
+        state = state if isinstance(state, dict) else (self.project_state if isinstance(self.project_state, dict) else {})
+        config = state.get("quad_grid") if isinstance(state, dict) else None
+        if not isinstance(config, dict) or not config.get("enabled"):
+            return {}
+        paths = []
+        for raw in config.get("paths", []) or []:
+            path = str(raw or "").strip()
+            if path and os.path.exists(path) and path not in paths:
+                paths.append(path)
+        if len(paths) < 4:
+            return {}
+        return {**config, "enabled": True, "paths": paths[:4], "fit": str(config.get("fit") or "cover")}
+
+    def _has_quad_grid_content(self, state=None):
+        return bool(self._quad_grid_config(state))
+
+    def _quad_grid_media_duration(self, state=None):
+        config = self._quad_grid_config(state)
+        durations = []
+        for path in config.get("paths", []) if config else []:
+            ext = os.path.splitext(path)[1].lower()
+            if ext in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+                durations.append(5.0)
+            else:
+                durations.append(self._safe_float(get_video_stream_duration(path) or get_exact_duration(path), 0.0))
+        return max(durations) if durations else 0.0
+
     def _safe_render_duration(self, requested=None, state=None, design_state=None):
         state = state if isinstance(state, dict) else (self.project_state if isinstance(self.project_state, dict) else {})
         durations = []
@@ -742,6 +791,10 @@ class DeliverView(QWidget):
             if music_target > 0:
                 durations.append(music_target)
 
+        if not durations:
+            quad_duration = self._quad_grid_media_duration(state)
+            if quad_duration > 0:
+                durations.append(quad_duration)
         content_dur = max(durations) if durations else 0.0
         guarded_dur = content_dur + render_tail_padding_seconds() if content_dur > 0 else 1.0
         if requested is not None:
@@ -1654,19 +1707,23 @@ class DeliverView(QWidget):
         self.load_project_data()
         subs = self.project_state.get("subs_data", [])
         clips = self.project_state.get("video_clips", [])
+        quad_grid = self._quad_grid_config(self.project_state)
         a_path = self.project_state.get("audio_path", "")
 
         self.log_console.clear()
         self.progress_bar.setValue(0)
         self.log_safe(f"📊 字幕数: {len(subs)}", "#89b4fa")
         self.log_safe(f"📊 视频数: {len(clips)}", "#89b4fa")
+        if quad_grid:
+            self.log_safe(f"📊 四宫格: 已启用 {len(quad_grid.get('paths', []))} 个素材", "#89b4fa")
         self.log_safe(f"📊 音频路径: {a_path or '未提供'}", "#89b4fa")
 
         export_format = self._current_export_format()
         transparent_export = self._is_canva_transparent_export(export_format)
         no_subtitle_export = self._is_no_subtitle_export(export_format)
         has_overlay = self._has_overlay_content(self.project_state, self.design_state)
-        current_missing = (not has_overlay) if transparent_export else ((not clips) if no_subtitle_export else (not clips or not subs))
+        has_visual = bool(clips) or bool(quad_grid)
+        current_missing = (not has_overlay) if transparent_export else ((not has_visual) if no_subtitle_export else (not has_visual or not subs))
 
         if current_missing and self.batch_project_paths and self.batch_output_dir:
             self.log_safe("⚠️ 当前工程数据为空，已自动切换到已选择的批量导出队列。", "#f9e2af")
@@ -1677,8 +1734,8 @@ class DeliverView(QWidget):
                 return QMessageBox.warning(self, "提示", "当前工程没有可导出的字幕/署名/设计层。")
             self.log_safe("🎨 Canva 透明 WebM 模式：只导出文字/署名/设计层，不合成底色视频和音频。", "#a6e3a1")
         else:
-            if not clips:
-                return QMessageBox.warning(self, "提示", "请先在 Edit 房间导入至少一个视频片段并保存工程！")
+            if not has_visual:
+                return QMessageBox.warning(self, "提示", "请先在 Edit 房间导入至少一个视频片段，或启用四宫格画面并保存工程！")
             if no_subtitle_export:
                 self.log_safe("🎞️ MP4 无字幕模式：只合成视频和音频，不烧录字幕层。", "#a6e3a1")
             elif not subs:
@@ -1829,16 +1886,42 @@ class DeliverView(QWidget):
                         f_concat.write(ffconcat_file_entry(path, duration))
                         last_concat_file = path
 
+                    def representative_frame_time(frame_start, duration):
+                        try:
+                            frame_start = float(frame_start or 0.0)
+                            duration = float(duration or 0.0)
+                        except Exception:
+                            return float(render_start or 0.0)
+                        frame_start = max(float(render_start or 0.0), frame_start)
+                        frame_end = min(float(render_end or frame_start), frame_start + max(0.0, duration))
+                        if frame_end <= frame_start:
+                            return frame_start
+                        span = frame_end - frame_start
+                        guard = min(0.001, span * 0.25)
+                        offset = min(span * 0.5, 0.035)
+                        return max(frame_start, min(frame_start + offset, frame_end - guard))
+
                     for current_time, frame_duration in frame_schedule:
-                        active_subs = active_subtitles_for_frame(render_subs_data, current_time, frame_duration)
-                        design_html = render_design_html(design_state, current_time, proj_w, proj_h)
-                        signature_html = render_signature_html(signature_render, current_time, proj_w, proj_h)
+                        sample_time = representative_frame_time(current_time, frame_duration)
+                        sample_duration = max(0.0, (current_time + frame_duration) - sample_time)
+                        active_subs = active_subtitles_for_frame(render_subs_data, sample_time, sample_duration)
+                        design_html = render_design_html(design_state, sample_time, proj_w, proj_h)
+                        signature_html = render_signature_html(signature_render, sample_time, proj_w, proj_h)
                         if not active_subs and not signature_html and not design_html:
                             write_subtitle_frame(blank_path, frame_duration)
                             self.update_progress_safe(int((((current_time + frame_duration) - render_start) / total_dur) * 50))
                             continue
 
-                        html_subs = design_html + signature_html
+                        scene_light_items = []
+                        active_ids = set()
+                        for s_item, s_time in active_subs:
+                            scene_light_items.append((s_item, s_time))
+                            active_ids.add(id(s_item))
+                        for s_item in render_subs_data:
+                            if isinstance(s_item, dict) and bool((s_item.get("style") or {}).get("scene_light_enable", False)) and id(s_item) not in active_ids:
+                                scene_light_items.append((s_item, sample_time))
+                        scene_light_html = render_scene_light_html(scene_light_items, sample_time, proj_w, proj_h)
+                        html_subs = scene_light_html + design_html + signature_html
                         for s, sub_time in active_subs:
                             px = s.get("pos_x", 0.0)
                             py = s.get("pos_y", 25.0)
@@ -1848,12 +1931,8 @@ class DeliverView(QWidget):
                             sub_html = render_subtitle_html(s, sub_time, proj_w, proj_h)
                             html_subs += f"<div style='{base_css}'>{sub_html}</div>\n"
 
-                        if last_frame_path and html_subs == last_html_subs:
-                            write_subtitle_frame(last_frame_path, frame_duration)
-                            reused_frame_count += 1
-                            self.update_progress_safe(int((((current_time + frame_duration) - render_start) / total_dur) * 50))
-                            continue
-
+                        # Nonblank subtitle frames can depend on time even when the
+                        # generated HTML string is identical, so do not reuse them.
                         page.evaluate(
                             "(html) => { const wrapper = document.getElementById('scale-wrapper'); if (wrapper) wrapper.innerHTML = html; }",
                             html_subs,
@@ -1885,6 +1964,7 @@ class DeliverView(QWidget):
         project_state = self._render_project_state()
         design_state = self._render_design_state()
         clips = project_state.get("video_clips", [])
+        quad_grid = self._quad_grid_config(project_state)
         transparent_export = self._is_canva_transparent_export()
         no_subtitle_export = self._is_no_subtitle_export()
         quality_profile = self._export_quality_profile()
@@ -1917,7 +1997,7 @@ class DeliverView(QWidget):
         music_vol = project_state.get("music_volume", 35) / 100.0
 
         res_text = project_state.get("resolution") or get_output_resolution()
-        media_path = clips[0]["path"] if clips else ""
+        media_path = quad_grid.get("paths", [""])[0] if quad_grid else (clips[0]["path"] if clips else "")
         proj_w, proj_h = resolution_to_size(res_text, media_path, get_video_dimensions)
         def video_mask_chain(input_label, output_label):
             if not video_mask_enabled:
@@ -1935,9 +2015,11 @@ class DeliverView(QWidget):
         if transparent_export:
             self.log_safe("🎨 Canva 透明 WebM：跳过视频/音频轨，只编码 RGBA 透明字幕层。", "#a6e3a1")
             clips = []
+            quad_grid = {}
 
         video_concat_path = ""
         assembly_video_plan = []
+        quad_grid_plan = []
         has_audio = False
         clip_speeds = [clip_speed_value(clip) for clip in clips or []]
         non_default_speeds = [speed for speed in clip_speeds if abs(speed - 1.0) > 0.001]
@@ -1951,7 +2033,13 @@ class DeliverView(QWidget):
             else:
                 speed_export_supported = False
                 self.log_safe("⚠️ 当前工程包含多种视频速度，本轮导出先按 1.0x 处理；预览和时间线仍按片段速度工作。", "#f9e2af")
-        use_filter_concat = len(clips or []) > 1 and any(str(clip.get("assembly_mode", "")) in {"batch_random", "audio_matched"} for clip in clips or [])
+        if quad_grid:
+            image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+            for path in quad_grid.get("paths", [])[:4]:
+                quad_grid_plan.append({"path": path, "is_image": os.path.splitext(path)[1].lower() in image_exts})
+            clips = []
+            self.log_safe("🎞️ 四宫格导出: 4 路素材同步铺满 2x2 画面。", "#89b4fa")
+        use_filter_concat = (not quad_grid_plan) and len(clips or []) > 1 and any(str(clip.get("assembly_mode", "")) in {"batch_random", "audio_matched"} for clip in clips or [])
         if clips and use_filter_concat:
             remaining_track_dur = video_track_target
             for clip in clips:
@@ -2056,6 +2144,13 @@ class DeliverView(QWidget):
             args.extend(["-f", "concat", "-safe", "0", "-i", video_concat_path])
             video_idx = input_idx
             input_idx += 1
+        for item in quad_grid_plan:
+            if item.get("is_image"):
+                args.extend(["-loop", "1", "-t", f"{target_dur:.3f}", "-i", item.get("path", "")])
+            else:
+                args.extend(["-stream_loop", "-1", "-i", item.get("path", "")])
+            item["input_idx"] = input_idx
+            input_idx += 1
         for item in assembly_video_plan:
             if item.get("is_image"):
                 args.extend(["-loop", "1", "-t", f"{float(item.get('source_dur', 0.0)):.3f}", "-i", item.get("path", "")])
@@ -2069,6 +2164,11 @@ class DeliverView(QWidget):
             input_idx += 1
         sub_idx = None
         if use_subtitle_layer:
+            if not self.concat_path or not os.path.exists(self.concat_path) or os.path.getsize(self.concat_path) <= 0:
+                self.log_safe("❌ 字幕层没有生成，已停止导出：请确认导出格式不是“无字幕 MP4”，并重新保存工程后再导出。", "#f38ba8")
+                QTimer.singleShot(0, self._handle_render_stage_failed)
+                return
+            self.log_safe(f"📝 字幕层输入: {int(getattr(self, '_render_subtitle_frame_count', 0) or 0)} 张截图 / {os.path.basename(self.concat_path)}", "#89b4fa")
             args.extend(["-f", "concat", "-safe", "0", "-i", self.concat_path])
             sub_idx = input_idx
             input_idx += 1
@@ -2086,7 +2186,43 @@ class DeliverView(QWidget):
         fc_parts = []
         audio_map = None
 
-        if assembly_video_plan:
+        if quad_grid_plan:
+            cell_w = max(2, proj_w // 2)
+            cell_h = max(2, proj_h // 2)
+            cell_w2 = max(2, proj_w - cell_w)
+            cell_h2 = max(2, proj_h - cell_h)
+            cells = [
+                (0, 0, cell_w, cell_h),
+                (cell_w, 0, cell_w2, cell_h),
+                (0, cell_h, cell_w, cell_h2),
+                (cell_w, cell_h, cell_w2, cell_h2),
+            ]
+            sub_guard = f"tpad=stop_mode=clone:stop_duration={target_dur:.3f},trim=duration={target_dur:.3f},setpts=PTS-STARTPTS"
+            fc_parts.append(ffmpeg_canvas_source(proj_w, proj_h, target_dur))
+            prev_label = "canvas"
+            for idx, item in enumerate(quad_grid_plan[:4]):
+                input_id = int(item.get("input_idx"))
+                x, y, w, h = cells[idx]
+                label = f"qcell{idx}"
+                out_label = f"qbg{idx}"
+                fc_parts.append(
+                    f"[{input_id}:v]setpts=PTS-STARTPTS,"
+                    f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+                    f"crop={w}:{h},setsar=1,format=rgba,"
+                    f"tpad=stop_mode=clone:stop_duration={target_dur:.3f},"
+                    f"trim=duration={target_dur:.3f},setpts=PTS-STARTPTS[{label}]"
+                )
+                fc_parts.append(f"[{prev_label}][{label}]overlay={x}:{y}:eof_action=pass:format=auto[{out_label}]")
+                prev_label = out_label
+            if no_subtitle_export:
+                fc_parts.append(f"{video_mask_chain(prev_label, 'masked')};[masked]format=yuv420p[outv]")
+            else:
+                fc_parts.append(
+                    f"[{sub_idx}:v]format=rgba,scale={proj_w}:{proj_h}:flags=lanczos,{sub_guard}[sub];"
+                    f"{video_mask_chain(prev_label, 'masked')};"
+                    f"[masked][sub]overlay=0:0:eof_action=pass:format=auto,format=yuv420p[outv]"
+                )
+        elif assembly_video_plan:
             vf_scale = ffmpeg_exact_layer_filter(v_scale, proj_w, proj_h)
             layer_x, layer_y = ffmpeg_layer_overlay_xy(v_pos_x, v_pos_y)
             segment_labels = []
@@ -2192,6 +2328,12 @@ class DeliverView(QWidget):
         elif len(audio_sources) > 1:
             fc_parts.append(f"{''.join(audio_sources)}amix=inputs={len(audio_sources)}:duration=longest:normalize=0,atrim=duration={target_dur:.3f},asetpts=PTS-STARTPTS[aout]")
             audio_map = "[aout]"
+
+        stereo_width = audio_stereo_width_value(project_state.get("audio_stereo_width", 35))
+        if audio_map and bool(project_state.get("audio_stereo_enabled", False)) and stereo_width > 0:
+            fc_parts.append(ffmpeg_audio_stereo_widen_filter(audio_map, "aout_stereo", stereo_width))
+            audio_map = "[aout_stereo]"
+            self.log_safe(f"🎧 立体声增强: 声场宽度 {stereo_width}%", "#89b4fa")
 
         if fc_parts:
             args.extend(["-filter_complex", ";".join(fc_parts)])

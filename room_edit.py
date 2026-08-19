@@ -42,7 +42,7 @@ from ui_components import (hex_to_rgb, get_exact_duration, get_video_dimensions,
                            AspectRatioContainer, default_signature_config,
                            default_design_room_state, normalize_design_room_state,
                            normalize_signature_config, render_design_html, render_signature_html,
-                           render_subtitle_html,
+                           render_scene_light_html, render_subtitle_html,
                            rebalance_subtitle_layout, tokenize_display_text,
                            normalize_word_timestamps, align_reference_text_to_timestamps,
                            format_subtitle_text_spacing, normalize_scripture_quote_text,
@@ -79,6 +79,7 @@ from caption_presets import (
     LEGACY_NARRATIVE_BLOCK_PRESET,
     LEGACY_NARRATIVE_CHUNK_MODE,
     REFERENCE_NARRATIVE_BLOCK_PRESET,
+    FULL_TEXT_CHUNK_MODE,
     REFERENCE_NARRATIVE_CHUNK_MODE,
     built_in_style_presets,
     chunk_mode_options,
@@ -486,6 +487,7 @@ class WebBridge(QObject):
     def update_box_width(self, idx, width):
         if not getattr(self.controller, "edit_mode", False):
             return
+        width = max(0.0, min(120.0, float(width or 0.0)))
         if 0 <= idx < len(self.controller.state["subs_data"]):
             current_clip = self.controller.state["subs_data"][idx]
             scope = self.controller.style_scope_combo.currentIndex()
@@ -582,6 +584,9 @@ class EditView(QWidget):
             "global_glow_enable": False, "global_glow_mode": "soft", "global_glow_motion": "stable",
             "global_glow_color": "#FFFFFF", "global_glow_size": 18, "global_glow_blur": 24,
             "global_glow_alpha": 35, "global_glow_x": 0, "global_glow_y": 0, "global_glow_z": 0,
+            "scene_light_enable": False, "scene_light_trigger": "word", "scene_light_color": "#F6C76A", "scene_light_mask_color": "#000000",
+            "scene_light_strength": 88, "scene_light_radius": 520, "scene_light_x_scale": 56, "scene_light_y_scale": 112, "scene_light_decay": 0.48,
+            "scene_light_dim": 90, "scene_light_blur": 52, "scene_light_spill": 78, "scene_light_edge_lift": 36,
             "hl_bg_skew": 0,
             "text_transform": "capitalize", "text_align": "center", "letter_spacing": 0, "word_spacing": 0,
             "layout_mode": "standard", "layout_variant": "auto", "box_layout": "fixed", "emphasis_scale": 145,
@@ -601,7 +606,7 @@ class EditView(QWidget):
         }
         self.state = {
             "video_clips": [], "audio_path": "", "music_path": "", "subs_data": [], "a_trim": [0.0, 10.0], "audio_source_in": 0.0, "duration": 10.0,
-            "resolution": get_output_resolution(), "v_scale": 100, "v_volume": 100, "a_volume": 100, "music_volume": 35,
+            "resolution": get_output_resolution(), "v_scale": 100, "v_volume": 100, "a_volume": 100, "music_volume": 35, "audio_stereo_enabled": False, "audio_stereo_width": 35,
             "video_mask_enabled": False, "video_mask_color": "#000000", "video_mask_alpha": 35,
             "chunk_mode": "双行大段 (约10字，智能折行)",
             "timing_mode": "J Cut (字幕稍后收尾)",
@@ -1405,6 +1410,63 @@ class EditView(QWidget):
         assembly_layout.addLayout(assembly_actions)
         self.left_media_layout.addWidget(self.assembly_panel)
         self.refresh_assembly_media_list()
+
+        self.quad_grid_media_paths = []
+        self.quad_grid_panel = QFrame()
+        self.quad_grid_panel.setStyleSheet("""
+            QFrame { background-color:#101824; border:1px solid #285064; border-radius:8px; }
+            QLabel { color:#cdd6f4; border:none; }
+            QListWidget { background-color:#0b1119; color:#cdd6f4; border:1px solid #29465a; border-radius:6px; padding:3px; outline:none; }
+            QListWidget::item { min-height:24px; padding:3px 6px; border-radius:4px; }
+            QListWidget::item:selected { background-color:#31748f; color:white; }
+        """)
+        quad_layout = QVBoxLayout(self.quad_grid_panel)
+        quad_layout.setContentsMargins(9, 8, 9, 9)
+        quad_layout.setSpacing(6)
+        quad_header = QHBoxLayout()
+        quad_title_box = QVBoxLayout()
+        quad_title_box.setSpacing(0)
+        quad_title_box.addWidget(QLabel("QUAD GRID", styleSheet="color:#74c7ec; font-weight:900; font-size:12px; letter-spacing:0px;"))
+        quad_title_box.addWidget(QLabel("四宫格同屏", styleSheet="color:#ffffff; font-weight:900; font-size:13px;"))
+        quad_header.addLayout(quad_title_box)
+        quad_header.addStretch()
+        self.quad_grid_count_label = QLabel("0/4")
+        self.quad_grid_count_label.setStyleSheet("color:#a6adc8; font-size:11px;")
+        quad_header.addWidget(self.quad_grid_count_label)
+        quad_layout.addLayout(quad_header)
+        self.quad_grid_list = QListWidget()
+        self.quad_grid_list.setFixedHeight(96)
+        self.quad_grid_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.quad_grid_list.customContextMenuRequested.connect(self.show_quad_grid_media_context_menu)
+        quad_layout.addWidget(self.quad_grid_list)
+        quad_actions = QHBoxLayout()
+        quad_actions.setSpacing(6)
+        self.btn_quad_grid_pick = QPushButton("选择4素材")
+        self.btn_quad_grid_pick.setFixedHeight(27)
+        self.btn_quad_grid_pick.setToolTip("选择 4 个画面素材，导出时自动合成 2x2 四宫格；短视频会循环补齐到音频/字幕长度。")
+        self.btn_quad_grid_pick.setStyleSheet("background-color:#74c7ec; color:#11111b; border-radius:5px; font-weight:900;")
+        self.btn_quad_grid_pick.clicked.connect(self.pick_quad_grid_media_dialog)
+        self.btn_quad_grid_build = QPushButton("一键组接四宫格")
+        self.btn_quad_grid_build.setFixedHeight(27)
+        self.btn_quad_grid_build.setToolTip("生成一个四宫格预览视频放到时间线，方便你马上看同屏效果；最终导出仍用原始 4 个素材合成。")
+        self.btn_quad_grid_build.setStyleSheet("background-color:#a6e3a1; color:#11111b; border-radius:5px; font-weight:900;")
+        self.btn_quad_grid_build.clicked.connect(self.assemble_quad_grid_to_timeline)
+        self.btn_quad_grid_clear = QPushButton("清空")
+        self.btn_quad_grid_clear.setFixedHeight(27)
+        self.btn_quad_grid_clear.setToolTip("关闭当前工程的四宫格画面布局，并移除一键生成的四宫格预览片段。")
+        self.btn_quad_grid_clear.setStyleSheet("background-color:#242b3f; color:#cdd6f4; border:1px solid #3a425a; border-radius:5px; font-weight:800;")
+        self.btn_quad_grid_clear.clicked.connect(self.clear_quad_grid_media)
+        quad_actions.addWidget(self.btn_quad_grid_pick)
+        quad_actions.addWidget(self.btn_quad_grid_build)
+        quad_actions.addWidget(self.btn_quad_grid_clear)
+        quad_layout.addLayout(quad_actions)
+        self.quad_grid_summary_label = QLabel("四宫格未启用")
+        self.quad_grid_summary_label.setWordWrap(True)
+        self.quad_grid_summary_label.setStyleSheet("color:#8f9bb3; font-size:11px; border:none;")
+        quad_layout.addWidget(self.quad_grid_summary_label)
+        self.left_media_layout.addWidget(self.quad_grid_panel)
+        self.refresh_quad_grid_media_list()
+        self.refresh_quad_grid_summary()
         self.left_media_layout.addStretch(1)
 
         left_layout.addWidget(QLabel("🎥 V1 画面轨道控制:", styleSheet="color: #89b4fa; font-weight: bold; margin-top: 5px;"))
@@ -1557,13 +1619,16 @@ class EditView(QWidget):
         left_layout.addLayout(text_header_layout)
 
         self.text_editor = QTextEdit()
+        self.text_editor.setMinimumHeight(84)
+        self.text_editor.setMaximumHeight(150)
+        self.text_editor.setToolTip("\u53ef\u7c98\u8d34\u53c2\u8003\u6587\u6848\uff1b\u4e0d\u586b\u5199\u65f6\u4f1a\u76f4\u63a5\u542c\u8bd1\u97f3\u9891\u3002")
         self.text_editor.setStyleSheet("background-color: #1e1e2e; border: 1px solid #313244; border-radius: 5px;")
         self.text_editor.textChanged.connect(self._on_custom_text_changed) # 绑定输入事件，实时保存
-        left_layout.addWidget(self.text_editor, stretch=1)
+        left_layout.addWidget(self.text_editor)
 
         self._syncing_chunk_controls = False
         chunk_row = QHBoxLayout()
-        chunk_row.addWidget(QLabel("✂️ 听译预设:", styleSheet="color: #89b4fa; font-weight: bold;"))
+        chunk_row.addWidget(QLabel("\u2702\ufe0f \u542c\u8bd1\u6a21\u5f0f/\u9884\u8bbe:", styleSheet="color: #89b4fa; font-weight: bold;"))
         self.chunk_mode = QComboBox()
         self.chunk_mode.addItems(chunk_mode_options())
         ensure_caption_mode_options(self.chunk_mode)
@@ -1584,17 +1649,26 @@ class EditView(QWidget):
         chunk_row.addWidget(self.btn_delete_caption_mode_preset)
         left_layout.addLayout(chunk_row)
         self.chunk_param_frame = QFrame()
-        self.chunk_param_frame.setStyleSheet("QFrame { background-color: #181825; border: 1px solid #313244; border-radius: 6px; }")
+        self.chunk_param_frame.setStyleSheet("QFrame { background-color: #131827; border: 1px solid #405173; border-radius: 7px; }")
         chunk_param_layout = QVBoxLayout(self.chunk_param_frame)
-        chunk_param_layout.setContentsMargins(8, 6, 8, 7)
-        chunk_param_layout.setSpacing(5)
+        chunk_param_layout.setContentsMargins(9, 7, 9, 8)
+        chunk_param_layout.setSpacing(6)
+
+        chunk_param_header = QHBoxLayout()
+        chunk_param_header.addWidget(QLabel("\U0001f39a\ufe0f \u542c\u8bd1\u5b57\u6570", styleSheet="color:#f9e2af; font-size:13px; font-weight:900;"))
+        chunk_param_hint = QLabel("\u56fa\u5b9a=\u6bcf\u6bb5\u56fa\u5b9a\u8bcd\u6570\uff1b\u667a\u80fd=\u6700\u5c0f/\u6700\u5927\u8303\u56f4")
+        chunk_param_hint.setStyleSheet("color:#a6adc8; font-size:11px;")
+        chunk_param_hint.setWordWrap(True)
+        chunk_param_header.addWidget(chunk_param_hint, stretch=1)
+        chunk_param_layout.addLayout(chunk_param_header)
 
         chunk_kind_row = QHBoxLayout()
-        chunk_kind_row.addWidget(QLabel("\u65b9\u5f0f:", styleSheet="color:#a6adc8; font-size:12px;"))
+        chunk_kind_row.addWidget(QLabel("\u5b57\u6570\u6a21\u5f0f:", styleSheet="color:#a6e3a1; font-size:12px; font-weight:800;"))
         self.chunk_strategy_combo = QComboBox()
         self.chunk_strategy_combo.addItem("\u667a\u80fd\u8303\u56f4", "smart")
-        self.chunk_strategy_combo.addItem("\u56fa\u5b9a\u5b57\u6570", "fixed")
-        self.chunk_strategy_combo.setFixedWidth(96)
+        self.chunk_strategy_combo.addItem("\u56fa\u5b9a\u8bcd\u6570", "fixed")
+        self.chunk_strategy_combo.addItem("\u5168\u6587\u5e73\u94fa", "full_text")
+        self.chunk_strategy_combo.setFixedWidth(108)
         self.chunk_strategy_combo.setStyleSheet("background-color:#313244; color:white; padding:4px; border-radius:4px;")
         chunk_kind_row.addWidget(self.chunk_strategy_combo)
         chunk_kind_row.addWidget(QLabel("\u56fa\u5b9a:", styleSheet="color:#a6adc8; font-size:12px;"))
@@ -2251,7 +2325,7 @@ class EditView(QWidget):
         self.transform_combo = QComboBox(); self.transform_combo.addItems(["首字母大写 (Capitalize)", "全部大写 (UPPERCASE)", "全部小写 (lowercase)", "正常 (Normal)"]); self.transform_combo.setStyleSheet("background-color: #313244; padding: 5px;"); self.transform_combo.currentTextChanged.connect(self._on_style_change); mode_layout.addWidget(self.transform_combo)
         self.align_combo = QComboBox(); self.align_combo.addItems(["居中对齐 (Center)", "居中左对齐 (Center Left)", "左对齐 (Left)", "自由混合对齐 (Free Mix)", "左对齐为主混合 (Left Mix)", "右对齐 (Right)", "两端对齐 (Justify)"]); self.align_combo.setStyleSheet("background-color: #313244; padding: 5px;"); self.align_combo.currentTextChanged.connect(self._on_style_change); mode_layout.addWidget(self.align_combo)
         self.box_layout_combo = QComboBox(); self.box_layout_combo.addItems(["自适应文字宽度", "固定窗口自动换行"]); self.box_layout_combo.setStyleSheet("background-color: #313244; padding: 5px;"); self.box_layout_combo.currentTextChanged.connect(self._on_style_change); mode_layout.addWidget(self.box_layout_combo)
-        self.box_width_slider, self.box_width_spin = create_slider_spinbox(mode_layout, "显示区域宽% (0=自动):", 0, 92, 74, self._on_style_change, is_float=True)
+        self.box_width_slider, self.box_width_spin = create_slider_spinbox(mode_layout, "显示区域宽% (0=自动):", 0, 120, 74, self._on_style_change, is_float=True)
         self.box_height_slider, self.box_height_spin = create_slider_spinbox(mode_layout, "显示区域高% (0=不限):", 0, 50, 0, self._on_style_change, is_float=True)
         self.max_lines_slider, self.max_lines_spin = create_slider_spinbox(mode_layout, "标准最大行数:", 1, 5, 2, self._on_style_change)
         self.lineh_slider, self.lineh_spin = create_slider_spinbox(mode_layout, "行距缩放:", 10, 300, 110, self._on_style_change)
@@ -2471,6 +2545,34 @@ class EditView(QWidget):
         self.global_glow_y_slider, self.global_glow_y_spin = create_slider_spinbox(glow_fx_layout, "光线 Y 轴:", -80, 80, 0, self._on_style_change)
         self.global_glow_z_slider, self.global_glow_z_spin = create_slider_spinbox(glow_fx_layout, "光线 Z 轴:", 0, 160, 0, self._on_style_change)
 
+        scene_light_layout = make_fx_group("画面光照", expanded=False)
+        self.chk_scene_light = QCheckBox("启用出字照亮画面")
+        self.chk_scene_light.setToolTip("字幕按词/按字出现时，给整幅画面叠一层暖色光脉冲；配合画面蒙版可做黑场被字照亮的效果。")
+        self.chk_scene_light.setStyleSheet("color:#f9e2af; font-weight:800;")
+        self.chk_scene_light.stateChanged.connect(self._on_style_change)
+        scene_light_layout.addWidget(self.chk_scene_light)
+        self.btn_scene_light_reference = QPushButton("套用参考黑场光照")
+        self.btn_scene_light_reference.setToolTip("一键设置成参考视频那种黑场常驻、文字挖亮画面的参数。")
+        self.btn_scene_light_reference.setStyleSheet("background-color:#f9e2af; color:#11111b; border-radius:6px; padding:6px; font-weight:900;")
+        self.btn_scene_light_reference.clicked.connect(self.apply_reference_scene_light)
+        scene_light_layout.addWidget(self.btn_scene_light_reference)
+        self.scene_light_trigger_combo = QComboBox()
+        self.scene_light_trigger_combo.addItems(["光照触发: 按词", "光照触发: 按字估算"])
+        self.scene_light_trigger_combo.setStyleSheet("background-color:#313244; padding:5px; font-weight:bold;")
+        self.scene_light_trigger_combo.currentTextChanged.connect(self._on_style_change)
+        scene_light_layout.addWidget(self.scene_light_trigger_combo)
+        create_color_control(scene_light_layout, "画面光色", "btn_color_scene_light", "scene_light", "#F6C76A")
+        create_color_control(scene_light_layout, "蒙版颜色", "btn_color_scene_mask", "scene_mask", "#000000")
+        self.scene_light_dim_slider, self.scene_light_dim_spin = create_slider_spinbox(scene_light_layout, "蒙版不透明 %:", 0, 100, 92, self._on_style_change)
+        self.scene_light_strength_slider, self.scene_light_strength_spin = create_slider_spinbox(scene_light_layout, "照亮强度 %:", 0, 100, 88, self._on_style_change)
+        self.scene_light_radius_slider, self.scene_light_radius_spin = create_slider_spinbox(scene_light_layout, "照亮范围/光斑 %:", 35, 1200, 520, self._on_style_change)
+        self.scene_light_x_scale_slider, self.scene_light_x_scale_spin = create_slider_spinbox(scene_light_layout, "光斑宽度 X %:", 15, 240, 56, self._on_style_change)
+        self.scene_light_y_scale_slider, self.scene_light_y_scale_spin = create_slider_spinbox(scene_light_layout, "光斑高度 Y %:", 15, 280, 112, self._on_style_change)
+        self.scene_light_decay_slider, self.scene_light_decay_spin = create_slider_spinbox(scene_light_layout, "光衰减(秒):", 0.05, 1.50, 0.48, self._on_style_change, is_float=True)
+        self.scene_light_blur_slider, self.scene_light_blur_spin = create_slider_spinbox(scene_light_layout, "光柔化:", 0, 180, 52, self._on_style_change)
+        self.scene_light_spill_slider, self.scene_light_spill_spin = create_slider_spinbox(scene_light_layout, "局部溢光 %:", 0, 100, 78, self._on_style_change)
+        self.scene_light_edge_slider, self.scene_light_edge_spin = create_slider_spinbox(scene_light_layout, "边缘余光 %:", 0, 100, 36, self._on_style_change)
+
         texture_fx_layout = make_fx_group("字体质感", expanded=False)
         self.text_texture_combo = QComboBox(); self.text_texture_combo.addItems(["字体质感: 无", "字体质感: Gold 金色金属", "字体质感: Grain 轻微颗粒", "字体质感: Noise 噪点", "字体质感: Roughen 粗糙边", "字体质感: Distress texture 破碎磨损", "字体质感: 叠加 Grain+Noise+Roughen+Distress"])
         self.text_texture_combo.setStyleSheet("background-color: #313244; padding: 5px;"); self.text_texture_combo.currentTextChanged.connect(self._on_style_change); texture_fx_layout.addWidget(self.text_texture_combo)
@@ -2498,7 +2600,7 @@ class EditView(QWidget):
 
         bg_fx_layout = make_fx_group("胶带底框", expanded=False)
         self.chk_bg_enabled = QCheckBox("启用胶带底框"); self.chk_bg_enabled.setChecked(False); self.chk_bg_enabled.stateChanged.connect(self._on_style_change); bg_fx_layout.addWidget(self.chk_bg_enabled)
-        self.bg_mode_combo = QComboBox(); self.bg_mode_combo.addItems(["胶带底框: 贴合文字", "胶带底框: 逐字单点", "胶带底框: 扫光渐变", "胶带底框: 全局底框", "胶带底框: 全屏框架", "胶带底框: 柔光玻璃"])
+        self.bg_mode_combo = QComboBox(); self.bg_mode_combo.addItems(["胶带底框: 贴合文字", "胶带底框: 连体下沉", "胶带底框: 逐字单点", "胶带底框: 扫光渐变", "胶带底框: 全局底框", "胶带底框: 全屏框架", "胶带底框: 柔光玻璃"])
         self.bg_mode_combo.setStyleSheet("background-color: #313244; padding: 5px; font-weight: bold;"); self.bg_mode_combo.currentTextChanged.connect(self._on_style_change); bg_fx_layout.addWidget(self.bg_mode_combo)
         create_color_control(bg_fx_layout, "胶带颜色", "btn_color_bg", "bg", "#000000")
         self.alpha_slider, self.alpha_spin = create_slider_spinbox(bg_fx_layout, "胶带透明度 %:", 0, 100, 80, self._on_style_change)
@@ -2653,7 +2755,25 @@ class EditView(QWidget):
         video_mask_layout.addWidget(sec_video_mask)
         video_mask_layout.addStretch()
         self.video_subtabs.addTab(video_mask_scroll, "蒙版")
-        page_aud = QWidget(); aud_layout = QVBoxLayout(page_aud); aud_layout.addWidget(QLabel("🎵 音频音量设置", alignment=Qt.AlignmentFlag.AlignCenter)); self.a_vol_slider, self.a_vol_spin = create_slider_spinbox(aud_layout, "配音音量 %:", 0, 100, 100, self._on_aud_prop_change); self.music_vol_slider, self.music_vol_spin = create_slider_spinbox(aud_layout, "配乐音量 %:", 0, 100, 35, self._on_music_prop_change); aud_layout.addStretch()
+        page_aud = QWidget()
+        aud_layout = QVBoxLayout(page_aud)
+        aud_layout.setSpacing(10)
+        aud_layout.addWidget(QLabel("🎵 音频音量设置", alignment=Qt.AlignmentFlag.AlignCenter))
+        self.a_vol_slider, self.a_vol_spin = create_slider_spinbox(aud_layout, "配音音量 %:", 0, 100, 100, self._on_aud_prop_change)
+        self.music_vol_slider, self.music_vol_spin = create_slider_spinbox(aud_layout, "配乐音量 %:", 0, 100, 35, self._on_music_prop_change)
+        sec_stereo, stereo_layout = create_section_frame("🎧 立体声声场", "#74c7ec")
+        self.chk_audio_stereo_enabled = QCheckBox("启用立体声增强")
+        self.chk_audio_stereo_enabled.setToolTip("导出时在最终混音后增强左右声场；适合配音/配乐更有空间感。")
+        self.chk_audio_stereo_enabled.setStyleSheet("color:#74c7ec; font-weight:800;")
+        self.chk_audio_stereo_enabled.stateChanged.connect(self._on_audio_stereo_prop_change)
+        stereo_layout.addWidget(self.chk_audio_stereo_enabled)
+        self.audio_stereo_width_slider, self.audio_stereo_width_spin = create_slider_spinbox(stereo_layout, "声场宽度 %:", 0, 100, 35, self._on_audio_stereo_prop_change)
+        stereo_hint = QLabel("默认关闭；30-45 比较自然，太高会有明显空间/回声感。")
+        stereo_hint.setWordWrap(True)
+        stereo_hint.setStyleSheet("color:#8f9bb3; font-size:12px;")
+        stereo_layout.addWidget(stereo_hint)
+        aud_layout.addWidget(sec_stereo)
+        aud_layout.addStretch()
 
         page_signature = QWidget(); signature_layout = QVBoxLayout(page_signature); signature_layout.setSpacing(10)
         sec_signature, sig_layout = create_section_frame("✒️ 全局署名 (Signature)", "#f9e2af")
@@ -3323,6 +3443,351 @@ class EditView(QWidget):
         self.refresh_assembly_media_list()
         if hasattr(self, "status_lbl"):
             self.status_lbl.setText("组接素材已清空。")
+
+    def _quad_grid_media_type(self, path):
+        ext = os.path.splitext(path or "")[1].lower()
+        if ext in getattr(self, "_video_exts", (".mp4", ".mov", ".webm", ".mkv", ".avi")):
+            return "video"
+        if ext in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
+            return "image"
+        return ""
+
+    def _valid_quad_grid_paths(self, paths):
+        valid = []
+        for raw in paths or []:
+            path = str(raw or "").strip()
+            if path and os.path.exists(path) and self._quad_grid_media_type(path) in {"video", "image"} and path not in valid:
+                valid.append(path)
+        return valid
+
+    def _quad_grid_config(self):
+        config = self.state.get("quad_grid") if isinstance(self.state, dict) else None
+        if not isinstance(config, dict) or not config.get("enabled"):
+            return {}
+        paths = self._valid_quad_grid_paths(config.get("paths", []))
+        if len(paths) < 4:
+            return {}
+        return {**config, "paths": paths[:4], "enabled": True}
+
+    def _quad_grid_paths_for_ui(self):
+        paths = self._valid_quad_grid_paths(getattr(self, "quad_grid_media_paths", []) or [])
+        if len(paths) >= 4:
+            return paths[:4]
+        config = self._quad_grid_config()
+        return self._valid_quad_grid_paths(config.get("paths", []))[:4] if config else paths[:4]
+
+    def _set_quad_grid_state(self, paths, source="manual", preview_path=""):
+        paths = self._valid_quad_grid_paths(paths)[:4]
+        if len(paths) < 4:
+            self.state["quad_grid"] = {"enabled": False, "paths": []}
+            return False
+        payload = {"enabled": True, "paths": paths, "fit": "cover", "source": source}
+        if preview_path:
+            payload["preview_path"] = preview_path
+        self.state["quad_grid"] = payload
+        self.quad_grid_media_paths = list(paths)
+        return True
+
+    def pick_quad_grid_media_dialog(self):
+        if not self._ensure_edit_mode("四宫格画面"):
+            return
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择四宫格画面素材（至少 4 个）",
+            "",
+            "Media Files (*.mp4 *.mov *.webm *.mkv *.avi *.jpg *.jpeg *.png *.webp *.bmp)"
+        )
+        paths = self._valid_quad_grid_paths(file_paths)
+        if len(paths) < 4:
+            return QMessageBox.information(self, "四宫格素材不足", "请至少选择 4 个视频或图片素材。")
+        self._set_quad_grid_state(paths[:4], source="manual")
+        self._recalc_duration()
+        self.refresh_quad_grid_media_list()
+        self.refresh_quad_grid_summary()
+        self.update_timeline_size()
+        self.update_floating_subtitle()
+        self.auto_save_cache()
+        self.push_history()
+        self.focus_media_pool()
+        if hasattr(self, "status_lbl"):
+            self.status_lbl.setText("四宫格素材已单独选择；点击“一键组接四宫格”可生成预览片段。")
+
+    def _remove_quad_grid_preview_clip(self, restore_previous=False):
+        clips = list(self.state.get("video_clips", []) or [])
+        preview_removed = any(clip.get("quad_grid_preview") for clip in clips if isinstance(clip, dict))
+        clips = [clip for clip in clips if not (isinstance(clip, dict) and clip.get("quad_grid_preview"))]
+        if restore_previous:
+            previous = self.state.pop("quad_grid_previous_video_clips", None)
+            if isinstance(previous, list) and previous:
+                clips = previous
+        self.state["video_clips"] = clips
+        return preview_removed
+
+    def clear_quad_grid_media(self):
+        if isinstance(self.state, dict):
+            self.state["quad_grid"] = {"enabled": False, "paths": []}
+        self.quad_grid_media_paths = []
+        self._remove_quad_grid_preview_clip(restore_previous=True)
+        self.refresh_quad_grid_media_list()
+        self.refresh_quad_grid_summary()
+        self._recalc_duration()
+        self.render_ui_list()
+        self.update_timeline_size()
+        self.auto_save_cache()
+        self.push_history()
+        if hasattr(self, "status_lbl"):
+            self.status_lbl.setText("四宫格画面已关闭，并已清理四宫格预览片段。")
+
+    def refresh_quad_grid_media_list(self):
+        if not hasattr(self, "quad_grid_list"):
+            return
+        paths = self._quad_grid_paths_for_ui()
+        self.quad_grid_list.clear()
+        for idx, path in enumerate(paths):
+            item = QListWidgetItem(f"{idx + 1}. {os.path.basename(path)}")
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setToolTip(path)
+            self.quad_grid_list.addItem(item)
+        if not paths:
+            self.quad_grid_list.addItem(QListWidgetItem("暂无四宫格素材，点击“选择4素材”"))
+        if hasattr(self, "quad_grid_count_label"):
+            self.quad_grid_count_label.setText(f"{len(paths)}/4")
+
+    def refresh_quad_grid_summary(self):
+        label = getattr(self, "quad_grid_summary_label", None)
+        if label is None:
+            return
+        config = self._quad_grid_config()
+        if not config:
+            label.setText("四宫格未启用")
+            if hasattr(self, "btn_quad_grid_clear"):
+                self.btn_quad_grid_clear.setEnabled(False)
+            if hasattr(self, "btn_quad_grid_build"):
+                self.btn_quad_grid_build.setEnabled(False)
+            return
+        paths = config.get("paths", [])[:4]
+        names = " / ".join(os.path.basename(path) for path in paths)
+        preview = " · 已生成预览" if config.get("preview_path") and os.path.exists(config.get("preview_path")) else ""
+        label.setText(f"四宫格已启用：{len(paths)} 个素材{preview} · {names}")
+        label.setToolTip("\n".join(paths))
+        if hasattr(self, "btn_quad_grid_clear"):
+            self.btn_quad_grid_clear.setEnabled(True)
+        if hasattr(self, "btn_quad_grid_build"):
+            self.btn_quad_grid_build.setEnabled(len(paths) >= 4)
+
+    def show_quad_grid_media_context_menu(self, pos):
+        if not hasattr(self, "quad_grid_list"):
+            return
+        item = self.quad_grid_list.itemAt(pos)
+        if item is None:
+            return
+        self.quad_grid_list.setCurrentItem(item)
+        path = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if not path:
+            return
+        menu = QMenu(self)
+        show_action = menu.addAction("显示完整路径")
+        copy_action = menu.addAction("复制素材路径")
+        folder_action = menu.addAction("打开所在文件夹")
+        file_action = menu.addAction("打开素材文件")
+        if not os.path.exists(path):
+            file_action.setEnabled(False)
+        chosen = menu.exec(self.quad_grid_list.viewport().mapToGlobal(pos))
+        if chosen == show_action:
+            QMessageBox.information(self, "四宫格素材完整路径", path)
+        elif chosen == copy_action:
+            QApplication.clipboard().setText(path)
+            if hasattr(self, "status_lbl"):
+                self.status_lbl.setText("已复制四宫格素材路径。")
+        elif chosen == folder_action:
+            self._open_local_path_folder(path)
+        elif chosen == file_action:
+            self._open_local_file(path)
+
+    def _quad_grid_media_duration(self, path):
+        if self._quad_grid_media_type(path) == "image":
+            return 5.0
+        return float(get_video_stream_duration(path) or get_exact_duration(path) or 0.0)
+
+    def _quad_grid_target_duration(self, paths):
+        durations = []
+        a_path = self.state.get("audio_path", "")
+        if a_path and os.path.exists(a_path):
+            a_trim = self.state.get("a_trim") or []
+            if len(a_trim) >= 2:
+                try:
+                    durations.append(max(0.0, float(a_trim[1]) - float(a_trim[0])))
+                except Exception:
+                    pass
+            else:
+                durations.append(float(get_exact_duration(a_path) or 0.0))
+        subs = self.state.get("subs_data", []) or []
+        durations.extend(float(s.get("end", 0.0) or 0.0) for s in subs)
+        music_target = float(self.state.get("music_match_duration", 0.0) or 0.0)
+        if music_target > 0:
+            durations.append(music_target)
+        content = max([value for value in durations if value > 0.05] or [0.0])
+        if content > 0:
+            return max(1.0, content)
+        media_durations = [self._quad_grid_media_duration(path) for path in paths]
+        return max(1.0, max(media_durations or [5.0]))
+
+    def _quad_grid_preview_output_path(self, paths, duration):
+        project_path = ""
+        parent = self.parent_window()
+        if parent and isinstance(getattr(parent, "project", None), dict):
+            project_path = parent.project.get("project_path", "")
+        if not project_path and isinstance(self.project_data, dict):
+            project_path = self.project_data.get("project_path", "")
+        if project_path:
+            out_dir = os.path.join(os.path.dirname(project_path), "assets", "quad_previews")
+        else:
+            out_dir = os.path.join(tempfile.gettempdir(), "subtitle_composer_quad_previews")
+        os.makedirs(out_dir, exist_ok=True)
+        sig_parts = []
+        for path in paths:
+            try:
+                stat = os.stat(path)
+                sig_parts.append(f"{os.path.abspath(path)}|{stat.st_mtime_ns}|{stat.st_size}")
+            except Exception:
+                sig_parts.append(os.path.abspath(path))
+        sig_parts.append(f"{duration:.3f}")
+        digest = hashlib.sha1("\n".join(sig_parts).encode("utf-8", "replace")).hexdigest()[:16]
+        return os.path.join(out_dir, f"quad_grid_preview_{digest}.mp4")
+
+    def _run_quad_grid_preview_render(self, paths, output_path, duration):
+        proj_w = int(getattr(self, "proj_width", 0) or 0)
+        proj_h = int(getattr(self, "proj_height", 0) or 0)
+        if proj_w <= 0 or proj_h <= 0:
+            proj_w, proj_h = resolution_to_size(self.state.get("resolution") or get_output_resolution(), paths[0], get_video_dimensions)
+        scale = min(1.0, 720.0 / max(1.0, float(proj_w)))
+        preview_w = max(4, int((proj_w * scale) // 4) * 4)
+        preview_h = max(4, int((proj_h * scale) // 4) * 4)
+        cell_w = preview_w // 2
+        cell_h = preview_h // 2
+        cells = [
+            (0, 0, cell_w, cell_h),
+            (cell_w, 0, preview_w - cell_w, cell_h),
+            (0, cell_h, cell_w, preview_h - cell_h),
+            (cell_w, cell_h, preview_w - cell_w, preview_h - cell_h),
+        ]
+        args = [get_ffmpeg_cmd(), "-y"]
+        for path in paths[:4]:
+            if self._quad_grid_media_type(path) == "image":
+                args.extend(["-loop", "1", "-t", f"{duration:.3f}", "-i", path])
+            else:
+                args.extend(["-stream_loop", "-1", "-i", path])
+        fc_parts = [f"color=c=black:s={preview_w}x{preview_h}:d={duration:.3f},format=rgba[base]"]
+        prev_label = "base"
+        for idx, (_x, _y, w, h) in enumerate(cells):
+            fc_parts.append(
+                f"[{idx}:v]setpts=PTS-STARTPTS,"
+                f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,"
+                f"crop={w}:{h},setsar=1,format=rgba,"
+                f"tpad=stop_mode=clone:stop_duration={duration:.3f},"
+                f"trim=duration={duration:.3f},setpts=PTS-STARTPTS[q{idx}]"
+            )
+            out_label = f"qbg{idx}"
+            x, y = cells[idx][0], cells[idx][1]
+            fc_parts.append(f"[{prev_label}][q{idx}]overlay={x}:{y}:eof_action=pass:format=auto[{out_label}]")
+            prev_label = out_label
+        fc_parts.append(f"[{prev_label}]format=yuv420p[outv]")
+        args.extend([
+            "-filter_complex", ";".join(fc_parts),
+            "-map", "[outv]",
+            "-an",
+            "-t", f"{duration:.3f}",
+            "-r", "30",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "27",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            output_path,
+        ])
+        flags = 0x08000000 if os.name == "nt" else 0
+        return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="ignore", creationflags=flags, timeout=max(60, int(duration * 8)))
+
+    def assemble_quad_grid_to_timeline(self):
+        if not self._ensure_edit_mode("一键组接四宫格"):
+            return False
+        paths = self._quad_grid_paths_for_ui()
+        if len(paths) < 4:
+            return QMessageBox.information(self, "四宫格素材不足", "请先在四宫格面板选择 4 个视频或图片素材。")
+        duration = self._quad_grid_target_duration(paths)
+        output_path = self._quad_grid_preview_output_path(paths, duration)
+        if hasattr(self, "status_lbl"):
+            self.status_lbl.setText("正在生成四宫格预览片段，请稍等...")
+        QApplication.processEvents()
+        try:
+            if not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
+                result = self._run_quad_grid_preview_render(paths, output_path, duration)
+                if result.returncode != 0:
+                    detail = (result.stderr or "").strip()[-1600:]
+                    return QMessageBox.warning(self, "四宫格组接失败", f"FFmpeg 生成四宫格预览失败：\n{detail}")
+            self._set_quad_grid_state(paths, source="manual_preview", preview_path=output_path)
+            existing_non_preview = [copy.deepcopy(clip) for clip in self.state.get("video_clips", []) or [] if not (isinstance(clip, dict) and clip.get("quad_grid_preview"))]
+            if existing_non_preview and not self.state.get("quad_grid_previous_video_clips"):
+                self.state["quad_grid_previous_video_clips"] = existing_non_preview
+            try:
+                meta = get_video_import_metadata(output_path)
+                preview_dur = float(meta.get("duration", 0.0) or duration)
+                duration_info = meta.get("duration_info", {})
+                video_w = int(meta.get("width", 0) or 0)
+                video_h = int(meta.get("height", 0) or 0)
+            except Exception:
+                preview_dur, duration_info, video_w, video_h = duration, {}, 0, 0
+            if video_w <= 0 or video_h <= 0:
+                try:
+                    video_w, video_h = get_video_dimensions(output_path)
+                except Exception:
+                    video_w, video_h = 0, 0
+            new_clip = {
+                "path": output_path,
+                "start": 0.0,
+                "end": duration,
+                "dur": max(0.05, preview_dur),
+                "width": int(video_w or 0),
+                "height": int(video_h or 0),
+                "scale": 100,
+                "volume": 0,
+                "duration_probe": duration_info,
+                "source_in": 0.0,
+                "source_out": min(max(0.05, preview_dur), duration),
+                "speed": 1.0,
+                "transition": {"type": "cut", "duration": 0.0},
+                "assembly_mode": "quad_grid_preview",
+                "quad_grid_preview": True,
+            }
+            self.state["video_clips"] = [new_clip]
+            self.current_v_idx = 0
+            self.current_selected_idx = -1
+            self.selected_track = "video"
+            if hasattr(self, "btn_v"):
+                self.btn_v.setText("✅ 四宫格预览")
+            self._queue_preview_proxy_for_clip(new_clip, announce=False)
+            self._prime_video_preview_source(new_clip, announce=True)
+            self.on_resolution_changed(self.state.get("resolution", get_output_resolution()))
+            self._recalc_duration()
+            self.render_ui_list()
+            self.update_timeline_size()
+            self.update_floating_subtitle()
+            self.refresh_media_pool()
+            self.refresh_quad_grid_media_list()
+            self.refresh_quad_grid_summary()
+            self.switch_inspector("video")
+            self.sync_player_to_time(0.0)
+            QTimer.singleShot(0, self._request_preview_video_refresh)
+            QTimer.singleShot(280, self._request_preview_video_refresh)
+            self.auto_save_cache()
+            self.push_history()
+            if hasattr(self, "status_lbl"):
+                self.status_lbl.setText(f"四宫格预览已生成并放入时间线：{duration:.1f}s。最终导出仍使用原始 4 个素材。")
+            return True
+        except subprocess.TimeoutExpired:
+            return QMessageBox.warning(self, "四宫格组接超时", "生成四宫格预览耗时过长，建议先换短一点的素材或降低素材分辨率再试。")
+        except Exception as e:
+            return QMessageBox.warning(self, "四宫格组接失败", f"无法生成四宫格预览：\n{e}")
 
     def _open_local_path_folder(self, path):
         path = str(path or "").strip()
@@ -4603,19 +5068,23 @@ class EditView(QWidget):
         if not hasattr(self, "chunk_strategy_combo"):
             return
         self._syncing_chunk_controls = True
-        fixed_count = self._chunk_fixed_count_for_mode(mode)
-        if fixed_count > 0:
-            self.chunk_strategy_combo.setCurrentIndex(1)
-            idx = self.fixed_chunk_words_combo.findData(fixed_count)
-            if idx < 0:
-                self.fixed_chunk_words_combo.addItem(f"{fixed_count}\u8bcd", fixed_count)
-                idx = self.fixed_chunk_words_combo.findData(fixed_count)
-            self.fixed_chunk_words_combo.setCurrentIndex(max(0, idx))
+        if is_full_text_chunk_mode(mode):
+            idx = self.chunk_strategy_combo.findData("full_text")
+            self.chunk_strategy_combo.setCurrentIndex(idx if idx >= 0 else 0)
         else:
-            self.chunk_strategy_combo.setCurrentIndex(0)
-            min_words, max_words = self._chunk_range_for_mode(mode)
-            self.smart_min_words_spin.setValue(min_words)
-            self.smart_max_words_spin.setValue(max_words)
+            fixed_count = self._chunk_fixed_count_for_mode(mode)
+            if fixed_count > 0:
+                self.chunk_strategy_combo.setCurrentIndex(1)
+                idx = self.fixed_chunk_words_combo.findData(fixed_count)
+                if idx < 0:
+                    self.fixed_chunk_words_combo.addItem(f"{fixed_count}词", fixed_count)
+                    idx = self.fixed_chunk_words_combo.findData(fixed_count)
+                self.fixed_chunk_words_combo.setCurrentIndex(max(0, idx))
+            else:
+                self.chunk_strategy_combo.setCurrentIndex(0)
+                min_words, max_words = self._chunk_range_for_mode(mode)
+                self.smart_min_words_spin.setValue(min_words)
+                self.smart_max_words_spin.setValue(max_words)
         self._syncing_chunk_controls = False
         self._select_caption_mode_preset_for_mode(mode)
         self._refresh_chunk_param_controls()
@@ -4623,18 +5092,25 @@ class EditView(QWidget):
     def _refresh_chunk_param_controls(self):
         if not hasattr(self, "chunk_strategy_combo"):
             return
-        fixed_mode = self.chunk_strategy_combo.currentData() == "fixed"
+        strategy = self.chunk_strategy_combo.currentData()
+        fixed_mode = strategy == "fixed"
+        full_text_mode = strategy == "full_text"
         self.fixed_chunk_words_combo.setEnabled(fixed_mode)
-        self.smart_min_words_spin.setEnabled(not fixed_mode)
-        self.smart_max_words_spin.setEnabled(not fixed_mode)
-        mode = self.state.get("chunk_mode") or (self.chunk_mode.currentText() if hasattr(self, "chunk_mode") else "")
+        self.smart_min_words_spin.setEnabled(not fixed_mode and not full_text_mode)
+        self.smart_max_words_spin.setEnabled(not fixed_mode and not full_text_mode)
+        mode = self._build_chunk_mode_from_params() if full_text_mode else (self.state.get("chunk_mode") or (self.chunk_mode.currentText() if hasattr(self, "chunk_mode") else ""))
         if hasattr(self, "chunk_param_preview"):
-            self.chunk_param_preview.setText(f"\u5b9e\u9645\u542c\u8bd1\u6a21\u5f0f: {mode}")
+            if full_text_mode:
+                self.chunk_param_preview.setText(f"\u5168\u6587\u5e73\u94fa \u00b7 {mode}")
+            else:
+                self.chunk_param_preview.setText(f"\u5f53\u524d\u4f1a\u6309\uff1a{mode}")
 
     def _build_chunk_mode_from_params(self):
         if not hasattr(self, "chunk_strategy_combo"):
             return self.chunk_mode.currentText()
         preset = self.chunk_mode.currentText()
+        if self.chunk_strategy_combo.currentData() == "full_text":
+            return FULL_TEXT_CHUNK_MODE
         if self.chunk_strategy_combo.currentData() == "fixed":
             return make_fixed_chunk_mode_label(self.fixed_chunk_words_combo.currentData() or 1)
         min_words = self.smart_min_words_spin.value()
@@ -4699,10 +5175,11 @@ class EditView(QWidget):
                 html, body { margin: 0; padding: 0; background: transparent !important; overflow: hidden; width: 100vw; height: 100vh; display: flex; justify-content: center; align-items: center; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; touch-action: none; }
                 #scale-wrapper { width: 100vw; height: 100vh; position: absolute; left: 0; top: 0; cursor: grab; will-change: transform; background: transparent !important; }
                 #scale-wrapper.panning { cursor: grabbing; }
+                #scene-light-layer { position: absolute; inset: 0; pointer-events: none; z-index: 1; }
                 #design-layer { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
                 #signature-layer { position: absolute; inset: 0; pointer-events: none; z-index: 90; }
 
-                .drag-container { position: absolute; transform: translate(-50%, -50%); width: max-content; max-width: 92%; will-change: transform; overflow: visible; backface-visibility: hidden; transform-style: preserve-3d; }
+                .drag-container { position: absolute; transform: translate(-50%, -50%); width: max-content; max-width: 120%; will-change: transform; overflow: visible; backface-visibility: hidden; transform-style: preserve-3d; }
                 .sub-box { outline: none; overflow: visible; }
 
                 #safe-area { position: absolute; top: 15%; bottom: 20%; left: 10%; right: 10%; border: 2px dashed rgba(255, 255, 255, 0.4); pointer-events: none; z-index: 999; display: none; }
@@ -4731,6 +5208,7 @@ class EditView(QWidget):
         <body id="canvas">
             <div id="scale-wrapper">
                 <div id="safe-area"></div>
+                <div id="scene-light-layer"></div>
                 <div id="design-layer"></div>
                 <div id="signature-layer"></div>
             </div>
@@ -4875,6 +5353,18 @@ class EditView(QWidget):
                         setSubtitlePosition(el, sub.pos_x, sub.pos_y);
                         el.style.zIndex = sub.track === 0 ? "30" : "20";
                     });
+                }
+
+                function syncSceneLight(htmlText) {
+                    const layer = document.getElementById('scene-light-layer');
+                    if (!layer) return;
+                    if (!htmlText || htmlText.trim() === "") {
+                        layer.innerHTML = "";
+                        layer.style.display = "none";
+                    } else {
+                        layer.style.display = "block";
+                        if (layer.innerHTML !== htmlText) layer.innerHTML = htmlText;
+                    }
                 }
 
                 function syncSignature(htmlText) {
@@ -5046,7 +5536,7 @@ class EditView(QWidget):
                             // 舞台由原生窗口尺寸缩放，rect 已经是当前视图尺寸。
                             let newHalfWidth = Math.abs(e.clientX - boxCx);
                             let newWidthPx = Math.max(newHalfWidth * 2, 100);
-                            let newWidthVw = (newWidthPx / rect.width) * 100;
+                            let newWidthVw = Math.min(120, Math.max(0, (newWidthPx / rect.width) * 100));
                             dragContainer.style.width = newWidthVw + 'vw';
                             dragContainer.dataset.newWidth = newWidthVw;
                         }
@@ -7116,6 +7606,10 @@ body {{
         st = clip.get("style", clip)
 
         controls = [self.sub_start_spin, self.sub_end_spin, self.pos_x_spin, self.pos_x_slider, self.pos_y_spin, self.pos_y_slider, self.size_slider, self.size_spin, self.box_width_slider, self.box_width_spin, self.box_height_slider, self.box_height_spin, self.max_lines_slider, self.max_lines_spin, self.alpha_slider, self.alpha_spin, self.radius_slider, self.radius_spin, self.padding_slider, self.padding_spin, self.bg_pad_left_slider, self.bg_pad_left_spin, self.bg_pad_right_slider, self.bg_pad_right_spin, self.bg_pad_top_slider, self.bg_pad_top_spin, self.bg_pad_bottom_slider, self.bg_pad_bottom_spin, self.hl_alpha_slider, self.hl_alpha_spin, self.hl_radius_slider, self.hl_radius_spin, self.hl_padding_slider, self.hl_padding_spin, self.hl_pad_left_slider, self.hl_pad_left_spin, self.hl_pad_right_slider, self.hl_pad_right_spin, self.hl_pad_top_slider, self.hl_pad_top_spin, self.hl_pad_bottom_slider, self.spacing_slider, self.spacing_spin, self.word_spacing_slider, self.word_spacing_spin, self.lineh_slider, self.lineh_spin, self.layout_row_gap_slider, self.layout_row_gap_spin, self.stroke_slider, self.stroke_spin, self.stroke_o_slider, self.stroke_o_spin, self.stroke_soft_slider, self.stroke_soft_spin, self.rot_slider, self.rot_spin, self.glow_size_slider, self.glow_size_spin, self.sh_x_slider, self.sh_x_spin, self.sh_y_slider, self.sh_y_spin, self.sh_blur_slider, self.sh_blur_spin, self.sh_a_slider, self.sh_a_spin, self.pop_speed_slider, self.pop_speed_spin, self.pop_bounce_slider, self.pop_bounce_spin, self.inactive_alpha_slider, self.inactive_alpha_spin, self.voice_reveal_fade_slider, self.voice_reveal_fade_spin, self.full_roll_window_slider, self.full_roll_window_spin, self.full_roll_start_slider, self.full_roll_start_spin, self.full_roll_end_slider, self.full_roll_end_spin, self.full_roll_feather_slider, self.full_roll_feather_spin, self.full_roll_lock_check, self.mask_top_slider, self.mask_top_spin, self.mask_bot_slider, self.mask_bot_spin, self.merge_bridge_width_slider, self.merge_bridge_width_spin, self.merge_bridge_height_slider, self.merge_bridge_height_spin, self.merge_bridge_alpha_slider, self.merge_bridge_alpha_spin, self.hl_skew_slider, self.hl_skew_spin, self.hl_trail_words_slider, self.hl_trail_words_spin, self.hl_trail_alpha_slider, self.hl_trail_alpha_spin, self.global_glow_size_slider, self.global_glow_size_spin, self.global_glow_blur_slider, self.global_glow_blur_spin, self.global_glow_alpha_slider, self.global_glow_alpha_spin, self.global_glow_x_slider, self.global_glow_x_spin, self.global_glow_y_slider, self.global_glow_y_spin, self.global_glow_z_slider, self.global_glow_z_spin, self.chk_text_3d, self.text_3d_depth_slider, self.text_3d_depth_spin, self.text_3d_x_slider, self.text_3d_x_spin, self.text_3d_y_slider, self.text_3d_y_spin, self.chk_bg_auto_resolution, self.chk_bg_enabled, self.chk_global_glow, self.global_glow_mode_combo, self.global_glow_motion_combo, self.transform_combo, self.align_combo, self.anim_combo, self.text_reveal_mode_combo, self.font_motion_combo, self.hl_motion_combo, self.text_texture_combo, self.bg_mode_combo, self.layout_mode_combo, self.layout_variant_combo, self.box_layout_combo, self.axis_mode_combo, self.layout_pattern_input, self.layout_layer_pattern_input, self.layout_layer_words_input, self.emphasis_slider, self.emphasis_spin, self.contrast_small_slider, self.contrast_small_spin, self.layout_layer_count_slider, self.layout_layer_count_spin, self.axis_spread_slider, self.axis_spread_spin, self.axis_gap_slider, self.axis_gap_spin]
+        if hasattr(self, "scene_light_strength_slider"):
+            controls.extend([self.chk_scene_light, self.scene_light_trigger_combo, self.scene_light_dim_slider, self.scene_light_dim_spin, self.scene_light_strength_slider, self.scene_light_strength_spin, self.scene_light_radius_slider, self.scene_light_radius_spin, self.scene_light_x_scale_slider, self.scene_light_x_scale_spin, self.scene_light_y_scale_slider, self.scene_light_y_scale_spin, self.scene_light_decay_slider, self.scene_light_decay_spin, self.scene_light_blur_slider, self.scene_light_blur_spin, self.scene_light_spill_slider, self.scene_light_spill_spin, self.scene_light_edge_slider, self.scene_light_edge_spin])
+            if hasattr(self, "btn_scene_light_reference"):
+                controls.append(self.btn_scene_light_reference)
         controls.append(self.hl_style_combo)
         controls.extend(getattr(self, "smart_layout_checks", {}).values())
         controls.extend(getattr(self, "split_screen_pos_controls", []))
@@ -7186,6 +7680,17 @@ body {{
         self.global_glow_x_spin.setValue(int(st.get("global_glow_x", 0))); self.global_glow_x_slider.setValue(int(st.get("global_glow_x", 0)))
         self.global_glow_y_spin.setValue(int(st.get("global_glow_y", 0))); self.global_glow_y_slider.setValue(int(st.get("global_glow_y", 0)))
         self.global_glow_z_spin.setValue(int(st.get("global_glow_z", 0))); self.global_glow_z_slider.setValue(int(st.get("global_glow_z", 0)))
+        if hasattr(self, "scene_light_strength_spin"):
+            self.scene_light_dim_spin.setValue(int(st.get("scene_light_dim", 90))); self.scene_light_dim_slider.setValue(int(st.get("scene_light_dim", 90)))
+            self.scene_light_strength_spin.setValue(int(st.get("scene_light_strength", 88))); self.scene_light_strength_slider.setValue(int(st.get("scene_light_strength", 88)))
+            self.scene_light_radius_spin.setValue(int(st.get("scene_light_radius", 520))); self.scene_light_radius_slider.setValue(int(st.get("scene_light_radius", 520)))
+            self.scene_light_x_scale_spin.setValue(int(st.get("scene_light_x_scale", 56))); self.scene_light_x_scale_slider.setValue(int(st.get("scene_light_x_scale", 56)))
+            self.scene_light_y_scale_spin.setValue(int(st.get("scene_light_y_scale", 112))); self.scene_light_y_scale_slider.setValue(int(st.get("scene_light_y_scale", 112)))
+            self.scene_light_decay_spin.setValue(float(st.get("scene_light_decay", 0.48))); self.scene_light_decay_slider.setValue(int(float(st.get("scene_light_decay", 0.48)) * 100))
+            self.scene_light_blur_spin.setValue(int(st.get("scene_light_blur", 52))); self.scene_light_blur_slider.setValue(int(st.get("scene_light_blur", 52)))
+            self.scene_light_spill_spin.setValue(int(st.get("scene_light_spill", 78))); self.scene_light_spill_slider.setValue(int(st.get("scene_light_spill", 78)))
+            self.scene_light_edge_spin.setValue(int(st.get("scene_light_edge_lift", 36))); self.scene_light_edge_slider.setValue(int(st.get("scene_light_edge_lift", 36)))
+            self.scene_light_trigger_combo.setCurrentText("光照触发: 按字估算" if str(st.get("scene_light_trigger", "word")) in ("char", "character", "letter") else "光照触发: 按词")
         self.chk_text_3d.setChecked(bool(st.get("text_3d_enable", False)))
         self.text_3d_depth_spin.setValue(int(st.get("text_3d_depth", 0))); self.text_3d_depth_slider.setValue(int(st.get("text_3d_depth", 0)))
         self.text_3d_x_spin.setValue(int(st.get("text_3d_x", 2))); self.text_3d_x_slider.setValue(int(st.get("text_3d_x", 2)))
@@ -7233,6 +7738,8 @@ body {{
         self.merge_bridge_alpha_spin.setValue(int(st.get("merge_bridge_alpha", 100))); self.merge_bridge_alpha_slider.setValue(int(st.get("merge_bridge_alpha", 100)))
 
         check_widgets = [self.chk_use_hl, self.chk_hl_glow, self.chk_mask_en, self.chk_merge_bridge, self.chk_bg_enabled, self.chk_global_glow, self.chk_text_3d, self.full_roll_lock_check]
+        if hasattr(self, "chk_scene_light"):
+            check_widgets.append(self.chk_scene_light)
         for w in check_widgets:
             w.blockSignals(True)
         self.chk_use_hl.setChecked(bool(st.get("use_hl", True)) and st.get("hl_style", "text") != "none")
@@ -7241,6 +7748,8 @@ body {{
         self.chk_merge_bridge.setChecked(st.get("merge_bridge_enable", False))
         self.chk_bg_enabled.setChecked(st.get("bg_mode", "none") != "none")
         self.chk_global_glow.setChecked(st.get("global_glow_enable", False))
+        if hasattr(self, "chk_scene_light"):
+            self.chk_scene_light.setChecked(bool(st.get("scene_light_enable", False)))
         self.full_roll_lock_check.setChecked(bool(st.get("full_roll_lock_to_words", True)))
         for w in check_widgets:
             w.blockSignals(False)
@@ -7297,7 +7806,7 @@ body {{
             self.font_var.blockSignals(False)
 
         bm = st.get("bg_mode", "none")
-        bg_label_map = {"canva_fit": "胶带底框: 贴合文字", "tape": "胶带底框: 逐字单点", "sweep": "胶带底框: 扫光渐变", "block": "胶带底框: 全局底框", "full_frame": "胶带底框: 全屏框架", "cinematic_frame": "胶带底框: 柔光玻璃", "none": "胶带底框: 贴合文字"}
+        bg_label_map = {"canva_fit": "胶带底框: 贴合文字", "canva_joined": "胶带底框: 连体下沉", "tape": "胶带底框: 逐字单点", "sweep": "胶带底框: 扫光渐变", "block": "胶带底框: 全局底框", "full_frame": "胶带底框: 全屏框架", "cinematic_frame": "胶带底框: 柔光玻璃", "none": "胶带底框: 贴合文字"}
         self.bg_mode_combo.setCurrentText(bg_label_map.get(bm, bg_label_map["block"]))
 
         for c in controls: c.blockSignals(False)
@@ -7329,6 +7838,8 @@ body {{
             "hl_bg": "hl_bg_color",
             "glow": "global_glow_color",
             "text3d": "text_3d_color",
+            "scene_light": "scene_light_color",
+            "scene_mask": "scene_light_mask_color",
         }.get(target)
 
     def _current_style_for_color(self):
@@ -7367,6 +7878,11 @@ body {{
         self._set_color_control("btn_color_hl", st.get("color_hl", "#FFFFFF"), highlight_enabled)
         self._set_color_control("btn_color_hl_bg", st.get("hl_bg_color", "#FF0050"), highlight_enabled)
         self._set_color_control("btn_color_glow", st.get("global_glow_color", "#FFFFFF"), True)
+        if hasattr(self, "btn_color_scene_light"):
+            scene_enabled = bool(st.get("scene_light_enable", False))
+            self._set_color_control("btn_color_scene_light", st.get("scene_light_color", "#F6C76A"), scene_enabled)
+            if hasattr(self, "btn_color_scene_mask"):
+                self._set_color_control("btn_color_scene_mask", st.get("scene_light_mask_color", "#000000"), scene_enabled)
         self._set_color_control("btn_color_stroke", st.get("stroke_color", "#000000"), True)
         self._set_color_control("btn_color_stroke_o", st.get("stroke_o_color", "#000000"), True)
         self._set_color_control("btn_color_sh", st.get("shadow_color", "#000000"), True)
@@ -7610,6 +8126,8 @@ body {{
             elif target_type == "hl_bg_col": c["style"]["hl_bg_color"] = hex_col
             elif target_type == "glow_col": c["style"]["global_glow_color"] = hex_col
             elif target_type == "text3d_col": c["style"]["text_3d_color"] = hex_col
+            elif target_type == "scene_light_col": c["style"]["scene_light_color"] = hex_col
+            elif target_type == "scene_mask_col": c["style"]["scene_light_mask_color"] = hex_col
             elif target_type == "params":
                 c["pos_x"] = float(self.pos_x_spin.value()); c["pos_y"] = float(self.pos_y_spin.value())
                 c["style"]["rotation"] = self.rot_slider.value(); c["style"]["font"] = self._usable_font_name(self._selected_font_family())
@@ -7633,6 +8151,18 @@ body {{
                 c["style"]["global_glow_enable"] = self.chk_global_glow.isChecked()
                 c["style"]["global_glow_size"] = self.global_glow_size_slider.value(); c["style"]["global_glow_blur"] = self.global_glow_blur_slider.value()
                 c["style"]["global_glow_alpha"] = self.global_glow_alpha_slider.value(); c["style"]["global_glow_x"] = self.global_glow_x_slider.value(); c["style"]["global_glow_y"] = self.global_glow_y_slider.value(); c["style"]["global_glow_z"] = self.global_glow_z_slider.value()
+                if hasattr(self, "chk_scene_light"):
+                    c["style"]["scene_light_enable"] = self.chk_scene_light.isChecked()
+                    c["style"]["scene_light_trigger"] = "char" if "按字" in self.scene_light_trigger_combo.currentText() else "word"
+                    c["style"]["scene_light_dim"] = self.scene_light_dim_slider.value()
+                    c["style"]["scene_light_strength"] = self.scene_light_strength_slider.value()
+                    c["style"]["scene_light_radius"] = self.scene_light_radius_slider.value()
+                    c["style"]["scene_light_x_scale"] = self.scene_light_x_scale_slider.value()
+                    c["style"]["scene_light_y_scale"] = self.scene_light_y_scale_slider.value()
+                    c["style"]["scene_light_decay"] = self.scene_light_decay_spin.value()
+                    c["style"]["scene_light_blur"] = self.scene_light_blur_slider.value()
+                    c["style"]["scene_light_spill"] = self.scene_light_spill_slider.value()
+                    c["style"]["scene_light_edge_lift"] = self.scene_light_edge_slider.value()
                 c["style"]["text_3d_enable"] = self.chk_text_3d.isChecked(); c["style"]["text_3d_depth"] = self.text_3d_depth_slider.value(); c["style"]["text_3d_x"] = self.text_3d_x_slider.value(); c["style"]["text_3d_y"] = self.text_3d_y_slider.value()
                 glow_mode_txt = self.global_glow_mode_combo.currentText(); c["style"]["global_glow_mode"] = "neon" if "霓虹" in glow_mode_txt else "sweep" if "扫光" in glow_mode_txt else "soft"
                 glow_motion_txt = self.global_glow_motion_combo.currentText(); c["style"]["global_glow_motion"] = "breath" if "呼吸" in glow_motion_txt else "sweep" if "扫光" in glow_motion_txt else "stable"
@@ -7836,6 +8366,8 @@ body {{
                     c["style"]["bg_mode"] = "none"
                 elif "逐字" in b_txt or "单点" in b_txt:
                     c["style"]["bg_mode"] = "tape"
+                elif "连体" in b_txt or "下沉" in b_txt:
+                    c["style"]["bg_mode"] = "canva_joined"
                 elif "贴合" in b_txt:
                     c["style"]["bg_mode"] = "canva_fit"
                 elif "渐变" in b_txt or "扫光" in b_txt:
@@ -7975,6 +8507,43 @@ body {{
                     widget = getattr(self, f"split_screen_pos_{axis}_{slot}_{kind}", None)
                     if widget is not None:
                         widget.setVisible(visible)
+
+    def apply_reference_scene_light(self):
+        params = {
+            "scene_light_enable": True,
+            "scene_light_trigger": "word",
+            "scene_light_color": "#F6C76A",
+            "scene_light_mask_color": "#000000",
+            "scene_light_dim": 90,
+            "scene_light_strength": 92,
+            "scene_light_radius": 620,
+            "scene_light_x_scale": 48,
+            "scene_light_y_scale": 118,
+            "scene_light_decay": 0.50,
+            "scene_light_blur": 62,
+            "scene_light_spill": 88,
+            "scene_light_edge_lift": 46,
+            "text_reveal_mode": "word_voice",
+            "voice_reveal_fade": 0.06,
+        }
+        targets = self._get_target_clips()
+        if not targets and self.state.get("subs_data"):
+            targets = self.state["subs_data"]
+        if targets:
+            for clip in targets:
+                if "style" not in clip or not isinstance(clip.get("style"), dict):
+                    clip["style"] = {}
+                clip["style"].update(params)
+        self.default_style.update(params)
+        self.state["default_style"] = copy.deepcopy(self.default_style)
+        if hasattr(self, "chk_scene_light"):
+            self.sync_inspector_to_clip()
+        self._update_color_controls_from_style(self._current_style_for_color())
+        self.update_floating_subtitle()
+        self.auto_save_cache()
+        self.push_history()
+        if hasattr(self, "status_lbl"):
+            self.status_lbl.setText("✅ 已套用参考黑场光照：黑色蒙版常驻，当前出字负责挖亮画面。")
 
     def _pick_color(self, target):
         key = self._color_key_for_target(target)
@@ -8130,7 +8699,37 @@ body {{
         self.sync_player_to_time(self.current_play_time)
         self.redraw_video_preview()
         self.auto_save_cache()
-    def _on_aud_prop_change(self): self.state["a_volume"] = self.a_vol_slider.value(); self.audio_track_output.setVolume(self.state["a_volume"] / 100.0); self.auto_save_cache()
+    def _sync_audio_effect_controls(self):
+        if not hasattr(self, "chk_audio_stereo_enabled"):
+            return
+        enabled = bool(self.state.get("audio_stereo_enabled", False))
+        width = max(0, min(100, int(self.state.get("audio_stereo_width", 35) or 35)))
+        self.chk_audio_stereo_enabled.blockSignals(True)
+        self.chk_audio_stereo_enabled.setChecked(enabled)
+        self.chk_audio_stereo_enabled.blockSignals(False)
+        for control in (getattr(self, "audio_stereo_width_slider", None), getattr(self, "audio_stereo_width_spin", None)):
+            if control is None:
+                continue
+            control.blockSignals(True)
+            control.setValue(width)
+            control.setEnabled(enabled)
+            control.blockSignals(False)
+
+    def _on_aud_prop_change(self):
+        self.state["a_volume"] = self.a_vol_slider.value()
+        self.audio_track_output.setVolume(self.state["a_volume"] / 100.0)
+        self.auto_save_cache()
+
+    def _on_audio_stereo_prop_change(self):
+        enabled = bool(getattr(self, "chk_audio_stereo_enabled", None) and self.chk_audio_stereo_enabled.isChecked())
+        width = int(getattr(self, "audio_stereo_width_spin", None).value()) if hasattr(self, "audio_stereo_width_spin") else 35
+        self.state["audio_stereo_enabled"] = enabled
+        self.state["audio_stereo_width"] = max(0, min(100, width))
+        for control in (getattr(self, "audio_stereo_width_slider", None), getattr(self, "audio_stereo_width_spin", None)):
+            if control is not None:
+                control.setEnabled(enabled)
+        self.auto_save_cache()
+
     def _on_music_prop_change(self):
         self.state["music_volume"] = self.music_vol_slider.value()
         if hasattr(self, "music_output"):
@@ -8842,6 +9441,7 @@ body {{
         clips = self.state.get("video_clips", [])
         durations = [float(c.get("end", 0.0) or 0.0) for c in clips]
 
+
         a_path = self.state.get("audio_path")
         if a_path:
             a_trim = self.state.get("a_trim") or []
@@ -8865,6 +9465,13 @@ body {{
             if music_target > 0:
                 durations.append(music_target)
 
+        if not durations:
+            quad_config = self._quad_grid_config() if hasattr(self, "_quad_grid_config") else {}
+            for path in (quad_config.get("paths", []) if quad_config else []):
+                try:
+                    durations.append(float(get_exact_duration(path) or 0.0))
+                except Exception:
+                    pass
         content_dur = max(durations) if durations else 0.0
         self.state["content_duration"] = max(0.0, content_dur)
         render_dur = content_dur + render_tail_padding_seconds() if content_dur > 0 else 1.0
@@ -8874,6 +9481,7 @@ body {{
         durations = []
         for clip in self.state.get("video_clips", []) or []:
             durations.append(float(clip.get("end", 0.0) or 0.0))
+
 
         a_path = self.state.get("audio_path", "")
         if a_path:
@@ -8895,6 +9503,13 @@ body {{
             if music_target > 0:
                 durations.append(music_target)
 
+        if not durations:
+            quad_config = self._quad_grid_config() if hasattr(self, "_quad_grid_config") else {}
+            for path in (quad_config.get("paths", []) if quad_config else []):
+                try:
+                    durations.append(float(get_exact_duration(path) or 0.0))
+                except Exception:
+                    pass
         content_dur = max(durations) if durations else float(self.state.get("content_duration", 0.0) or 0.0)
         return max(0.0, content_dur)
 
@@ -9251,6 +9866,7 @@ body {{
 
     def update_floating_subtitle(self):
         active_subs = []
+        scene_light_source = []
         preview_mode = getattr(self, "preview_effect_quality", get_preview_effect_quality())
         subtitles = self.state.get("subs_data", [])
         source_index_by_id = {id(s): i for i, s in enumerate(subtitles) if isinstance(s, dict)}
@@ -9261,6 +9877,7 @@ body {{
                 i = source_index_by_id.get(id(s), -1)
             style = s.get("style", {}) if isinstance(s.get("style", {}), dict) else {}
             preview_sub = simplify_subtitle_for_preview(s, preview_mode)
+            scene_light_source.append((preview_sub, sample_time))
             htmlText = render_subtitle_html(preview_sub, sample_time, self.proj_width, self.proj_height)
             active_subs.append({
                 "idx": i, "htmlText": htmlText, "isNew": (i not in self.active_subs_cache),
@@ -9276,16 +9893,22 @@ body {{
         design_html = render_design_html(design_state, self.current_play_time, self.proj_width, self.proj_height)
         preview_signature = simplify_signature_for_preview(self.state.get("signature"), preview_mode)
         signature_html = render_signature_html(preview_signature, self.current_play_time, self.proj_width, self.proj_height)
-        overlay_has_content = bool(active_subs or design_html.strip() or signature_html.strip())
-        current_hash = hash(json.dumps({"subs": active_subs, "signature": signature_html, "design": design_html}, sort_keys=True))
+        scene_light_all = []
+        for sub in subtitles:
+            if isinstance(sub, dict) and bool((sub.get("style") or {}).get("scene_light_enable", False)):
+                scene_light_all.append((simplify_subtitle_for_preview(sub, preview_mode), self.current_play_time))
+        scene_light_html = render_scene_light_html(scene_light_all, self.current_play_time, self.proj_width, self.proj_height)
+        overlay_has_content = bool(active_subs or design_html.strip() or signature_html.strip() or scene_light_html.strip())
+        current_hash = hash(json.dumps({"subs": active_subs, "signature": signature_html, "design": design_html, "scene_light": scene_light_html}, sort_keys=True))
         if current_hash != getattr(self, 'last_render_hash', None):
             json_str = json.dumps(active_subs)
             safe_json = json_str.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$')
             safe_sig = signature_html.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$')
             safe_design = design_html.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$')
+            safe_scene = scene_light_html.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$')
             if overlay_has_content:
                 self._set_preview_overlay_visible(True)
-            self.browser.page().runJavaScript(f"if(typeof syncDesign === 'function') syncDesign(`{safe_design}`); if(typeof syncSubs === 'function') syncSubs(`{safe_json}`); if(typeof syncSignature === 'function') syncSignature(`{safe_sig}`);")
+            self.browser.page().runJavaScript(f"if(typeof syncSceneLight === 'function') syncSceneLight(`{safe_scene}`); if(typeof syncDesign === 'function') syncDesign(`{safe_design}`); if(typeof syncSubs === 'function') syncSubs(`{safe_json}`); if(typeof syncSignature === 'function') syncSignature(`{safe_sig}`);")
             if not overlay_has_content:
                 QTimer.singleShot(0, lambda: self._set_preview_overlay_visible(False))
             self.last_render_hash = current_hash; self.active_subs_cache = set([sub["idx"] for sub in active_subs if sub.get("idx", -1) >= 0])
@@ -9878,6 +10501,7 @@ body {{
                 self.a_vol_spin.setValue(self.state.get("a_volume", 100))
                 self.music_vol_spin.setValue(self.state.get("music_volume", 35))
                 self._sync_video_mask_controls()
+                self._sync_audio_effect_controls()
                 chunk_value = self.state.get("chunk_mode", "双行大段 (约10字，智能折行)")
                 timing_value = self.state.get("timing_mode", "J Cut (字幕稍后收尾)")
                 if "对齐声音" in chunk_value:
@@ -9915,6 +10539,8 @@ body {{
                     self.music_player.setLoops(QMediaPlayer.Loops.Infinite)
                 self.render_ui_list()
                 self.refresh_media_pool()
+                self.refresh_quad_grid_media_list()
+                self.refresh_quad_grid_summary()
                 self.switch_inspector("empty")
                 self.push_history() # 初始化历史栈
                 QTimer.singleShot(500, self._sync_duration_after_cache)
@@ -9934,7 +10560,7 @@ body {{
             if isinstance(cached.get("default_style"), dict):
                 merged_default_style.update(cached.get("default_style", {}))
             cached["default_style"] = merged_default_style
-            self.state.update(cached); self.default_style.update(merged_default_style); self.state["signature"] = normalize_signature_config(self.state.get("signature"), self.default_style); self.sync_signature_controls(); self.last_render_hash = None; self.active_subs_cache = set(); self.v_scale_spin.setValue(self.state.get("v_scale", 100)); self.v_vol_spin.setValue(self.state.get("v_volume", 100)); self.a_vol_spin.setValue(self.state.get("a_volume", 100)); self.music_vol_spin.setValue(self.state.get("music_volume", 35)); self._sync_video_mask_controls()
+            self.state.update(cached); self.default_style.update(merged_default_style); self.state["signature"] = normalize_signature_config(self.state.get("signature"), self.default_style); self.sync_signature_controls(); self.last_render_hash = None; self.active_subs_cache = set(); self.v_scale_spin.setValue(self.state.get("v_scale", 100)); self.v_vol_spin.setValue(self.state.get("v_volume", 100)); self.a_vol_spin.setValue(self.state.get("a_volume", 100)); self.music_vol_spin.setValue(self.state.get("music_volume", 35)); self._sync_video_mask_controls(); self._sync_audio_effect_controls()
             chunk_value = self.state.get("chunk_mode", "双行大段 (约10字，智能折行)")
             timing_value = self.state.get("timing_mode", "J Cut (字幕稍后收尾)")
             if "对齐声音" in chunk_value:
@@ -9968,7 +10594,7 @@ body {{
                 self.btn_music.setText("✅ " + os.path.basename(self.state.get("music_path"))[:15])
                 self.music_player.setSource(QUrl.fromLocalFile(self.state.get("music_path")))
                 self.music_player.setLoops(QMediaPlayer.Loops.Infinite)
-            self.render_ui_list(); self.refresh_media_pool(); self.switch_inspector("empty");
+            self.render_ui_list(); self.refresh_media_pool(); self.refresh_quad_grid_media_list(); self.refresh_quad_grid_summary(); self.switch_inspector("empty");
             self.push_history() # 初始化历史栈
             QTimer.singleShot(500, self._sync_duration_after_cache)
         except: pass
@@ -10025,7 +10651,7 @@ body {{
             self.music_output.setVolume(float(self.state.get("music_volume", 35) or 35) / 100.0)
         if self._has_music_track():
             self._sync_music_playback_to_time(self.current_play_time, force_seek=True)
-        self._recalc_duration(); self.sync_player_to_time(0.1)
+        self._recalc_duration(); self.refresh_quad_grid_media_list(); self.refresh_quad_grid_summary(); self.sync_player_to_time(0.1)
 
     def _get_target_clips(self):
         if self.current_selected_idx == -1: return []

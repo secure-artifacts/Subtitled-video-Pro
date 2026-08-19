@@ -22,7 +22,7 @@ EXPORT_RENDER_QUALITY_PROFILES = {
         "vp9_tile_columns": "2",
     },
     "极速出片": {
-        "render_scale_cap": 0.65,
+        "render_scale_cap": 1.0,
         "event_fps_cap": 4,
         "continuous_fps_cap": 6,
         "vp9_crf": "34",
@@ -48,7 +48,9 @@ def export_render_profile(mode, default_scale=1.0, default_event_fps=8, default_
         scale = 1.0
     cap = base.get("render_scale_cap")
     render_scale = scale if cap is None else min(scale, float(cap))
-    render_scale = max(0.5, float(render_scale or 1.0))
+    # Subtitle HTML is laid out against the project canvas. Rendering below 1:1
+    # can crop text-heavy layouts in fast export modes, so speed up elsewhere.
+    render_scale = max(1.0, float(render_scale or 1.0))
 
     def capped_fps(value, cap_value):
         try:
@@ -96,6 +98,10 @@ def _style_key(style):
 def style_render_cost_score(style):
     style = style if isinstance(style, dict) else {}
     score = 0
+    if _enabled(style.get("scene_light_enable")):
+        score += 1
+        if str(style.get("scene_light_trigger", "word") or "word") in {"char", "character", "letter"}:
+            score += 1
     if _enabled(style.get("global_glow_enable")):
         blur = _to_int(style.get("global_glow_blur"), 24)
         score += 2
@@ -134,6 +140,8 @@ def style_render_cost_score(style):
 def style_render_cost_notes(style, label="字幕样式"):
     style = style if isinstance(style, dict) else {}
     notes = []
+    if _enabled(style.get("scene_light_enable")):
+        notes.append(f"{label}: 画面光照启用，触发={style.get('scene_light_trigger', 'word')}, 强度={_to_int(style.get('scene_light_strength'), 42)}; 按字触发会增加截图采样。")
     if _enabled(style.get("global_glow_enable")):
         blur = _to_int(style.get("global_glow_blur"), 24)
         size = _to_int(style.get("global_glow_size"), 18)
@@ -152,7 +160,6 @@ def style_render_cost_notes(style, label="字幕样式"):
     if str(style.get("anim_type", "") or "") == "full_text_roll":
         notes.append(f"{label}: 全文滚动会按连续帧采样，字幕截图段数通常比普通字幕更多。")
     return notes
-
 
 def summarize_project_render_cost(project_state, design_state=None):
     project_state = project_state if isinstance(project_state, dict) else {}
@@ -223,6 +230,14 @@ def simplify_style_for_export(style, mode="清晰快速"):
     if not force and style_render_cost_score(simplified) < 3:
         return simplified
 
+    if _enabled(simplified.get("scene_light_enable")):
+        _cap_int_field(simplified, "scene_light_strength", 42, 68 if force else 90)
+        _cap_int_field(simplified, "scene_light_x_scale", 56, 72 if force else 130)
+        _cap_int_field(simplified, "scene_light_blur", 18, 32 if force else 58)
+        _cap_int_field(simplified, "scene_light_spill", 38, 72 if force else 92)
+        _cap_int_field(simplified, "scene_light_edge_lift", 34, 46 if force else 78)
+        if force and str(simplified.get("scene_light_trigger", "word") or "word") in {"char", "character", "letter"}:
+            simplified["scene_light_trigger"] = "word"
     if _enabled(simplified.get("global_glow_enable")):
         _cap_int_field(simplified, "global_glow_blur", 24, 14 if force else 22)
         _cap_int_field(simplified, "global_glow_size", 18, 22 if force else 34)
@@ -273,6 +288,13 @@ def simplify_style_for_preview(style, mode="自动流畅"):
     if not force and style_render_cost_score(simplified) < 3:
         return simplified
 
+    if _enabled(simplified.get("scene_light_enable")):
+        simplified["scene_light_blur"] = min(_to_int(simplified.get("scene_light_blur"), 18), 24 if force else 48)
+        simplified["scene_light_strength"] = min(_to_int(simplified.get("scene_light_strength"), 42), 58 if force else 84)
+        simplified["scene_light_x_scale"] = min(_to_int(simplified.get("scene_light_x_scale"), 56), 68 if force else 120)
+        simplified["scene_light_edge_lift"] = min(_to_int(simplified.get("scene_light_edge_lift"), 34), 40 if force else 64)
+        if force:
+            simplified["scene_light_trigger"] = "word"
     if _enabled(simplified.get("global_glow_enable")):
         simplified["global_glow_blur"] = min(_to_int(simplified.get("global_glow_blur"), 24), 10 if force else 18)
         simplified["global_glow_size"] = min(_to_int(simplified.get("global_glow_size"), 18), 16 if force else 28)

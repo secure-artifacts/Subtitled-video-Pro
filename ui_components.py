@@ -938,7 +938,7 @@ def subtitle_layout_capacity(style, proj_w=1080):
     width_pct = float(style.get("box_width", 0) or 0)
     if width_pct <= 0:
         width_pct = 74.0
-    width_pct = max(28.0, min(92.0, width_pct))
+    width_pct = max(28.0, min(120.0, width_pct))
     max_lines = max(1, min(5, int(style.get("max_lines", 2) or 2)))
     line_capacity = max(3.5, (float(proj_w) * width_pct / 100.0) / size * 0.92)
     layout_mode = style.get("layout_mode", "standard")
@@ -1283,6 +1283,7 @@ class WebBridge(QObject):
 
     @pyqtSlot(int, float)
     def update_box_width(self, idx, width):
+        width = max(0.0, min(120.0, float(width or 0.0)))
         if 0 <= idx < len(self.controller.state["subs_data"]):
             current_clip = self.controller.state["subs_data"][idx]
             scope = self.controller.style_scope_combo.currentIndex()
@@ -1334,6 +1335,358 @@ class WebBridge(QObject):
 
 
 
+
+def _scene_light_bool(value):
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+    return bool(value)
+
+
+def _scene_light_word_items(sub, clip_start, clip_end):
+    words = sub.get("words", []) if isinstance(sub, dict) else []
+    if not words:
+        text = str((sub or {}).get("text", "") if isinstance(sub, dict) else "").strip()
+        return [{"text": text, "start": clip_start, "end": clip_end}] if text else []
+    items = []
+    for word in words:
+        label = _clean_word_text(word)
+        if not label:
+            continue
+        start = max(clip_start, min(clip_end, _safe_float(word.get("start", clip_start), clip_start)))
+        end = max(start + 0.02, min(clip_end, _safe_float(word.get("end", start + 0.16), start + 0.16)))
+        items.append({"text": label, "start": start, "end": end})
+    return items
+
+
+def _scene_light_pulse_for_sub(sub, current_time):
+    if not isinstance(sub, dict):
+        return 0.0
+    style = sub.get("style", sub)
+    if not isinstance(style, dict) or not _scene_light_bool(style.get("scene_light_enable", False)):
+        return 0.0
+    current_time = _safe_float(current_time, 0.0)
+    clip_start = _safe_float(sub.get("start", current_time), current_time)
+    clip_end = _safe_float(sub.get("end", clip_start + 1.0), clip_start + 1.0)
+    if current_time < clip_start - 0.001 or current_time > clip_end + 0.001:
+        return 0.0
+    trigger = str(style.get("scene_light_trigger", "word") or "word").strip().lower()
+    decay = max(0.05, min(1.20, _safe_float(style.get("scene_light_decay", 0.30), 0.30)))
+    hold = max(0.0, min(0.35, _safe_float(style.get("scene_light_hold", 0.02), 0.02)))
+    pulse = 0.0
+    for word in _scene_light_word_items(sub, clip_start, clip_end):
+        starts = [word["start"]]
+        if trigger in {"char", "character", "letter"}:
+            clean = re.sub(r"\s+", "", str(word.get("text", "")))
+            char_count = max(1, min(24, len(clean)))
+            word_span = max(0.04, min(max(0.04, word["end"] - word["start"]), decay * 1.6))
+            interval = max(0.035, word_span / char_count)
+            starts = [word["start"] + i * interval for i in range(char_count)]
+        for start in starts:
+            age = current_time - start
+            if age < -0.002 or age > decay + hold:
+                continue
+            if age <= hold:
+                local = 1.0
+            else:
+                p = max(0.0, min(1.0, (age - hold) / decay))
+                local = (1.0 - p) ** 2.15
+            if local > pulse:
+                pulse = local
+    return max(0.0, min(1.0, pulse))
+
+
+def render_scene_light_html(active_subs, current_time, proj_w=1080, proj_h=1920):
+    """Render the reference-style dark scene light effect.
+
+    The layer keeps a persistent dark mask over the video, then cuts soft holes
+    through that mask using only words that are actually visible at this time.
+    Word positions are estimated from the full subtitle layout so hidden future
+    words can still reserve space without creating ghost text in the light mask.
+    """
+    canvas_w = float(proj_w or 1080)
+    canvas_h = float(proj_h or 1920)
+    dim_alpha = 0.0
+    mask_rgb = (0, 0, 0)
+    mask_color = "#000000"
+    mask_items = []
+    spot_items = []
+    bloom_items = []
+    ambient_lift_alpha = 0.0
+
+    def _reveal_mode(style):
+        mode = str(style.get("text_reveal_mode", "all") or "all").strip().lower()
+        mapped = {
+            "word": "word_voice",
+            "voice_word": "word_voice",
+            "word_voice": "word_voice",
+            "line": "line_voice",
+            "voice_line": "line_voice",
+            "line_voice": "line_voice",
+            "none": "all",
+        }.get(mode, mode if mode in {"all", "word_voice", "line_voice"} else "all")
+        # Scene light is an "appearing word lights the scene" effect.  Even when
+        # the subtitle display mode is all-at-once, old projects can still hide
+        # future words via word timestamps/inactive alpha, so the light must not
+        # pre-cut holes for words that have not reached their audio time yet.
+        if mapped == "all":
+            return "word_voice"
+        return mapped
+
+    def _text_width_px(label, size_px, letter_spacing_px=0.0):
+        clean = str(label or "")
+        if not clean:
+            return 0.0
+        spacing = max(-24.0, min(60.0, _safe_float(letter_spacing_px, 0.0))) * max(0, len(clean) - 1)
+        return max(size_px * 0.24, _visual_text_units(clean) * size_px * 0.96 + spacing)
+
+    def _layout_scene_words(sub, style, clip_start, clip_end, size_px):
+        words = _scene_light_word_items(sub, clip_start, clip_end)
+        if not words:
+            raw = str(sub.get("text", "") or "").strip()
+            if raw:
+                span = max(0.05, clip_end - clip_start)
+                tokens = [part for part in re.split(r"\s+", raw) if part]
+                if tokens:
+                    step = span / max(1, len(tokens))
+                    words = [
+                        {"text": token, "start": clip_start + i * step, "end": min(clip_end, clip_start + (i + 1) * step)}
+                        for i, token in enumerate(tokens)
+                    ]
+        if not words:
+            return []
+
+        max_lines = max(1, min(6, int(style.get("max_lines", 2) or 2)))
+        width_pct = _safe_float(style.get("box_width", 0), 0)
+        if width_pct <= 0:
+            width_pct = 74.0
+        width_pct = max(24.0, min(120.0, width_pct))
+        line_capacity = max(3.5, (canvas_w * width_pct / 100.0) / max(8.0, size_px) * 0.92)
+        arranged = words
+        if len(words) > 1 and max_lines > 1:
+            try:
+                arranged = _apply_balanced_breaks(words, line_capacity, max_lines, style)
+            except Exception:
+                arranged = words
+
+        rows = [[]]
+        for item in arranged:
+            raw = str(item.get("text") or item.get("word") or "")
+            if "\n" in raw and rows[-1]:
+                rows.append([])
+            clean = raw.replace("\n", "").strip()
+            if not clean:
+                continue
+            display = _style_display_text(clean, style)
+            rows[-1].append({
+                "text": display,
+                "start": _safe_float(item.get("start", clip_start), clip_start),
+                "end": _safe_float(item.get("end", clip_end), clip_end),
+            })
+        return [row for row in rows if row]
+
+    def _svg_word_group(label, x, y, size_px, anchor, family, weight, font_style, rotation):
+        return (
+            f"<g transform='translate({x:.3f} {y:.3f}) rotate({rotation:.3f})'>"
+            f"<text text-anchor='{anchor}' dominant-baseline='middle' font-family='{html_attr(family)}' "
+            f"font-size='{size_px:.3f}' font-weight='{html_attr(weight)}' font-style='{html_attr(font_style)}' "
+            f"letter-spacing='0' paint-order='stroke fill'>{html_text(label)}</text></g>"
+        )
+
+    for entry in active_subs or []:
+        if isinstance(entry, tuple) and len(entry) >= 2:
+            sub, sub_time = entry[0], entry[1]
+        else:
+            sub, sub_time = entry, current_time
+        if not isinstance(sub, dict):
+            continue
+        style = sub.get("style", sub)
+        if not isinstance(style, dict) or not _scene_light_bool(style.get("scene_light_enable", False)):
+            continue
+
+        current_mask_color = _normalize_render_hex_color(style.get("scene_light_mask_color", "#000000"), "#000000") or "#000000"
+        current_dim = max(0.0, min(100.0, _safe_float(style.get("scene_light_dim", 92), 92))) / 100.0
+        if current_dim >= dim_alpha:
+            dim_alpha = current_dim
+            mask_color = current_mask_color
+            mask_rgb = hex_to_rgb(mask_color)
+
+        clip_start = _safe_float(sub.get("start", sub_time), sub_time)
+        clip_end = _safe_float(sub.get("end", clip_start + 1.0), clip_start + 1.0)
+        if sub_time < clip_start - 0.001 or sub_time > clip_end + 0.001:
+            continue
+
+        mode = _reveal_mode(style)
+        color = _normalize_render_hex_color(style.get("scene_light_color", "#F6C76A"), "#F6C76A") or "#F6C76A"
+        strength = max(0.0, min(100.0, _safe_float(style.get("scene_light_strength", 76), 76))) / 100.0
+        radius = max(35.0, min(1200.0, _safe_float(style.get("scene_light_radius", 360), 360)))
+        x_scale = max(0.15, min(2.40, _safe_float(style.get("scene_light_x_scale", 56), 56) / 100.0))
+        y_scale = max(0.15, min(2.80, _safe_float(style.get("scene_light_y_scale", 112), 112) / 100.0))
+        blur = max(0.0, min(180.0, _safe_float(style.get("scene_light_blur", 38), 38)))
+        spill = max(0.0, min(100.0, _safe_float(style.get("scene_light_spill", 68), 68))) / 100.0
+        edge_lift = max(0.0, min(100.0, _safe_float(style.get("scene_light_edge_lift", 34), 34))) / 100.0
+        decay = max(0.05, min(1.50, _safe_float(style.get("scene_light_decay", 0.38), 0.38)))
+        hold = max(0.0, min(0.35, _safe_float(style.get("scene_light_hold", 0.02), 0.02)))
+        fade_time = max(0.0, min(0.60, _safe_float(style.get("voice_reveal_fade", 0.06), 0.06)))
+
+        px = max(-80.0, min(180.0, _safe_float(sub.get("pos_x", 0.0), 0.0)))
+        py = max(-80.0, min(180.0, _safe_float(sub.get("pos_y", 25.0), 25.0)))
+        rot = max(-180.0, min(180.0, _safe_float(style.get("rotation", 0), 0)))
+        size_px = max(8.0, min(520.0, _safe_float(style.get("size", 100), 100)))
+        line_height = max(0.72, min(2.4, _safe_float(style.get("line_height", 1.1), 1.1)))
+        layout_mode = str(style.get("layout_mode", "standard") or "standard").strip().lower()
+        if layout_mode in ("contrast", "triple", "reel_stack", "random_focus", "side_steps", "axis_stack", "quote_stack", "prayer_reflow", "narrative_block"):
+            line_height = max(0.60, min(3.0, line_height * max(0.35, min(3.0, _safe_float(style.get("layout_row_gap", 100), 100) / 100.0))))
+        line_gap_px = size_px * line_height
+        x_px = canvas_w * (0.5 + px / 100.0)
+        y_px = canvas_h * (0.5 + py / 100.0)
+        align = str(style.get("text_align", "center") or "center").lower()
+        family = str(style.get("font", "Arial") or "Arial")
+        weight = str(style.get("font_weight", "800") or "800")
+        font_style = str(style.get("font_style", "normal") or "normal")
+        letter_spacing = _safe_float(style.get("letter_spacing", 0), 0)
+        word_spacing = _safe_float(style.get("word_spacing", 0), 0)
+        gap_px = max(size_px * 0.22, size_px * 0.32 + word_spacing)
+        width_pct = _safe_float(style.get("box_width", 0), 0)
+        if width_pct <= 0:
+            width_pct = 74.0
+        box_width_px = canvas_w * max(24.0, min(120.0, width_pct)) / 100.0
+
+        rows = _layout_scene_words(sub, style, clip_start, clip_end, size_px)
+        if not rows:
+            continue
+        line_starts = [min(_safe_float(w.get("start", clip_start), clip_start) for w in row) for row in rows]
+        start_y = -((len(rows) - 1) * line_gap_px) / 2.0
+        trigger = str(style.get("scene_light_trigger", "word") or "word").strip().lower()
+
+        total_light_words = max(1, sum(len(row) for row in rows))
+        light_slot_i = 0
+        for row_i, row in enumerate(rows):
+            widths = [_text_width_px(word["text"], size_px, letter_spacing) for word in row]
+            row_width = sum(widths) + max(0, len(row) - 1) * gap_px
+            if align == "left":
+                cursor_x = x_px - box_width_px / 2.0
+            elif align == "right":
+                cursor_x = x_px + box_width_px / 2.0 - row_width
+            else:
+                cursor_x = x_px - row_width / 2.0
+            row_y = y_px + start_y + row_i * line_gap_px
+            for word_i, word in enumerate(row):
+                light_slot_i += 1
+                label = word["text"]
+                word_width = widths[word_i]
+                word_x = cursor_x + word_width / 2.0
+                cursor_x += word_width + gap_px
+                reveal_start = line_starts[row_i] if mode == "line_voice" else _safe_float(word.get("start", clip_start), clip_start)
+                if mode != "all" and sub_time < reveal_start:
+                    continue
+                fade = 1.0
+                if mode != "all" and fade_time > 0:
+                    fade = max(0.0, min(1.0, (sub_time - reveal_start) / max(0.01, fade_time)))
+                    fade = 1.0 - (1.0 - fade) ** 3
+                if fade <= 0.01:
+                    continue
+                starts = [reveal_start]
+                if trigger in {"char", "character", "letter"}:
+                    clean = re.sub(r"\s+", "", label)
+                    char_count = max(1, min(24, len(clean)))
+                    span = max(0.04, min(max(0.04, _safe_float(word.get("end", reveal_start + 0.16), reveal_start + 0.16) - reveal_start), decay * 1.6))
+                    interval = max(0.035, span / char_count)
+                    starts = [reveal_start + i * interval for i in range(char_count)]
+                pulse = 0.0
+                for local_start in starts:
+                    age = sub_time - local_start
+                    if age < -0.002 or age > decay + hold:
+                        continue
+                    if age <= hold:
+                        local = 1.0
+                    else:
+                        p = max(0.0, min(1.0, (age - hold) / decay))
+                        local = (1.0 - p) ** 2.15
+                    pulse = max(pulse, local)
+                base_opacity = 0.62 + strength * 0.30 + spill * 0.10
+                reveal_opacity = max(0.0, min(1.0, (base_opacity + pulse * 0.12) * fade))
+                if reveal_opacity <= 0.01:
+                    continue
+                progress_raw = max(0.0, min(1.0, (light_slot_i - 1 + fade) / total_light_words))
+                progress_curve = progress_raw ** 1.45
+                radius_mix = max(0.0, min(1.0, radius / 1200.0))
+                spread_curve = 0.50 + 0.50 * progress_curve
+                base_rx = max(
+                    word_width * (0.62 + spill * 0.42),
+                    size_px * (1.35 + spill * 0.92),
+                    canvas_w * (0.050 + radius_mix * 0.34) * spread_curve,
+                )
+                base_ry = max(
+                    size_px * (1.95 + spill * 1.18),
+                    canvas_h * (0.070 + radius_mix * 0.40) * spread_curve,
+                )
+                spot_rx = max(size_px * 0.70, base_rx * x_scale)
+                spot_ry = max(size_px * 0.90, base_ry * y_scale)
+                outer_rx = max(
+                    spot_rx * (1.10 + edge_lift * 0.82),
+                    canvas_w * (0.070 + radius_mix * 0.30) * spread_curve * x_scale,
+                )
+                outer_ry = max(
+                    spot_ry * (1.14 + edge_lift * 0.92),
+                    canvas_h * (0.12 + radius_mix * 0.46) * spread_curve * y_scale,
+                )
+                spot_center_alpha = max(0.0, min(0.96, (0.34 + strength * 0.44 + spill * 0.16 + pulse * 0.22) * fade))
+                spot_mid_alpha = max(0.0, min(0.66, (0.13 + strength * 0.22 + spill * 0.18 + pulse * 0.13) * fade * (0.55 + 0.45 * progress_curve)))
+                spot_edge_alpha = max(0.0, min(0.46, (0.020 + edge_lift * 0.30 + strength * 0.065 + spill * 0.052 + pulse * 0.05) * fade * progress_curve))
+                spot_bloom_alpha = max(0.0, min(0.56, (0.055 + strength * 0.18 + spill * 0.20 + edge_lift * 0.12 + pulse * 0.15) * fade * (0.50 + 0.50 * progress_curve)))
+                if spot_center_alpha > 0.02:
+                    spot_items.append((word_x, row_y, spot_rx, spot_ry, outer_rx, outer_ry, spot_center_alpha, spot_mid_alpha, spot_edge_alpha, spot_bloom_alpha, color))
+                    ambient_lift_alpha = max(ambient_lift_alpha, min(0.22, (0.010 + edge_lift * 0.17 + strength * 0.030 + spill * 0.024) * fade * progress_curve))
+
+    if dim_alpha <= 0.004:
+        return ""
+
+    mr, mg, mb = mask_rgb
+    defs = []
+    mask_layers = ["<rect width='100%' height='100%' fill='white'/>"]
+    bloom_layers = []
+    if ambient_lift_alpha > 0.001:
+        mask_layers.append(f"<rect width='100%' height='100%' fill='black' opacity='{ambient_lift_alpha:.4f}'/>")
+    for idx, (cx, cy, rx, ry, outer_rx, outer_ry, center_alpha, mid_alpha, edge_alpha, bloom_alpha, color) in enumerate(spot_items):
+        if edge_alpha > 0.01:
+            defs.append(
+                f"<radialGradient id='scene-edge-mask-{idx}' cx='50%' cy='50%' r='50%'>"
+                f"<stop offset='0%' stop-color='black' stop-opacity='{edge_alpha:.4f}'/>"
+                f"<stop offset='42%' stop-color='black' stop-opacity='{edge_alpha * 0.66:.4f}'/>"
+                f"<stop offset='78%' stop-color='black' stop-opacity='{edge_alpha * 0.22:.4f}'/>"
+                f"<stop offset='100%' stop-color='black' stop-opacity='0'/>"
+                f"</radialGradient>"
+            )
+            mask_layers.append(f"<ellipse cx='{cx:.3f}' cy='{cy:.3f}' rx='{outer_rx:.3f}' ry='{outer_ry:.3f}' fill='url(#scene-edge-mask-{idx})'/>")
+        defs.append(
+            f"<radialGradient id='scene-spot-mask-{idx}' cx='50%' cy='50%' r='50%'>"
+            f"<stop offset='0%' stop-color='black' stop-opacity='{center_alpha:.4f}'/>"
+            f"<stop offset='35%' stop-color='black' stop-opacity='{center_alpha * 0.82:.4f}'/>"
+            f"<stop offset='70%' stop-color='black' stop-opacity='{mid_alpha:.4f}'/>"
+            f"<stop offset='100%' stop-color='black' stop-opacity='0'/>"
+            f"</radialGradient>"
+        )
+        mask_layers.append(f"<ellipse cx='{cx:.3f}' cy='{cy:.3f}' rx='{rx:.3f}' ry='{ry:.3f}' fill='url(#scene-spot-mask-{idx})'/>")
+        if bloom_alpha > 0.01:
+            defs.append(
+                f"<radialGradient id='scene-spot-bloom-{idx}' cx='50%' cy='50%' r='50%'>"
+                f"<stop offset='0%' stop-color='{html_attr(color)}' stop-opacity='{bloom_alpha:.4f}'/>"
+                f"<stop offset='38%' stop-color='{html_attr(color)}' stop-opacity='{bloom_alpha * 0.48:.4f}'/>"
+                f"<stop offset='100%' stop-color='{html_attr(color)}' stop-opacity='0'/>"
+                f"</radialGradient>"
+            )
+            bloom_layers.append(f"<ellipse cx='{cx:.3f}' cy='{cy:.3f}' rx='{outer_rx:.3f}' ry='{outer_ry:.3f}' fill='url(#scene-spot-bloom-{idx})' opacity='0.55'/>")
+            bloom_layers.append(f"<ellipse cx='{cx:.3f}' cy='{cy:.3f}' rx='{rx:.3f}' ry='{ry:.3f}' fill='url(#scene-spot-bloom-{idx})'/>")
+
+    svg = (
+        f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {canvas_w:.3f} {canvas_h:.3f}' "
+        f"preserveAspectRatio='none' style='position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:1; overflow:visible;'>"
+        f"<defs>{''.join(defs)}<mask id='scene-light-cutout' maskUnits='userSpaceOnUse' mask-type='luminance'>{''.join(mask_layers)}</mask></defs>"
+        f"<rect x='0' y='0' width='{canvas_w:.3f}' height='{canvas_h:.3f}' fill='rgba({mr},{mg},{mb},{dim_alpha:.4f})' mask='url(#scene-light-cutout)'/>"
+        f"<g style='mix-blend-mode:screen; pointer-events:none;'>{''.join(bloom_layers)}</g>"
+        f"</svg>"
+    )
+    return svg
 
 def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
     def vw(val):
@@ -1513,7 +1866,7 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
 
     r, g, b = hex_to_rgb(bg_col)
     hl_r, hl_g, hl_b = hex_to_rgb(hl_bg_col)
-    stable_word_boxes = bg_mode in ("tape", "canva_fit", "block", "full_frame", "sweep", "cinematic_frame") and hl_motion == "stable"
+    stable_word_boxes = bg_mode in ("tape", "canva_fit", "canva_joined", "block", "full_frame", "sweep", "cinematic_frame") and hl_motion == "stable"
 
     words = sub.get("words", [])
     if not words:
@@ -2027,7 +2380,7 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         if not clean_txt:
             if has_newline:
                 html_words_fg.append("<br>")
-                if bg_mode in ("tape", "canva_fit", "block", "sweep"):
+                if bg_mode in ("tape", "canva_fit", "canva_joined", "block", "sweep"):
                     html_words_bg.append("<br>")
             continue
 
@@ -2044,12 +2397,12 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         if has_newline and idx > 0:
             html_words_fg.append("<br>")
             inserted_break = True
-            if bg_mode in ("tape", "canva_fit", "block", "sweep"):
+            if bg_mode in ("tape", "canva_fit", "canva_joined", "block", "sweep"):
                 html_words_bg.append("<br>")
 
         if not inserted_break and _layout_breaks_before(idx):
             html_words_fg.append("<br>")
-            if bg_mode in ("tape", "canva_fit", "block", "sweep"):
+            if bg_mode in ("tape", "canva_fit", "canva_joined", "block", "sweep"):
                 html_words_bg.append("<br>")
 
         clean_txt = _style_display_text(clean_txt, style)
@@ -2205,6 +2558,8 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
             hidden_pct = max(0.0, 100.0 - word_reveal_pct)
             current_clip_css = f"-webkit-clip-path: inset(0 {hidden_pct:.3f}% 0 0); clip-path: inset(0 {hidden_pct:.3f}% 0 0);"
 
+        layout_row_i, layout_pos_i, layout_row_len = layout_row_lookup.get(idx, (0, 0, 0))
+
         shadows = []
         stroke_r, stroke_g, stroke_b = hex_to_rgb(stroke_c)
         if stroke_o_w > 0:
@@ -2254,6 +2609,33 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
                 f"0 0 {vw(10)} rgba({gr}, {gg}, {gb}, {0.16 * aura:.2f})",
                 f"0 0 {vw(22)} rgba({gr}, {gg}, {gb}, {0.10 * aura:.2f})",
             ])
+        scene_light_text_on = _scene_light_bool(style.get("scene_light_enable", False)) and current_opacity > 0.02
+        scene_light_filter_parts = []
+        if scene_light_text_on:
+            lr, lg, lb = hex_to_rgb(_normalize_render_hex_color(style.get("scene_light_color", "#F6C76A"), "#F6C76A") or "#F6C76A")
+            scene_strength = max(0.0, min(1.0, _safe_float(style.get("scene_light_strength", 76), 76) / 100.0))
+            scene_blur = max(6.0, min(120.0, _safe_float(style.get("scene_light_blur", 26), 26)))
+            scene_spill = max(0.0, min(1.0, _safe_float(style.get("scene_light_spill", 42), 42) / 100.0))
+            scene_radius = max(35.0, min(1200.0, _safe_float(style.get("scene_light_radius", 360), 360)))
+            scene_x_scale = max(0.15, min(2.40, _safe_float(style.get("scene_light_x_scale", 56), 56) / 100.0))
+            scene_y_scale = max(0.15, min(2.80, _safe_float(style.get("scene_light_y_scale", 112), 112) / 100.0))
+            text_glow_scale = max(0.45, min(1.35, (scene_x_scale * 0.65 + scene_y_scale * 0.35)))
+            scene_alpha = min(1.0, (0.48 + scene_strength * 0.48 + scene_spill * 0.22) * current_opacity)
+            aura_blur = max(scene_blur * 2.65, scene_radius * 0.34) * text_glow_scale
+            wide_blur = max(scene_blur * 4.10, scene_radius * 0.58) * max(0.38, min(1.40, scene_x_scale))
+            shadows.extend([
+                f"0 0 {vw(max(4.0, scene_blur * 0.34))} rgba(255, 255, 248, {min(1.0, scene_alpha * 0.78):.3f})",
+                f"0 0 {vw(scene_blur * 0.80)} rgba(255, 246, 205, {min(1.0, scene_alpha * 0.70):.3f})",
+                f"0 0 {vw(scene_blur * 1.35)} rgba({lr}, {lg}, {lb}, {scene_alpha:.3f})",
+                f"0 0 {vw(aura_blur)} rgba({lr}, {lg}, {lb}, {scene_alpha * 0.58:.3f})",
+                f"0 0 {vw(wide_blur)} rgba({lr}, {lg}, {lb}, {scene_alpha * 0.34:.3f})",
+            ])
+            scene_light_filter_parts = [
+                f"brightness({1.0 + scene_strength * 0.16:.3f})",
+                f"drop-shadow(0 0 {vw(max(5.0, scene_blur * 0.58))} rgba(255, 255, 248, {min(1.0, scene_alpha * 0.72):.3f}))",
+                f"drop-shadow(0 0 {vw(max(scene_blur * 1.35, scene_radius * 0.16))} rgba({lr}, {lg}, {lb}, {scene_alpha * 0.72:.3f}))",
+                f"drop-shadow(0 0 {vw(max(scene_blur * 2.45, scene_radius * 0.30))} rgba({lr}, {lg}, {lb}, {scene_alpha * 0.42:.3f}))",
+            ]
 
         text_shadow_css = f"text-shadow: {', '.join(shadows)};" if shadows else "text-shadow: none;"
 
@@ -2264,7 +2646,6 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         layout_font_scale = 1.0
         per_word_translate = 0.0
         word_margin_right = ws_vw
-        layout_row_i, layout_pos_i, layout_row_len = layout_row_lookup.get(idx, (0, 0, 0))
         if layout_mode in ("contrast", "triple"):
             if idx in emphasis_idx:
                 layout_font_scale = emphasis_scale / 100.0
@@ -2444,6 +2825,13 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
             if anim_type == "pop":
                 current_scale = min(current_scale, 1.025)
 
+        if scene_light_filter_parts:
+            scene_filter_css = " ".join(scene_light_filter_parts)
+            if current_filter_css == "filter: none;":
+                current_filter_css = f"filter: {scene_filter_css};"
+            else:
+                current_filter_css = current_filter_css.rstrip(";") + f" {scene_filter_css};"
+
         skewable_highlight = hl_style in ("box", "outline", "glow", "capsule", "canva_frame")
         hl_skew_transform = f" skewX({hl_bg_skew:.3f}deg)" if is_current and skewable_highlight and abs(hl_bg_skew) > 0.01 else ""
         word_base = (
@@ -2544,7 +2932,7 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
             extrude.append(f"{vw(base_x * steps * depth_scale * 1.10)} {vw(base_y * steps * depth_scale * 1.15)} {vw(max(2.0, text_3d_depth * 0.18))} rgba(0, 0, 0, 0.42)")
             back_layer_shadows = extrude + back_layer_shadows
         layered_text = bool(back_layer_shadows)
-        front_text_shadow_css = "text-shadow: none;" if layered_text else text_shadow_css
+        front_text_shadow_css = text_shadow_css if scene_light_text_on else ("text-shadow: none;" if layered_text else text_shadow_css)
         back_text_shadow_css = f"text-shadow: {', '.join(back_layer_shadows)};" if back_layer_shadows else "text-shadow: none;"
 
         word_css_fg = f"display: inline-block; color: {fill_color}; opacity: {current_opacity:.3f}; {front_text_shadow_css} {stroke_css} {texture_css} {word_base}"
@@ -2619,7 +3007,7 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
             if next_is_visible and "\n" not in next_raw and not _layout_breaks_before(idx + 1):
                 spacer = "<span style='display:inline-block; width:0.14em;'></span>" if layout_mode in ("contrast", "triple", "reel_stack", "random_focus", "side_steps", "axis_stack", "quote_stack", "prayer_reflow", "narrative_block") else " "
                 html_words_fg.append(spacer)
-                if bg_mode in ("tape", "canva_fit", "block", "sweep"):
+                if bg_mode in ("tape", "canva_fit", "canva_joined", "block", "sweep"):
                     html_words_bg.append(spacer if layout_mode in ("contrast", "triple", "reel_stack", "random_focus", "side_steps", "axis_stack", "quote_stack", "prayer_reflow", "narrative_block") else " ")
 
     inner_html_fg = "".join(html_words_fg)
@@ -2725,15 +3113,15 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
     align_item = j_map.get(align, "center")
     if stable_left_box_mode:
         width_value = f"{(box_width if box_width > 0 else 74.0):.4f}vw"
-        width_css = f"width: {width_value}; max-width: 92vw;"
+        width_css = f"width: {width_value}; max-width: 120vw;"
     elif box_width > 0:
         width_value = f"{box_width:.4f}vw"
         if box_layout == "fixed":
-            width_css = f"width: {width_value}; max-width: 92vw;"
+            width_css = f"width: {width_value}; max-width: 120vw;"
         else:
             width_css = f"max-width: {width_value}; width: fit-content;"
     else:
-        width_css = "width: max-content; max-width: 92vw;"
+        width_css = "width: max-content; max-width: 120vw;"
 
     mask_css = ""
     if mask_en:
@@ -2796,6 +3184,79 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         <div class='sub-box canva-fit-bg' style='{outer_box_style}'>
             <div style="{inner_transform} width: 100%; max-width: 100%; display: block; text-align: {align};">
                 {fit_html}
+            </div>
+        </div>
+        """
+    elif bg_mode == "canva_joined":
+        joined_fg_lines = _split_html_lines(inner_html_fg)
+        joined_bg_lines = _split_html_lines(inner_html_bg)
+        joined_lh = max(0.82, float(lh))
+        joined_justify = {"center": "center", "left": "flex-start", "right": "flex-end", "justify": "center"}.get(align, "center")
+        joined_radius_vw = bg_vw(max(8.0, float(rad)))
+        joined_pad_top = bg_vw(max(1.0, float(pad_top) * 0.38))
+        joined_pad_bottom = bg_vw(max(float(pad_bottom) * 1.22, float(pad_top) * 0.76 + float(size) * 0.145))
+        joined_pad_left = bg_vw(max(float(pad_left), float(pad) * 0.70))
+        joined_pad_right = bg_vw(max(float(pad_right), float(pad) * 0.70))
+        joined_text_raise = -max(1.2, min(16.0, float(size) * 0.038 + float(pad_top) * 0.09))
+        joined_bg_down = max(1.2, min(22.0, float(size) * 0.055 + float(pad_bottom) * 0.16))
+        joined_next_up = max(0.0, min(34.0, float(size) * 0.132 + float(pad_top) * 0.30 + float(pad_bottom) * 0.23))
+        joined_line_gap = bg_vw(max(0.0, (float(lh) - 1.0) * float(size) * 0.16))
+        joined_outline_a = max(0.0, min(1.0, hl_bg_a))
+        joined_outline_vw = bg_vw(max(1.5, min(8.0, float(hl_pad or 6) * 0.42)))
+        joined_shadow_css = f"box-shadow: 0 {vw(2)} {vw(8)} rgba(0, 0, 0, 0.22);"
+        if hl_style == "canva_frame":
+            joined_shadow_css = f"box-shadow: 0 0 0 {joined_outline_vw} rgba({hl_r}, {hl_g}, {hl_b}, {joined_outline_a:.3f}), 0 {vw(2)} {vw(8)} rgba(0, 0, 0, 0.22);"
+
+        joined_bg_rows = []
+        joined_fg_rows = []
+        for line_i, line_html in enumerate(joined_fg_lines):
+            bg_html = joined_bg_lines[line_i] if line_i < len(joined_bg_lines) else ""
+            row_css = f"display:flex; justify-content:{joined_justify}; width:100%; max-width:100%; margin:{joined_line_gap} 0; line-height:{joined_lh};"
+            line_join_scale = 0.0 if line_i <= 0 else min(1.72, 1.0 + line_i * 0.24)
+            bg_shift = joined_bg_down - joined_next_up * line_join_scale
+            bg_line_css = base_wrapper_css + f"""
+                display: inline-block;
+                background-color: rgb({r}, {g}, {b});
+                border-radius: {joined_radius_vw};
+                padding: {joined_pad_top} {joined_pad_right} {joined_pad_bottom} {joined_pad_left};
+                {joined_shadow_css}
+                line-height: {joined_lh};
+                white-space: normal;
+                overflow-wrap: normal;
+                word-break: normal;
+                color: transparent;
+                -webkit-text-fill-color: transparent;
+                text-shadow: none;
+                -webkit-text-stroke: transparent;
+                background-clip: padding-box;
+                box-sizing: border-box;
+                transform: translateY({bg_vw(bg_shift)});
+                will-change: transform;
+            """
+            fg_line_css = base_wrapper_css + f"""
+                display: inline-block;
+                position: relative;
+                z-index: 2;
+                line-height: {joined_lh};
+                white-space: normal;
+                overflow-wrap: normal;
+                word-break: normal;
+                transform: translateY({bg_vw(joined_text_raise)});
+                will-change: transform;
+            """
+            if bg_html:
+                joined_bg_rows.append(f"<div class='canva-joined-bg-row' style=\"{row_css}\"><span style=\"{bg_line_css}\">{bg_html}</span></div>")
+            joined_fg_rows.append(f"<div class='canva-joined-fg-row' style=\"{row_css}\"><span style=\"{fg_line_css}\">{line_html}</span></div>")
+
+        final_html = f"""
+        <div class='sub-box canva-joined-bg' style='{outer_box_style}'>
+            <div style="{inner_transform} width: 100%; max-width: 100%; display: block; text-align: {align}; position: relative; isolation: isolate; overflow: visible;">
+                <div class='canva-joined-bg-stack' aria-hidden='true' style="position:absolute; inset:0; z-index:1; opacity:{bg_a:.3f}; pointer-events:none; isolation:isolate; overflow:visible;">
+                    {''.join(joined_bg_rows)}
+                </div>
+                <div class='canva-joined-fg-stack' style="position:relative; z-index:2; width:100%; display:block; text-align:{align}; overflow:visible;">
+                    {''.join(joined_fg_rows)}
+                </div>
             </div>
         </div>
         """
