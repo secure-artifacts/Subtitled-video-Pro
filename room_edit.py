@@ -3982,37 +3982,53 @@ class EditView(QWidget):
 
         timeline_segments = []
         remaining = max(0.05, target_duration)
-        cursor_idx = 0
-        # Auto assembly should look like real material splicing: play a slice,
-        # move to the next source, then loop the pool until the target is full.
         max_slice = 5.5
         min_tail = 0.12
-        guard = 0
-        while remaining > min_tail and guard < 2000:
-            guard += 1
-            item = valid[cursor_idx % len(valid)]
-            clip_len = min(max_slice, remaining)
+
+        def add_segment(item, clip_len, allow_source_loop=False):
             if clip_len <= min_tail:
-                break
+                return False
+            source_out = item["dur"] if allow_source_loop else min(item["dur"], clip_len)
             timeline_segments.append({
                 "path": item["path"],
                 "timeline_duration": max(0.05, clip_len),
                 "source_duration": item["dur"],
                 "source_in": 0.0,
-                "source_out": item["dur"],
+                "source_out": source_out,
                 "speed": 1.0,
                 "duration_info": item.get("duration_info", {}),
                 "width": item.get("width", 0),
                 "height": item.get("height", 0),
             })
-            remaining -= clip_len
-            cursor_idx += 1
+            return True
+
+        # First pass never repeats sources. Only loop the pool after every selected
+        # material has already contributed its natural slice.
+        for item in valid:
+            if remaining <= min_tail:
+                break
+            clip_len = min(item["dur"], max_slice, remaining)
+            if add_segment(item, clip_len, allow_source_loop=False):
+                remaining -= clip_len
+
+        cursor_idx = 0
+        guard = 0
+        while remaining > min_tail and guard < 2000:
+            guard += 1
+            item = valid[cursor_idx % len(valid)]
+            clip_len = min(max_slice, remaining)
+            if add_segment(item, clip_len, allow_source_loop=True):
+                remaining -= clip_len
+                cursor_idx += 1
+            else:
+                break
         if remaining > 0.001 and timeline_segments:
             timeline_segments[-1]["timeline_duration"] += remaining
-            timeline_segments[-1]["source_out"] = min(
-                timeline_segments[-1]["source_duration"],
-                timeline_segments[-1]["source_in"] + timeline_segments[-1]["timeline_duration"],
-            )
+            if timeline_segments[-1]["timeline_duration"] <= timeline_segments[-1]["source_duration"]:
+                timeline_segments[-1]["source_out"] = min(
+                    timeline_segments[-1]["source_duration"],
+                    timeline_segments[-1]["source_in"] + timeline_segments[-1]["timeline_duration"],
+                )
         return timeline_segments
 
     def assemble_media_paths_to_audio_duration(self, paths, start_t=None, replace_existing=False, assembly_mode="audio_matched"):

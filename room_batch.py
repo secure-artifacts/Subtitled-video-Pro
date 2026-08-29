@@ -2181,15 +2181,16 @@ class BatchView(QWidget):
             target = float(fallback_target or 0.0)
         if target <= 0:
             return min(3, len(paths))
-        min_count = 1
-        max_count = min(len(paths), 12)
-        ideal_by_time = int(round(target / 5.5))
-        if target <= 10:
-            ideal_by_time = min(2, ideal_by_time or 1)
-        elif target <= 18:
-            ideal_by_time = max(2, ideal_by_time)
-        count = max(min_count, min(max_count, ideal_by_time))
-        return max(1, count)
+        max_slice = 5.5
+        capacity = 0.0
+        count = 0
+        for path in paths:
+            video_dur, _ = self._media_source_duration(path)
+            capacity += max(0.1, min(max_slice, float(video_dur or max_slice)))
+            count += 1
+            if capacity >= max(0.1, target - 0.12):
+                return max(1, count)
+        return max(1, len(paths))
 
     def _batch_assembly_summary(self, paths, count):
         paths = self._normalize_batch_assembly_paths(paths)
@@ -2200,7 +2201,7 @@ class BatchView(QWidget):
         priority = self._batch_assembly_priority_mode()
         priority_label = "" if priority == "none" else f"，{self._assembly_priority_label(priority)}"
         if mode == "smart":
-            return f"{len(paths)} 个素材{priority_label}，智能按音频时长自动决定数量"
+            return f"{len(paths)} 个素材{priority_label}，智能按音频时长尽量不重复，用完才循环"
         try:
             combo_count = math.comb(len(paths), count) if len(paths) >= count else 1
         except Exception:
@@ -2795,11 +2796,14 @@ class BatchView(QWidget):
             return ordered
         return ordered[:1]
 
-    def _select_one_smart_queue_clip(self, group, used_clips, rng, priority_mode="none"):
+    def _select_one_smart_queue_clip(self, group, used_clips, rng, priority_mode="none", excluded_paths=None):
         paths = self._normalize_batch_assembly_paths(group.get("paths", []))
         resolved_priority = self._resolved_assembly_priority_mode(paths, priority_mode)
         if resolved_priority != "none":
             paths = self._prioritized_assembly_paths(paths, resolved_priority)
+        excluded_paths = set(excluded_paths or [])
+        if excluded_paths:
+            paths = [path for path in paths if path not in excluded_paths]
         if not paths:
             return ""
         key = group.get("name", "__group__")
@@ -2819,7 +2823,10 @@ class BatchView(QWidget):
         if len(groups) == 1:
             combo_used = used_clips.setdefault(f"combo::{groups[0].get('name', '__group__')}", set())
             return self._select_assembly_combo(groups[0].get("paths", []), count, combo_used, rng, priority_mode)
-        total_paths = sum(len(self._normalize_batch_assembly_paths(group.get("paths", []))) for group in groups)
+        unique_paths = self._normalize_batch_assembly_paths(
+            [path for group in groups for path in self._normalize_batch_assembly_paths(group.get("paths", []))]
+        )
+        total_paths = len(unique_paths)
         if total_paths <= 0:
             return []
         resolved = cut_mode if cut_mode in {"parallel", "cross", "sequence"} else ("cross" if len(groups) >= 3 else "parallel")
@@ -2839,9 +2846,20 @@ class BatchView(QWidget):
             count = max(count, min(3, len(groups), total_paths))
             slots = [groups[i % len(groups)] for i in range(count)]
         clips = []
+        local_used = set()
         for group in slots:
-            clip = self._select_one_smart_queue_clip(group, used_clips, rng, priority_mode)
+            clip = self._select_one_smart_queue_clip(group, used_clips, rng, priority_mode, excluded_paths=local_used)
+            if not clip:
+                for alt_group in groups:
+                    if alt_group is group:
+                        continue
+                    clip = self._select_one_smart_queue_clip(alt_group, used_clips, rng, priority_mode, excluded_paths=local_used)
+                    if clip:
+                        break
+            if not clip and len(local_used) >= total_paths:
+                clip = self._select_one_smart_queue_clip(group, used_clips, rng, priority_mode)
             if clip:
+                local_used.add(clip)
                 clips.append(clip)
         return clips
 
@@ -5391,23 +5409,20 @@ class BatchView(QWidget):
         clips = []
         cursor = 0.0
         remaining = target
-        cursor_idx = 0
         max_slice = 5.5
         min_tail = 0.12
-        guard = 0
-        while remaining > min_tail and guard < 5000:
-            guard += 1
-            item = media[cursor_idx % len(media)]
-            clip_len = min(max_slice, remaining)
+
+        def add_clip(item, clip_len, allow_source_loop=False):
+            nonlocal cursor
             if clip_len <= min_tail:
-                break
+                return False
             clips.append({
                 "path": item["path"],
                 "start": cursor,
                 "end": cursor + clip_len,
                 "dur": item["stream_dur"],
                 "source_in": 0.0,
-                "source_out": item["video_dur"],
+                "source_out": item["video_dur"] if allow_source_loop else min(item["video_dur"], clip_len),
                 "speed": 1.0,
                 "scale": 100,
                 "volume": 100,
@@ -5415,14 +5430,33 @@ class BatchView(QWidget):
                 "assembly_mode": "batch_random",
             })
             cursor += clip_len
-            remaining -= clip_len
-            cursor_idx += 1
+            return True
+
+        for item in media:
+            if remaining <= min_tail:
+                break
+            clip_len = min(item["video_dur"], max_slice, remaining)
+            if add_clip(item, clip_len, allow_source_loop=False):
+                remaining -= clip_len
+
+        cursor_idx = 0
+        guard = 0
+        while remaining > min_tail and guard < 5000:
+            guard += 1
+            item = media[cursor_idx % len(media)]
+            clip_len = min(max_slice, remaining)
+            if add_clip(item, clip_len, allow_source_loop=True):
+                remaining -= clip_len
+                cursor_idx += 1
+            else:
+                break
         if remaining > 0.001 and clips:
             clips[-1]["end"] += remaining
-            clips[-1]["source_out"] = min(
-                float(clips[-1].get("dur", clips[-1]["source_out"]) or clips[-1]["source_out"]),
-                float(clips[-1].get("source_in", 0.0) or 0.0) + (clips[-1]["end"] - clips[-1]["start"]),
-            )
+            if clips[-1]["end"] - clips[-1]["start"] <= float(clips[-1].get("dur", clips[-1]["source_out"]) or clips[-1]["source_out"]):
+                clips[-1]["source_out"] = min(
+                    float(clips[-1].get("dur", clips[-1]["source_out"]) or clips[-1]["source_out"]),
+                    float(clips[-1].get("source_in", 0.0) or 0.0) + (clips[-1]["end"] - clips[-1]["start"]),
+                )
         return clips, source_total
 
     def _quad_grid_preview_output_path(self, paths, project_path, duration, resolution_text=""):
