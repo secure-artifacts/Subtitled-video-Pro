@@ -9454,6 +9454,7 @@ body {{
         valid_indices = [idx for idx in indices if 0 <= idx < len(clips)]
         if not valid_indices or not file_path or not os.path.exists(file_path):
             return False
+        old_paths = {os.path.abspath(clips[idx].get("path", "") or "") for idx in valid_indices}
         new_path, dur, duration_info, video_w, video_h = self._load_video_replacement_metadata(file_path)
         changed_clips = []
         for idx in valid_indices:
@@ -9477,6 +9478,24 @@ body {{
             changed_clips.append(clip)
         self.state["video_clips"] = sorted(clips, key=lambda c: float(c.get("start", 0.0) or 0.0))
         self.current_v_idx = self.state["video_clips"].index(changed_clips[0]) if changed_clips[0] in self.state["video_clips"] else valid_indices[0]
+        if old_paths and hasattr(self, "assembly_media_paths"):
+            self.assembly_media_paths = [
+                new_path if os.path.abspath(path or "") in old_paths else path
+                for path in (getattr(self, "assembly_media_paths", []) or [])
+            ]
+            self.refresh_assembly_media_list()
+        quad_config = self.state.get("quad_grid") if isinstance(self.state, dict) else None
+        if old_paths and isinstance(quad_config, dict) and isinstance(quad_config.get("paths"), list):
+            quad_config["paths"] = [
+                new_path if os.path.abspath(path or "") in old_paths else path
+                for path in quad_config.get("paths", [])
+            ]
+            if hasattr(self, "quad_grid_media_paths"):
+                self.quad_grid_media_paths = list(quad_config.get("paths", []))
+            if hasattr(self, "refresh_quad_grid_media_list"):
+                self.refresh_quad_grid_media_list()
+            if hasattr(self, "refresh_quad_grid_summary"):
+                self.refresh_quad_grid_summary()
         self.current_selected_idx = -1
         self.selected_track = "video"
         self.last_video_image = None
