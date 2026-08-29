@@ -1878,10 +1878,12 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
     voice_reveal_fade = max(0.0, min(0.60, _safe_float(style.get("voice_reveal_fade", 0.06), 0.06)))
     if voice_reveal_active:
         inactive_alpha = 0.0
-    full_roll_window_height = max(8.0, min(100.0, _safe_float(style.get("full_roll_window_height", 42), 42)))
-    full_roll_start_y = max(-120.0, min(120.0, _safe_float(style.get("full_roll_start_y", 28), 28)))
-    full_roll_end_y = max(-120.0, min(120.0, _safe_float(style.get("full_roll_end_y", -18), -18)))
-    full_roll_feather = max(0.0, min(45.0, _safe_float(style.get("full_roll_feather", 10), 10)))
+    full_roll_window_mode = str(style.get("full_roll_window_mode", "lines") or "lines").strip().lower()
+    full_roll_visible_lines = max(1.0, min(8.0, _safe_float(style.get("full_roll_visible_lines", 3), 3)))
+    full_roll_window_height = max(4.0, min(100.0, _safe_float(style.get("full_roll_window_height", 28), 28)))
+    full_roll_start_y = max(-120.0, min(120.0, _safe_float(style.get("full_roll_start_y", 18), 18)))
+    full_roll_end_y = max(-120.0, min(120.0, _safe_float(style.get("full_roll_end_y", -16), -16)))
+    full_roll_feather = max(0.0, min(45.0, _safe_float(style.get("full_roll_feather", 8), 8)))
     full_roll_lock_to_words = bool(style.get("full_roll_lock_to_words", True))
 
     box_width = float(style.get("box_width", 0))
@@ -1900,6 +1902,11 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         return vw(float(val) * bg_resolution_scale)
 
     size_vw = vw(size)
+    font_vh = max(0.1, float(size or 100) * 100.0 / max(1.0, canvas_h))
+    line_vh = font_vh * max(0.8, float(lh or 1.1)) * max(0.65, float(style.get("layout_row_gap", 100) or 100) / 100.0)
+    if full_roll_window_mode in ("lines", "line", "visible_lines", "auto"):
+        fit_padding_vh = max(0.6, min(4.0, (pad_top + pad_bottom + max(pad, 0) * 0.5) * 100.0 / max(1.0, canvas_h)))
+        full_roll_window_height = max(4.0, min(80.0, line_vh * full_roll_visible_lines + fit_padding_vh))
     rad_vw = bg_vw(rad)
     pad_y = bg_vw(pad / 2.5)
     pad_x = bg_vw(pad)

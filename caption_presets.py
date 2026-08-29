@@ -5,6 +5,7 @@ import re
 REFERENCE_NARRATIVE_BLOCK_PRESET = "参考视频 · 左下累积叙事块"
 COMPACT_NARRATIVE_BLOCK_PRESET = "参考视频 · 0516紧凑累积叙事块"
 GOLD_METALLIC_TEXT_PRESET = "\u91d1\u8272\u8d28\u611f\u5b57 \u00b7 \u9ed1\u5e95\u7977\u544a"
+FULL_TEXT_ROLL_PRESET = "全文滚动小窗 · 打轴"
 REFERENCE_NARRATIVE_CHUNK_MODE = "累积叙事块 (14-18词清屏)"
 COMPACT_NARRATIVE_CHUNK_MODE = "0516累积叙事块 (8-12词清屏)"
 FULL_TEXT_CHUNK_MODE = "\u5168\u90e8\u6253\u8f74 (\u6574\u7bc7\u6587\u5b57)"
@@ -208,6 +209,61 @@ def gold_metal_text_preset():
     return style
 
 
+
+def full_text_roll_style():
+    style = gold_metal_text_style()
+    style.update({
+        "size": 62,
+        "font": "TikTok Sans",
+        "color_txt": "#FFFFFF",
+        "color_hl": "#FFE600",
+        "bg_mode": "bottom_band",
+        "bg_color": "#000000",
+        "bg_alpha": 64,
+        "stroke_width": 3,
+        "stroke_color": "#000000",
+        "stroke_softness": 14,
+        "shadow_x": 0,
+        "shadow_y": 4,
+        "shadow_blur": 10,
+        "shadow_alpha": 68,
+        "line_height": 1.02,
+        "layout_row_gap": 96,
+        "text_align": "center",
+        "text_transform": "none",
+        "letter_spacing": 0,
+        "word_spacing": 0,
+        "layout_mode": "standard",
+        "layout_variant": "auto",
+        "box_layout": "fixed",
+        "box_width": 92.0,
+        "box_height": 0.0,
+        "max_lines": 6,
+        "anim_type": "full_text_roll",
+        "font_motion": "none",
+        "text_reveal_mode": "all",
+        "full_roll_window_mode": "lines",
+        "full_roll_visible_lines": 3,
+        "full_roll_window_height": 28,
+        "full_roll_start_y": 18,
+        "full_roll_end_y": -16,
+        "full_roll_feather": 8,
+        "full_roll_lock_to_words": True,
+        "global_glow_enable": False,
+        "scene_light_enable": False,
+        "text_texture": "none",
+        "text_3d_enable": False,
+        "caption_build_mode": "full_text",
+    })
+    return style
+
+
+def full_text_roll_preset():
+    style = full_text_roll_style()
+    style["__position__"] = {"pos_x": 0.0, "pos_y": 34.0}
+    return style
+
+
 def legacy_narrative_block_style():
     return compact_narrative_block_style()
 
@@ -221,6 +277,7 @@ def built_in_style_presets():
         REFERENCE_NARRATIVE_BLOCK_PRESET: reference_narrative_block_preset(),
         COMPACT_NARRATIVE_BLOCK_PRESET: compact_narrative_block_preset(),
         GOLD_METALLIC_TEXT_PRESET: gold_metal_text_preset(),
+        FULL_TEXT_ROLL_PRESET: full_text_roll_preset(),
     }
 
 
