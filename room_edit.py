@@ -112,10 +112,14 @@ from preview_proxy import (
     PROXY_STATUS_PENDING,
     PROXY_STATUS_READY,
     build_preview_proxy_command,
+    build_timeline_preview_proxy_command,
     clip_should_auto_proxy,
     prepare_clip_for_preview_proxy,
     preview_proxy_is_ready,
     preview_source_for_clip,
+    timeline_preview_dimensions,
+    timeline_preview_proxy_is_ready,
+    timeline_preview_proxy_path_for_clips,
 )
 from font_registry import (
     STATUS_NONCOMMERCIAL,
@@ -636,6 +640,13 @@ class EditView(QWidget):
         self.project_autosave_timer.timeout.connect(self.flush_project_autosave)
         self.project_autosave_busy = False
         self._preview_proxy_jobs = set()
+        self._timeline_preview_proxy_jobs = set()
+        self._timeline_preview_proxy_path = ""
+        self._timeline_preview_proxy_fingerprint = {}
+        self._timeline_preview_proxy_status = ""
+        self._timeline_preview_proxy_error = ""
+        self._timeline_preview_proxy_source_signature = ""
+        self._last_timeline_preview_proxy_check_at = 0.0
         self.preview_proxy_auto_generate = True
         self.preview_proxy_resolution = get_preview_proxy_resolution()
         self.preview_effect_quality = get_preview_effect_quality()
@@ -4077,6 +4088,7 @@ class EditView(QWidget):
         if hasattr(self, "btn_v"):
             self.btn_v.setText("✅ 已组接素材")
         self._prepare_preview_proxies_for_clips(new_clips, announce=True)
+        self._queue_timeline_preview_proxy(announce=True)
         self._prime_video_preview_source(new_clips[0], announce=True)
         self.on_resolution_changed(self.state.get("resolution", get_output_resolution()))
         self.generate_waveform(new_clips[0]["path"], "v_wave_pixmap", max_seconds=90)
@@ -6769,7 +6781,7 @@ body {{
     def _queue_static_preview_frame(self, time_sec=None):
         if getattr(self, "is_playing", False):
             return False
-        idx, clip = self._video_clip_for_time(float(time_sec if time_sec is not None else self.current_play_time or 0.0))
+        idx, clip = self._preview_video_clip_for_time(float(time_sec if time_sec is not None else self.current_play_time or 0.0))
         if not clip:
             return False
         source_path = self._preview_media_path_for_clip(clip) or clip.get("path", "")
@@ -9148,6 +9160,7 @@ body {{
         was_playing = bool(getattr(self, "is_playing", False))
         for clip in clips:
             self._queue_preview_proxy_for_clip(clip, announce=False)
+        self._queue_timeline_preview_proxy(announce=True)
         if active_clip:
             if was_playing and not preview_proxy_is_ready(active_clip):
                 # Keep the current player source alive while the newly selected proxy is being generated.
@@ -9209,7 +9222,7 @@ body {{
 
     def _should_defer_original_preview(self, clip):
         assembly_mode = str((clip or {}).get("assembly_mode", "")) if isinstance(clip, dict) else ""
-        if assembly_mode in {"audio_matched", "batch_random", "random_fill", "quad_grid_preview"}:
+        if assembly_mode in {"audio_matched", "batch_random", "random_fill", "quad_grid_preview", "timeline_preview_proxy"}:
             return False
         if not self._clip_needs_preview_proxy(clip):
             return False
@@ -9259,6 +9272,217 @@ body {{
     def _prepare_preview_proxies_for_clips(self, clips, announce=False):
         for idx, clip in enumerate(clips or []):
             self._queue_preview_proxy_for_clip(clip, announce=announce and idx == 0)
+        self._queue_timeline_preview_proxy(announce=announce)
+
+    def _timeline_preview_source_clips(self):
+        clips = []
+        for clip in self.state.get("video_clips", []) or []:
+            if not isinstance(clip, dict):
+                continue
+            path = clip.get("path", "")
+            if path and os.path.exists(path):
+                clips.append(clip)
+        clips.sort(key=lambda item: float(item.get("start", 0.0) or 0.0))
+        return clips
+
+    def _timeline_preview_source_signature(self, clips=None):
+        source_clips = clips if clips is not None else self._timeline_preview_source_clips()
+        settings = self._preview_proxy_settings()
+        pieces = {
+            "project": [int(float(self.proj_width or 1080)), int(float(self.proj_height or 1920))],
+            "proxy": [settings.get("height"), settings.get("fps"), settings.get("crf")],
+            "duration": round(float(self._preview_playback_duration() or 0.0), 3),
+            "clips": [],
+        }
+        for clip in source_clips or []:
+            if not isinstance(clip, dict):
+                continue
+            pieces["clips"].append([
+                os.path.abspath(clip.get("path", "") or ""),
+                round(float(clip.get("start", 0.0) or 0.0), 3),
+                round(float(clip.get("end", 0.0) or 0.0), 3),
+                round(float(clip.get("source_in", 0.0) or 0.0), 3),
+                round(float(clip.get("source_out", clip.get("dur", 0.0)) or 0.0), 3),
+                round(float(clip.get("dur", 0.0) or 0.0), 3),
+                round(float(clip.get("speed", 1.0) or 1.0), 4),
+            ])
+        if not pieces["clips"]:
+            return ""
+        payload = json.dumps(pieces, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha1(payload.encode("utf-8", "ignore")).hexdigest()
+
+    def _current_timeline_preview_proxy_path(self, clips=None):
+        if not getattr(self, "preview_proxy_auto_generate", False):
+            return "", {}
+        source_clips = clips if clips is not None else self._timeline_preview_source_clips()
+        if len(source_clips) < 2:
+            return "", {}
+        settings = self._preview_proxy_settings()
+        return timeline_preview_proxy_path_for_clips(
+            source_clips,
+            self.proj_width,
+            self.proj_height,
+            proxy_height=settings.get("height"),
+            proxy_fps=settings.get("fps"),
+            proxy_crf=settings.get("crf"),
+            target_duration=self._preview_playback_duration(),
+        )
+
+    def _timeline_preview_proxy_ready_clip(self):
+        proxy_path = getattr(self, "_timeline_preview_proxy_path", "")
+        fingerprint = getattr(self, "_timeline_preview_proxy_fingerprint", {})
+        if getattr(self, "_timeline_preview_proxy_status", "") != PROXY_STATUS_READY:
+            return None
+        if not timeline_preview_proxy_is_ready(proxy_path, fingerprint):
+            return None
+        settings = self._preview_proxy_settings()
+        width, height = timeline_preview_dimensions(
+            self.proj_width,
+            self.proj_height,
+            proxy_height=settings.get("height"),
+            proxy_fps=settings.get("fps"),
+            proxy_crf=settings.get("crf"),
+        )
+        duration = max(0.05, float((fingerprint or {}).get("target_duration", self._preview_playback_duration()) or self._preview_playback_duration()))
+        return {
+            "path": proxy_path,
+            "start": 0.0,
+            "end": duration,
+            "dur": duration,
+            "width": width,
+            "height": height,
+            "source_in": 0.0,
+            "source_out": duration,
+            "speed": 1.0,
+            "scale": 100,
+            "volume": 0,
+            "assembly_mode": "timeline_preview_proxy",
+            "timeline_preview_proxy": True,
+        }
+
+    def _preview_video_clip_for_time(self, time_sec):
+        idx, _active_clip = self._video_clip_for_time(float(time_sec or 0.0))
+        proxy_clip = self._timeline_preview_proxy_ready_clip()
+        if proxy_clip:
+            return idx, proxy_clip
+        return self._video_clip_for_time(float(time_sec or 0.0))
+
+    def _queue_timeline_preview_proxy(self, announce=False):
+        if not getattr(self, "preview_proxy_auto_generate", False):
+            return False
+        clips = self._timeline_preview_source_clips()
+        if len(clips) < 2:
+            self._timeline_preview_proxy_status = ""
+            self._timeline_preview_proxy_source_signature = ""
+            return False
+        source_signature = self._timeline_preview_source_signature(clips)
+        cached_signature = getattr(self, "_timeline_preview_proxy_source_signature", "")
+        status = getattr(self, "_timeline_preview_proxy_status", "")
+        if source_signature and source_signature == cached_signature:
+            if status == PROXY_STATUS_READY and timeline_preview_proxy_is_ready(self._timeline_preview_proxy_path, self._timeline_preview_proxy_fingerprint):
+                return False
+            if status == PROXY_STATUS_GENERATING:
+                return False
+        elif status == PROXY_STATUS_READY:
+            self._timeline_preview_proxy_status = PROXY_STATUS_PENDING
+        now = time.monotonic()
+        if not announce and now - getattr(self, "_last_timeline_preview_proxy_check_at", 0.0) < 0.75:
+            return False
+        self._last_timeline_preview_proxy_check_at = now
+        proxy_path, fingerprint = self._current_timeline_preview_proxy_path(clips)
+        if not proxy_path or not fingerprint:
+            return False
+        if timeline_preview_proxy_is_ready(proxy_path, fingerprint):
+            self._timeline_preview_proxy_path = proxy_path
+            self._timeline_preview_proxy_fingerprint = fingerprint
+            self._timeline_preview_proxy_source_signature = source_signature
+            self._timeline_preview_proxy_status = PROXY_STATUS_READY
+            return False
+        job_key = os.path.abspath(proxy_path)
+        if job_key in self._timeline_preview_proxy_jobs:
+            self._timeline_preview_proxy_source_signature = source_signature
+            return False
+        self._timeline_preview_proxy_jobs.add(job_key)
+        self._timeline_preview_proxy_path = proxy_path
+        self._timeline_preview_proxy_fingerprint = fingerprint
+        self._timeline_preview_proxy_source_signature = source_signature
+        self._timeline_preview_proxy_status = PROXY_STATUS_GENERATING
+        self._timeline_preview_proxy_error = ""
+        if announce and hasattr(self, "status_lbl"):
+            self.status_lbl.setText("正在后台生成多素材流畅预览代理，生成后会自动切到连续预览。")
+        settings = self._preview_proxy_settings()
+        clips_snapshot = copy.deepcopy(clips)
+        threading.Thread(
+            target=self._generate_timeline_preview_proxy_task,
+            args=(clips_snapshot, proxy_path, fingerprint, settings, self.proj_width, self.proj_height, self._preview_playback_duration()),
+            daemon=True,
+        ).start()
+        return True
+
+    def _generate_timeline_preview_proxy_task(self, clips, proxy_path, fingerprint, proxy_settings, proj_w, proj_h, duration):
+        tmp_path = proxy_path + ".tmp.mp4"
+        try:
+            os.makedirs(os.path.dirname(proxy_path), exist_ok=True)
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            cmd = build_timeline_preview_proxy_command(
+                get_ffmpeg_cmd(),
+                clips,
+                tmp_path,
+                proj_w,
+                proj_h,
+                proxy_height=proxy_settings.get("height"),
+                proxy_fps=proxy_settings.get("fps"),
+                proxy_crf=proxy_settings.get("crf"),
+                target_duration=duration,
+            )
+            if not cmd:
+                raise RuntimeError("No valid timeline preview proxy inputs.")
+            flags = 0x08000000 if os.name == 'nt' else 0
+            timeout = max(45, int(float(duration or 0.0) * 4) + len(clips) * 3)
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="ignore", creationflags=flags, timeout=timeout)
+            if result.returncode != 0:
+                raise RuntimeError((result.stderr or "FFmpeg timeline proxy failed.").strip()[-600:])
+            if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) <= 1024:
+                raise RuntimeError("Timeline preview proxy file was not created.")
+            os.replace(tmp_path, proxy_path)
+            QTimer.singleShot(0, lambda pp=proxy_path, fp=fingerprint: self._finish_timeline_preview_proxy_job(pp, fp, True, ""))
+        except Exception as exc:
+            error = str(exc)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            QTimer.singleShot(0, lambda pp=proxy_path, fp=fingerprint, err=error: self._finish_timeline_preview_proxy_job(pp, fp, False, err))
+
+    def _finish_timeline_preview_proxy_job(self, proxy_path, fingerprint, success, error):
+        self._timeline_preview_proxy_jobs.discard(os.path.abspath(proxy_path))
+        current_clips = self._timeline_preview_source_clips()
+        current_signature = self._timeline_preview_source_signature(current_clips)
+        current_path, current_fingerprint = self._current_timeline_preview_proxy_path(current_clips)
+        if current_path != proxy_path or current_fingerprint != fingerprint:
+            return
+        if success:
+            self._timeline_preview_proxy_path = proxy_path
+            self._timeline_preview_proxy_fingerprint = fingerprint
+            self._timeline_preview_proxy_source_signature = current_signature
+            self._timeline_preview_proxy_status = PROXY_STATUS_READY
+            self._timeline_preview_proxy_error = ""
+            self.last_video_image = None
+            self._preview_scaled_pixmap_key = None
+            self._preview_scaled_pixmap = None
+            self._sync_video_playback_to_time(self.current_play_time, force_seek=True)
+            if hasattr(self, "status_lbl"):
+                self.status_lbl.setText("多素材流畅预览代理已生成：预览会用连续轻量片，导出仍用原素材。")
+        else:
+            self._timeline_preview_proxy_status = PROXY_STATUS_FAILED
+            self._timeline_preview_proxy_error = str(error or "")[:300]
+            if hasattr(self, "status_lbl"):
+                self.status_lbl.setText("多素材预览代理生成失败，已继续使用原素材预览。")
 
     def _queue_preview_proxy_for_clip(self, clip, announce=False):
         if not getattr(self, "preview_proxy_auto_generate", False):
@@ -9518,6 +9742,7 @@ body {{
         self._preview_scaled_pixmap_key = None
         self._preview_scaled_pixmap = None
         self._prepare_preview_proxies_for_clips(changed_clips, announce=False)
+        self._queue_timeline_preview_proxy(announce=True)
         self._prime_video_preview_source(self.state["video_clips"][self.current_v_idx], announce=False)
         self.on_resolution_changed(self.state.get("resolution", get_output_resolution()))
         self.generate_waveform(new_path, "v_wave_pixmap", max_seconds=90)
@@ -9946,10 +10171,12 @@ body {{
         return max(0.0, min(source_out, source_in + offset))
 
     def _sync_video_playback_to_time(self, time_sec, force_seek=False):
-        idx, clip = self._video_clip_for_time(float(time_sec or 0.0))
+        if len(self.state.get("video_clips", []) or []) > 1:
+            self._queue_timeline_preview_proxy(announce=False)
+        idx, clip = self._preview_video_clip_for_time(float(time_sec or 0.0))
         if not clip:
             return
-        if not self.is_playing:
+        if not self.is_playing and not clip.get("timeline_preview_proxy"):
             self._queue_preview_proxy_for_clip(clip)
         path = self._preview_media_path_for_clip(clip)
         if not path:
@@ -10778,6 +11005,7 @@ body {{
                 if clips:
                     self.btn_v.setText("✅ 已导原素材")
                     self._prepare_preview_proxies_for_clips(clips, announce=True)
+                    self._queue_timeline_preview_proxy(announce=True)
                     self._prime_video_preview_source(clips[0], announce=True)
                     self.on_resolution_changed(self.state.get("resolution", get_output_resolution()))
                     self.generate_waveform(clips[0]["path"], "v_wave_pixmap", max_seconds=90)
@@ -10837,6 +11065,7 @@ body {{
             if clips:
                 self.btn_v.setText("✅ 已导原素材")
                 self._prepare_preview_proxies_for_clips(clips, announce=True)
+                self._queue_timeline_preview_proxy(announce=True)
                 self._prime_video_preview_source(clips[0], announce=True)
                 self.on_resolution_changed(self.state.get("resolution", get_output_resolution()))
                 self.generate_waveform(clips[0]["path"], "v_wave_pixmap", max_seconds=90)
