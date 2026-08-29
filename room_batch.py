@@ -5391,21 +5391,23 @@ class BatchView(QWidget):
         clips = []
         cursor = 0.0
         remaining = target
-        for idx, item in enumerate(media):
-            if idx == len(media) - 1:
-                clip_len = max(0.1, remaining)
-            else:
-                weight = item["video_dur"] / source_total if source_total > 0 else 1.0 / len(media)
-                clip_len = max(0.1, target * weight)
-                clip_len = min(clip_len, max(0.1, remaining - 0.1 * (len(media) - idx - 1)))
-                remaining -= clip_len
+        cursor_idx = 0
+        max_slice = 5.5
+        min_tail = 0.12
+        guard = 0
+        while remaining > min_tail and guard < 5000:
+            guard += 1
+            item = media[cursor_idx % len(media)]
+            clip_len = min(item["video_dur"], max_slice, remaining)
+            if clip_len <= min_tail:
+                break
             clips.append({
                 "path": item["path"],
                 "start": cursor,
                 "end": cursor + clip_len,
                 "dur": item["stream_dur"],
                 "source_in": 0.0,
-                "source_out": item["video_dur"],
+                "source_out": min(item["video_dur"], clip_len),
                 "speed": 1.0,
                 "scale": 100,
                 "volume": 100,
@@ -5413,6 +5415,14 @@ class BatchView(QWidget):
                 "assembly_mode": "batch_random",
             })
             cursor += clip_len
+            remaining -= clip_len
+            cursor_idx += 1
+        if remaining > 0.001 and clips:
+            clips[-1]["end"] += remaining
+            clips[-1]["source_out"] = min(
+                float(clips[-1].get("dur", clips[-1]["source_out"]) or clips[-1]["source_out"]),
+                float(clips[-1].get("source_in", 0.0) or 0.0) + (clips[-1]["end"] - clips[-1]["start"]),
+            )
         return clips, source_total
 
     def _quad_grid_preview_output_path(self, paths, project_path, duration, resolution_text=""):

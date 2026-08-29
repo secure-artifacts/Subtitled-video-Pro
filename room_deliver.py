@@ -2039,7 +2039,7 @@ class DeliverView(QWidget):
                 quad_grid_plan.append({"path": path, "is_image": os.path.splitext(path)[1].lower() in image_exts})
             clips = []
             self.log_safe("🎞️ 四宫格导出: 4 路素材同步铺满 2x2 画面。", "#89b4fa")
-        use_filter_concat = (not quad_grid_plan) and len(clips or []) > 1 and any(str(clip.get("assembly_mode", "")) in {"batch_random", "audio_matched"} for clip in clips or [])
+        use_filter_concat = (not quad_grid_plan) and len(clips or []) > 1 and any(str(clip.get("assembly_mode", "")) in {"batch_random", "audio_matched", "random_fill"} for clip in clips or [])
         if clips and use_filter_concat:
             remaining_track_dur = video_track_target
             for clip in clips:
@@ -2054,7 +2054,7 @@ class DeliverView(QWidget):
                 overlap_end = min(c_end, render_end)
                 if overlap_end <= overlap_start:
                     continue
-                speed = 1.0 if str(clip.get("assembly_mode", "")) in {"batch_random", "audio_matched"} else clip_speed_value(clip)
+                speed = 1.0 if str(clip.get("assembly_mode", "")) in {"batch_random", "audio_matched", "random_fill"} else clip_speed_value(clip)
                 media_dur = get_video_stream_duration(clip_path) or float(clip.get("dur", 0.0) or 0.0) or get_exact_duration(clip_path) or 5.0
                 media_dur = max(0.1, media_dur)
                 source_in = max(0.0, float(clip.get("source_in", 0.0) or 0.0))

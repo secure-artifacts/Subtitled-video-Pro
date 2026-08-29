@@ -3891,9 +3891,9 @@ class EditView(QWidget):
         shuffled = list(paths)
         random.shuffle(shuffled)
         start_t = 0.0
-        if self.assemble_media_paths_to_audio_duration(shuffled, start_t=start_t, replace_existing=True, assembly_mode="random_fill"):
+        if self.assemble_media_paths_to_audio_duration(shuffled, start_t=start_t, replace_existing=True, assembly_mode="audio_matched"):
             if hasattr(self, "status_lbl"):
-                self.status_lbl.setText(f"已随机铺满 {len(shuffled)} 段画面素材。")
+                self.status_lbl.setText(f"已随机循环铺满素材池：{len(shuffled)} 个素材按配音/字幕时长连续组接。")
             self.focus_media_pool()
             return True
         return False
@@ -3964,25 +3964,37 @@ class EditView(QWidget):
 
         timeline_segments = []
         remaining = max(0.05, target_duration)
-        for idx, item in enumerate(valid):
-            if idx == len(valid) - 1:
-                clip_len = remaining
-            else:
-                weight = item["dur"] / source_total if source_total > 0 else 1.0 / len(valid)
-                clip_len = max(0.20, target_duration * weight)
-                clip_len = min(clip_len, max(0.20, remaining - 0.20 * (len(valid) - idx - 1)))
-                remaining -= clip_len
+        cursor_idx = 0
+        # Auto assembly should look like real material splicing: play a slice,
+        # move to the next source, then loop the pool until the target is full.
+        max_slice = 5.5
+        min_tail = 0.12
+        guard = 0
+        while remaining > min_tail and guard < 2000:
+            guard += 1
+            item = valid[cursor_idx % len(valid)]
+            clip_len = min(item["dur"], max_slice, remaining)
+            if clip_len <= min_tail:
+                break
             timeline_segments.append({
                 "path": item["path"],
                 "timeline_duration": max(0.05, clip_len),
                 "source_duration": item["dur"],
                 "source_in": 0.0,
-                "source_out": item["dur"],
+                "source_out": min(item["dur"], clip_len),
                 "speed": 1.0,
                 "duration_info": item.get("duration_info", {}),
                 "width": item.get("width", 0),
                 "height": item.get("height", 0),
             })
+            remaining -= clip_len
+            cursor_idx += 1
+        if remaining > 0.001 and timeline_segments:
+            timeline_segments[-1]["timeline_duration"] += remaining
+            timeline_segments[-1]["source_out"] = min(
+                timeline_segments[-1]["source_duration"],
+                timeline_segments[-1]["source_in"] + timeline_segments[-1]["timeline_duration"],
+            )
         return timeline_segments
 
     def assemble_media_paths_to_audio_duration(self, paths, start_t=None, replace_existing=False, assembly_mode="audio_matched"):
@@ -4048,7 +4060,7 @@ class EditView(QWidget):
         self.push_history()
         total = max(0.0, cursor - start)
         if hasattr(self, "status_lbl"):
-            self.status_lbl.setText(f"已组接 {len(new_clips)} 段素材，按{target_label}时长分配到 {total:.1f}s。")
+            self.status_lbl.setText(f"已循环组接 {len(new_clips)} 段素材，按{target_label}时长连续铺满 {total:.1f}s。")
         return True
 
     def dragEnterEvent(self, event):
