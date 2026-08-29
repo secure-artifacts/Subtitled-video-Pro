@@ -939,7 +939,9 @@ def subtitle_layout_capacity(style, proj_w=1080):
     if width_pct <= 0:
         width_pct = 74.0
     width_pct = max(28.0, min(120.0, width_pct))
-    max_lines = max(1, min(5, int(style.get("max_lines", 2) or 2)))
+    full_text_layout = str(style.get("caption_build_mode", "") or "").lower().startswith("full_text") or bool(style.get("full_text_layout"))
+    max_line_cap = 12 if full_text_layout else 5
+    max_lines = max(1, min(max_line_cap, int(style.get("max_lines", 2) or 2)))
     line_capacity = max(3.5, (float(proj_w) * width_pct / 100.0) / size * 0.92)
     layout_mode = style.get("layout_mode", "standard")
     if layout_mode == "split_screen":
@@ -966,11 +968,59 @@ def rebalance_subtitle_layout(subs, fallback_style=None, default_pos=(0.0, 25.0)
         base = copy.deepcopy(sub)
         style = copy.deepcopy(fallback_style)
         style.update(copy.deepcopy(base.get("style", {})))
+        caption_build_mode = str(base.get("caption_build_mode") or style.get("caption_build_mode") or "").lower()
+        full_text_layout = caption_build_mode.startswith("full_text") or bool(style.get("full_text_layout"))
+        if full_text_layout:
+            base["caption_build_mode"] = "full_text"
+            style["caption_build_mode"] = "full_text"
+            style["text_reveal_mode"] = "all"
+            style["inactive_alpha"] = 100
+            style["layout_mode"] = "standard"
+            style["box_layout"] = "fixed"
+            if not style.get("_full_text_defaults_applied"):
+                try:
+                    style["box_width"] = max(88.0, min(120.0, float(style.get("box_width", 0) or 0)))
+                except Exception:
+                    style["box_width"] = 92.0
+                if style["box_width"] < 90.0:
+                    style["box_width"] = 92.0
+                try:
+                    style["max_lines"] = max(6, min(12, int(style.get("max_lines", 0) or 0)))
+                except Exception:
+                    style["max_lines"] = 10
+                if style["max_lines"] < 8:
+                    style["max_lines"] = 10
+                try:
+                    current_size = float(style.get("size", 54) or 54)
+                    style["size"] = max(32, min(64, current_size))
+                except Exception:
+                    style["size"] = 54
+                style.setdefault("line_height", 1.04)
+                style["_full_text_defaults_applied"] = True
         layout_mode = style.get("layout_mode", "standard")
         if layout_mode == "split_screen":
             layout_mode = "standard"
         is_standard = layout_mode == "standard"
         is_reflowable = layout_mode in ("standard", "contrast")
+        if full_text_layout:
+            words = base.get("words", [])
+            if not words:
+                words = [{"text": base.get("text", ""), "start": base.get("start", 0.0), "end": base.get("end", 1.0)}]
+            words = normalize_word_timestamps(words, text_key="text")
+            words = [copy.deepcopy(w) for w in words if _clean_word_text(w)]
+            if not words:
+                balanced.append(base)
+                continue
+            base["style"] = style
+            base["text"] = _subtitle_plain_text(words)
+            base["words"] = words
+            base["start"] = float(base.get("start", words[0].get("start", 0.0)) or 0.0)
+            base["end"] = max(float(base.get("end", words[-1].get("end", 1.0)) or 1.0), float(words[-1].get("end", 1.0) or 1.0))
+            base["pos_x"] = float(base.get("pos_x", default_pos[0]) or 0.0)
+            base["pos_y"] = float(base.get("pos_y", 50.0) if "pos_y" in base else 50.0)
+            base["track"] = base.get("track", 1)
+            balanced.append(base)
+            continue
         if force_standard_box and is_standard:
             style["box_layout"] = "fixed"
             if float(style.get("box_width", 0) or 0) <= 0:
@@ -1704,6 +1754,8 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
         return p * p * (3.0 - 2.0 * p)
 
     style = sub.get("style", sub)
+    caption_build_mode = str(style.get("caption_build_mode") or sub.get("caption_build_mode") or "").lower()
+    full_text_layout = caption_build_mode.startswith("full_text") or bool(style.get("full_text_layout"))
     c_txt = style.get("color_txt", "#FFFFFF")
     c_hl = style.get("color_hl", "#FFFFFF")
     text_color_mode = str(style.get("text_color_mode", "single") or "single").strip().lower()
@@ -1820,6 +1872,8 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
     }.get(text_reveal_mode, text_reveal_mode)
     if text_reveal_mode not in ("all", "word_voice", "line_voice"):
         text_reveal_mode = "all"
+    if full_text_layout:
+        text_reveal_mode = "all"
     voice_reveal_active = text_reveal_mode in ("word_voice", "line_voice")
     voice_reveal_fade = max(0.0, min(0.60, _safe_float(style.get("voice_reveal_fade", 0.06), 0.06)))
     if voice_reveal_active:
@@ -1832,7 +1886,8 @@ def render_subtitle_html(sub, current_time, proj_w=1080, proj_h=None):
 
     box_width = float(style.get("box_width", 0))
     box_height = float(style.get("box_height", 0) or 0)
-    max_lines = max(1, min(4, int(style.get("max_lines", 2) or 2)))
+    max_line_cap = 12 if full_text_layout else 4
+    max_lines = max(1, min(max_line_cap, int(style.get("max_lines", 2) or 2)))
     mask_en = style.get("mask_en", False)
     mask_top = style.get("mask_top", 20)
     mask_bot = style.get("mask_bottom", 20)
