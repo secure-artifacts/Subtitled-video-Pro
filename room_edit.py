@@ -627,7 +627,7 @@ class EditView(QWidget):
         self._audio_exts = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
         self.zoom_factor = 50.0; self.timeline_snap_enabled = True; self.active_subs_cache = set(); self.last_render_hash = None
         self.preview_zoom = 1.0; self.preview_pan_x = 0.0; self.preview_pan_y = 0.0
-        self.preview_overlay_enabled = True; self._preview_overlay_has_content = False; self._preview_frame_retry_pending = False; self._preview_frame_retry_count = 0
+        self.preview_overlay_enabled = True; self.preview_material_inspect = False; self._preview_overlay_has_content = False; self._preview_frame_retry_pending = False; self._preview_frame_retry_count = 0
         self.v_wave_pixmap = None; self.a_wave_pixmap = None; self.video_thumbs = []; self.last_video_image = None
         self.proj_width = 1080; self.proj_height = 1920
         self.safe_font_only = False
@@ -1954,6 +1954,11 @@ class EditView(QWidget):
         self.btn_preview_zoom_in = QPushButton("+"); self.btn_preview_zoom_in.setFixedSize(28, 26); self.btn_preview_zoom_in.setToolTip("放大监看预览 Ctrl++"); self.btn_preview_zoom_in.setStyleSheet("background-color: #313244; color: #cdd6f4; font-weight: bold; border-radius: 5px;"); self.btn_preview_zoom_in.clicked.connect(lambda: self.adjust_preview_zoom(1)); view_row.addWidget(self.btn_preview_zoom_in)
         self.btn_preview_reset = QPushButton("100"); self.btn_preview_reset.setFixedSize(38, 26); self.btn_preview_reset.setToolTip("重置监看视窗 Ctrl+0"); self.btn_preview_reset.setStyleSheet("background-color: #313244; color: #a6e3a1; font-family: Consolas; font-weight: bold; border-radius: 5px;"); self.btn_preview_reset.clicked.connect(self.reset_preview_view); view_row.addWidget(self.btn_preview_reset)
         self.btn_preview_fullscreen = QPushButton("全屏"); self.btn_preview_fullscreen.setFixedSize(52, 26); self.btn_preview_fullscreen.setToolTip(f"全屏观看预览 {self.preview_fullscreen_shortcut_text} / Esc 退出"); self.btn_preview_fullscreen.setStyleSheet("background-color: #313244; color: #f9e2af; font-weight: bold; border-radius: 5px;"); self.btn_preview_fullscreen.clicked.connect(self.toggle_preview_fullscreen); view_row.addWidget(self.btn_preview_fullscreen)
+        self.chk_material_inspect = QCheckBox("素材检查")
+        self.chk_material_inspect.setToolTip("临时隐藏字幕/光效/画面蒙版，只看原始画面；不影响导出和工程效果。")
+        self.chk_material_inspect.setStyleSheet("color: #74c7ec; font-weight: bold;")
+        self.chk_material_inspect.stateChanged.connect(lambda state: self.toggle_material_inspect_preview(state == Qt.CheckState.Checked.value))
+        view_row.addWidget(self.chk_material_inspect)
         view_row.addSpacing(8)
         self.lbl_preview_proxy_resolution = QLabel("预览清晰度")
         self.lbl_preview_proxy_resolution.setStyleSheet("color: #89b4fa; font-size: 11px; font-weight: 900; border: none;")
@@ -2711,6 +2716,19 @@ class EditView(QWidget):
         self.v_end_spin.valueChanged.connect(self._on_v_time_change)
         v_end_row.addWidget(self.v_end_spin, stretch=1)
         video_timing_controls.addLayout(v_end_row)
+        replace_row = QHBoxLayout()
+        replace_row.setSpacing(8)
+        self.btn_replace_current_video = QPushButton("🔁 替换当前")
+        self.btn_replace_current_video.setToolTip("只替换当前选中的时间线片段，保留原来的开始/结束时间。")
+        self.btn_replace_current_video.setStyleSheet("background:#89b4fa; color:#11111b; border-radius:6px; padding:7px 10px; font-weight:900;")
+        self.btn_replace_current_video.clicked.connect(self.replace_current_video_clip)
+        self.btn_replace_same_video = QPushButton("🔄 替换同源")
+        self.btn_replace_same_video.setToolTip("把时间线里所有同一个素材文件一起替换；适合循环拼接里发现某个素材不好时使用。")
+        self.btn_replace_same_video.setStyleSheet("background:#74c7ec; color:#11111b; border-radius:6px; padding:7px 10px; font-weight:900;")
+        self.btn_replace_same_video.clicked.connect(self.replace_same_source_video_clips)
+        replace_row.addWidget(self.btn_replace_current_video)
+        replace_row.addWidget(self.btn_replace_same_video)
+        video_timing_controls.addLayout(replace_row)
         timing_hint = QLabel("这里调时间线里的片段长度；不影响画面基础参数和蒙版。")
         timing_hint.setWordWrap(True)
         timing_hint.setStyleSheet("color:#8f9bb3; font-size:12px;")
@@ -6674,7 +6692,7 @@ body {{
 
     def _set_preview_overlay_visible(self, visible):
         wants_overlay = bool(visible)
-        visible = wants_overlay and bool(getattr(self, "preview_overlay_enabled", True))
+        visible = wants_overlay and bool(getattr(self, "preview_overlay_enabled", True)) and not bool(getattr(self, "preview_material_inspect", False))
         previous_wants_overlay = bool(getattr(self, "_preview_overlay_has_content", False))
         self._preview_overlay_has_content = wants_overlay
         try:
@@ -6696,14 +6714,97 @@ body {{
         except Exception:
             pass
 
+    def toggle_material_inspect_preview(self, enabled):
+        self.preview_material_inspect = bool(enabled)
+        self.last_render_hash = None
+        self._preview_scaled_pixmap_key = None
+        self._preview_scaled_pixmap = None
+        if self.preview_material_inspect:
+            self._set_preview_overlay_visible(False)
+            self._queue_static_preview_frame(self.current_play_time)
+            if hasattr(self, "status_lbl"):
+                self.status_lbl.setText("素材检查已开启：临时隐藏字幕、光效和画面蒙版。")
+        else:
+            self.update_floating_subtitle()
+            if hasattr(self, "status_lbl"):
+                self.status_lbl.setText("素材检查已关闭：恢复字幕、光效和画面蒙版预览。")
+        self.redraw_video_preview()
+
     def _request_preview_video_refresh(self):
         try:
             last_image = getattr(self, "last_video_image", None)
             if (last_image is None or last_image.isNull()) and self.state.get("video_clips"):
                 self._sync_video_playback_to_time(self.current_play_time, force_seek=True)
+                self._queue_static_preview_frame(self.current_play_time)
         except Exception:
             pass
         self.redraw_video_preview()
+
+    def _static_preview_frame_path(self, source_path, local_time):
+        try:
+            stat = os.stat(source_path)
+            source_sig = f"{os.path.abspath(source_path)}|{stat.st_mtime_ns}|{stat.st_size}|{int(max(0.0, float(local_time or 0.0)) * 4)}"
+        except Exception:
+            source_sig = f"{os.path.abspath(source_path)}|{int(max(0.0, float(local_time or 0.0)) * 4)}"
+        token = hashlib.sha1(source_sig.encode("utf-8", "replace")).hexdigest()[:18]
+        out_dir = os.path.join(tempfile.gettempdir(), "subtitle_composer_static_preview")
+        return os.path.join(out_dir, f"frame_{token}.jpg"), token
+
+    def _queue_static_preview_frame(self, time_sec=None):
+        if getattr(self, "is_playing", False):
+            return False
+        idx, clip = self._video_clip_for_time(float(time_sec if time_sec is not None else self.current_play_time or 0.0))
+        if not clip:
+            return False
+        source_path = self._preview_media_path_for_clip(clip) or clip.get("path", "")
+        if not source_path or not os.path.exists(source_path):
+            return False
+        local_time = self._video_local_time(clip, float(time_sec if time_sec is not None else self.current_play_time or 0.0))
+        frame_path, key = self._static_preview_frame_path(source_path, local_time)
+        self._static_preview_expected_key = key
+        if os.path.exists(frame_path) and os.path.getsize(frame_path) > 512:
+            return self._apply_static_preview_frame(key, frame_path)
+        jobs = getattr(self, "_static_preview_jobs", set())
+        if key in jobs:
+            return False
+        jobs.add(key)
+        self._static_preview_jobs = jobs
+
+        def task():
+            try:
+                os.makedirs(os.path.dirname(frame_path), exist_ok=True)
+                seek_time = max(0.0, float(local_time or 0.0))
+                cmd = [
+                    get_ffmpeg_cmd(), "-y", "-hide_banner", "-loglevel", "error",
+                    "-ss", f"{seek_time:.3f}", "-i", source_path,
+                    "-frames:v", "1", "-vf", "scale=-2:720:flags=fast_bilinear",
+                    "-q:v", "3", frame_path,
+                ]
+                flags = 0x08000000 if os.name == 'nt' else 0
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags, timeout=5, check=True)
+                QTimer.singleShot(0, lambda k=key, p=frame_path: self._apply_static_preview_frame(k, p))
+            except Exception:
+                pass
+            finally:
+                try:
+                    self._static_preview_jobs.discard(key)
+                except Exception:
+                    pass
+
+        threading.Thread(target=task, daemon=True).start()
+        return True
+
+    def _apply_static_preview_frame(self, key, frame_path):
+        if key != getattr(self, "_static_preview_expected_key", "") or getattr(self, "is_playing", False):
+            return False
+        pixmap = QPixmap(frame_path)
+        if pixmap.isNull():
+            return False
+        self.last_video_image = pixmap.toImage()
+        self._preview_scaled_pixmap_key = None
+        self._preview_scaled_pixmap = None
+        self.redraw_video_preview()
+        return True
 
     def _sync_preview_web_state(self):
         if not hasattr(self, "browser"):
@@ -9326,6 +9427,101 @@ body {{
         self.push_history()
         return True
 
+    def _load_video_replacement_metadata(self, file_path):
+        file_path = self.cloud_import_media_if_needed(file_path)
+        try:
+            media_meta = get_video_import_metadata(file_path)
+            dur = float(media_meta.get("duration", 0.0) or 0.0)
+            duration_info = media_meta.get("duration_info", {})
+        except Exception:
+            media_meta = {}
+            dur, duration_info = 0.0, {}
+        if dur <= 0:
+            dur = get_video_stream_duration(file_path) or get_exact_duration(file_path)
+        if dur <= 0:
+            dur = 5.0
+        try:
+            video_w = int(media_meta.get("width", 0) or 0)
+            video_h = int(media_meta.get("height", 0) or 0)
+            if video_w <= 0 or video_h <= 0:
+                video_w, video_h = get_video_dimensions(file_path)
+        except Exception:
+            video_w, video_h = 0, 0
+        return file_path, float(dur), duration_info, int(video_w or 0), int(video_h or 0)
+
+    def _replace_video_clip_sources(self, indices, file_path, label="当前片段"):
+        clips = self.state.get("video_clips", []) or []
+        valid_indices = [idx for idx in indices if 0 <= idx < len(clips)]
+        if not valid_indices or not file_path or not os.path.exists(file_path):
+            return False
+        new_path, dur, duration_info, video_w, video_h = self._load_video_replacement_metadata(file_path)
+        changed_clips = []
+        for idx in valid_indices:
+            clip = clips[idx]
+            old_start = float(clip.get("start", 0.0) or 0.0)
+            old_end = float(clip.get("end", old_start) or old_start)
+            timeline_len = max(0.05, old_end - old_start)
+            for key in list(clip.keys()):
+                if str(key).startswith("preview_proxy_"):
+                    clip.pop(key, None)
+            clip.update({
+                "path": new_path,
+                "dur": dur,
+                "width": video_w,
+                "height": video_h,
+                "duration_probe": duration_info,
+                "source_in": 0.0,
+                "source_out": dur,
+                "end": old_start + timeline_len,
+            })
+            changed_clips.append(clip)
+        self.state["video_clips"] = sorted(clips, key=lambda c: float(c.get("start", 0.0) or 0.0))
+        self.current_v_idx = self.state["video_clips"].index(changed_clips[0]) if changed_clips[0] in self.state["video_clips"] else valid_indices[0]
+        self.current_selected_idx = -1
+        self.selected_track = "video"
+        self.last_video_image = None
+        self._preview_scaled_pixmap_key = None
+        self._preview_scaled_pixmap = None
+        self._prepare_preview_proxies_for_clips(changed_clips, announce=False)
+        self._prime_video_preview_source(self.state["video_clips"][self.current_v_idx], announce=False)
+        self.on_resolution_changed(self.state.get("resolution", get_output_resolution()))
+        self.generate_waveform(new_path, "v_wave_pixmap", max_seconds=90)
+        threading.Thread(target=self._gen_thumbs_cache, daemon=True).start()
+        self._recalc_duration()
+        self.render_ui_list()
+        self.update_timeline_size()
+        self.refresh_media_pool()
+        self.switch_inspector("video")
+        self.sync_player_to_time(float(self.state["video_clips"][self.current_v_idx].get("start", self.current_play_time) or 0.0))
+        self.auto_save_cache()
+        self.push_history()
+        self.status_lbl.setText(f"已替换{label}：{os.path.basename(new_path)}")
+        return True
+
+    def replace_current_video_clip(self):
+        if not self._ensure_edit_mode("替换当前素材"):
+            return False
+        clips = self.state.get("video_clips", []) or []
+        if not clips or self.current_v_idx < 0 or self.current_v_idx >= len(clips):
+            return QMessageBox.information(self, "没有选中视频", "请先在时间线点选要替换的画面片段。")
+        file_path, _ = QFileDialog.getOpenFileName(self, "替换当前画面素材", "", "Video Files (*.mp4 *.mov *.webm *.mkv *.avi)")
+        if not file_path:
+            return False
+        return self._replace_video_clip_sources([self.current_v_idx], file_path, "当前片段")
+
+    def replace_same_source_video_clips(self):
+        if not self._ensure_edit_mode("替换同源素材"):
+            return False
+        clips = self.state.get("video_clips", []) or []
+        if not clips or self.current_v_idx < 0 or self.current_v_idx >= len(clips):
+            return QMessageBox.information(self, "没有选中视频", "请先在时间线点选一个要替换的画面片段。")
+        old_path = os.path.abspath(clips[self.current_v_idx].get("path", "") or "")
+        indices = [idx for idx, clip in enumerate(clips) if os.path.abspath(clip.get("path", "") or "") == old_path]
+        file_path, _ = QFileDialog.getOpenFileName(self, "替换同源画面素材", "", "Video Files (*.mp4 *.mov *.webm *.mkv *.avi)")
+        if not file_path:
+            return False
+        return self._replace_video_clip_sources(indices, file_path, f"同源素材 {len(indices)} 段")
+
     def load_audio(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "选择音频", "", "Audio Files (*.mp3 *.wav *.m4a *.aac *.flac *.ogg)")
         if file_path:
@@ -9582,6 +9778,8 @@ body {{
             painter = QPainter(result_pix)
             painter.drawPixmap(layer_rect.x, layer_rect.y, scaled_pix)
             mask_enabled, mask_color, mask_alpha = self._video_mask_settings()
+            if getattr(self, "preview_material_inspect", False):
+                mask_enabled = False
             if mask_enabled:
                 overlay_color = QColor(mask_color)
                 overlay_color.setAlpha(int(round(mask_alpha * 2.55)))
@@ -9872,6 +10070,8 @@ body {{
         clips = self.state.get("video_clips", [])
         if clips:
             self._sync_video_playback_to_time(time_sec, force_seek=True)
+            if not self.is_playing:
+                self._queue_static_preview_frame(time_sec)
         else:
             self.player.setPosition(int(time_sec * 1000))
         self._sync_audio_playback_to_time(time_sec, force_seek=True)
@@ -9880,6 +10080,9 @@ body {{
         self.timeline_widget.update_playhead(time_sec); self.update_floating_subtitle(); self._update_workspace_status()
 
     def update_floating_subtitle(self):
+        if getattr(self, "preview_material_inspect", False):
+            self._set_preview_overlay_visible(False)
+            return
         active_subs = []
         scene_light_source = []
         preview_mode = getattr(self, "preview_effect_quality", get_preview_effect_quality())
