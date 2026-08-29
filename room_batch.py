@@ -5398,7 +5398,7 @@ class BatchView(QWidget):
         while remaining > min_tail and guard < 5000:
             guard += 1
             item = media[cursor_idx % len(media)]
-            clip_len = min(item["video_dur"], max_slice, remaining)
+            clip_len = min(max_slice, remaining)
             if clip_len <= min_tail:
                 break
             clips.append({
@@ -5407,7 +5407,7 @@ class BatchView(QWidget):
                 "end": cursor + clip_len,
                 "dur": item["stream_dur"],
                 "source_in": 0.0,
-                "source_out": min(item["video_dur"], clip_len),
+                "source_out": item["video_dur"],
                 "speed": 1.0,
                 "scale": 100,
                 "volume": 100,

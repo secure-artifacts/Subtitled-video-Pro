@@ -3973,7 +3973,7 @@ class EditView(QWidget):
         while remaining > min_tail and guard < 2000:
             guard += 1
             item = valid[cursor_idx % len(valid)]
-            clip_len = min(item["dur"], max_slice, remaining)
+            clip_len = min(max_slice, remaining)
             if clip_len <= min_tail:
                 break
             timeline_segments.append({
@@ -3981,7 +3981,7 @@ class EditView(QWidget):
                 "timeline_duration": max(0.05, clip_len),
                 "source_duration": item["dur"],
                 "source_in": 0.0,
-                "source_out": min(item["dur"], clip_len),
+                "source_out": item["dur"],
                 "speed": 1.0,
                 "duration_info": item.get("duration_info", {}),
                 "width": item.get("width", 0),
@@ -9091,6 +9091,9 @@ body {{
         )
 
     def _should_defer_original_preview(self, clip):
+        assembly_mode = str((clip or {}).get("assembly_mode", "")) if isinstance(clip, dict) else ""
+        if assembly_mode in {"audio_matched", "batch_random", "random_fill", "quad_grid_preview"}:
+            return False
         if not self._clip_needs_preview_proxy(clip):
             return False
         if preview_proxy_is_ready(clip):
